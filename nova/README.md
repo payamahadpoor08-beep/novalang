@@ -935,9 +935,35 @@ benchmark; override with `--jit-threshold=N` or `jit-threshold` in `nova.hgx`),
 so cold functions are **never** compiled — `--jit-stats` proves it. A second,
 disjoint eligibility track compiles **f64-only** functions natively (`fadd`/
 `fsub`/`fmul`/`fdiv`, comparisons in conditions); floats never deopt because
-IEEE inf/NaN semantics already match the interpreter bit-for-bit. `%`/`**` on
-floats stay on the VM (no Cranelift instruction), as does anything int/float
-mixed — correct first, fast second.
+IEEE inf/NaN semantics already match the interpreter bit-for-bit.
+
+**Phase 10 (v3.26) makes exceptions, defers, and flow VM-native.** `try/catch/
+finally`, `throw`, `defer`, and `break`-with-value no longer force a function
+onto the interpreter: `Op::Try` transcribes the tree-walker's TryCatch logic
+over sub-runs of the same frame, defers register at runtime and unwind in LIFO
+block order (including during throw unwinding), and runtime errors become
+catchable values exactly as in `nova run`. Differential probing also found and
+fixed six real VM/interp divergences (flat statement-block scoping, expression
+blocks consuming every flow and shadowing writes, break/continue outside loops,
+sentinel leaks on uncaught throws). `Op::Pos` keeps the interpreter's position
+in sync, so located runtime errors print **byte-identically**, and a new
+peephole pass fuses `i = i + k` / loop-header compare-branches into
+superinstructions — the pure VM is ~10% faster than v3.25 despite the extra
+tracking. Only `yield` (generators) and refinement-typed `let` remain
+interp-only, with the documented fallback message.
+
+**Phase 10 also widens the JIT.** Integer `**` compiles natively (a
+transcription of `i64::checked_pow` whose every multiply deopts on overflow,
+matching BigInt promotion). The f64 track gains `%` and `**` (bit-identical via
+Rust libcalls), integer `for` ranges with i64 counters, and **mixed int/float
+arithmetic** through a static kind analysis: int literals and loop counters
+promote through the interpreter's `as_f` rules, while anything whose int-ness
+is observable (Int÷Int, Int returns, Int==Int) stays off the track. And the
+i64 track now supports **local integer arrays** — arrays built from literals
+that never escape a pure function (indexing, `a[i]=v`, `len`/`push`/`pop`,
+aliasing with shared storage) lower to a thread-local arena with deopt guards
+on out-of-bounds access, so a hot sieve runs ~2.7× faster than the pure VM
+while byte-identical output is still enforced across all four VM modes.
 
 ## Projects & native binaries — `nova.hgx` and `nova build` (Phase 6.1)
 

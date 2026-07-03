@@ -1,0 +1,54 @@
+// Local integer arrays on the JIT's i64 track: build/index/mutate/push/pop/len
+// inside pure functions, hot enough to cross the tiering threshold. Aliases
+// share storage; out-of-range access deopts and re-raises on the VM.
+
+fn sieve(n) {
+  s = []
+  for i in 0..n { push(s, 1) }
+  s[0] = 0
+  s[1] = 0
+  i = 2
+  while i * i < n {
+    if s[i] == 1 {
+      j = i * i
+      while j < n { s[j] = 0; j = j + i }
+    }
+    i = i + 1
+  }
+  c = 0
+  for k in 0..n { c = c + s[k] }
+  c
+}
+
+fn reverse_sum(n) {
+  a = []
+  for i in 0..n { push(a, i * 3 + 1) }
+  t = 0
+  while len(a) > 0 { t = t + pop(a) }
+  t
+}
+
+fn alias_mix(n) {
+  a = [0, 0, 0]
+  b = a
+  for i in 0..n { b[i % 3] = b[i % 3] + i }
+  a[0] * 10000 + a[1] * 100 + a[2]
+}
+
+fn powers(n) {
+  t = 0
+  for i in 0..n { t = t + 2 ** i + i ** 3 }
+  t
+}
+
+fn main() {
+  t = 0
+  for k in 0..200 { t = t + sieve(500) }
+  print(t)
+  print(sieve(10000))
+  print(reverse_sum(1000))
+  print(alias_mix(30))
+  print(powers(30))
+  print(2 ** 63)          // overflow: promotes to BigInt via deopt
+  print(10 ** (0 - 2))    // negative exponent: float result via deopt
+}
