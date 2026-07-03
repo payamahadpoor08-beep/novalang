@@ -23,81 +23,6 @@ use crate::ast::*;
 const MAX_ARITY: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Runtime helpers callable from JIT code.
-//
-// Local integer arrays: a JIT-eligible function may build arrays of i64 that
-// never escape it (see `array_vars`). They live in a thread-local arena of
-// Vec<i64> pools addressed by handle; `raw_call` resets the arena after each
-// top-level native call, so re-running on the VM after a deopt starts clean —
-// array effects are invisible outside the JIT, preserving purity. Bounds
-// violations and pops of an empty array set the deopt flag: the VM re-run then
-// raises the exact interpreter error (or returns its null for empty pop).
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static JIT_ARENA: std::cell::RefCell<(Vec<Vec<i64>>, usize)> =
-        std::cell::RefCell::new((Vec::new(), 0));
-}
-
-extern "C" fn nova_arr_new() -> i64 {
-    JIT_ARENA.with(|a| {
-        let (pool, live) = &mut *a.borrow_mut();
-        if *live < pool.len() { pool[*live].clear(); } else { pool.push(Vec::new()); }
-        *live += 1;
-        (*live - 1) as i64
-    })
-}
-
-extern "C" fn nova_arr_push(h: i64, v: i64) {
-    JIT_ARENA.with(|a| a.borrow_mut().0[h as usize].push(v));
-}
-
-extern "C" fn nova_arr_len(h: i64) -> i64 {
-    JIT_ARENA.with(|a| a.borrow().0[h as usize].len() as i64)
-}
-
-extern "C" fn nova_arr_get(dp: *mut i64, h: i64, i: i64) -> i64 {
-    JIT_ARENA.with(|a| {
-        let arr = &a.borrow().0[h as usize];
-        if i < 0 || i as usize >= arr.len() {
-            unsafe { *dp = 1; }
-            0
-        } else {
-            arr[i as usize]
-        }
-    })
-}
-
-extern "C" fn nova_arr_set(dp: *mut i64, h: i64, i: i64, v: i64) {
-    JIT_ARENA.with(|a| {
-        let arr = &mut a.borrow_mut().0[h as usize];
-        if i < 0 || i as usize >= arr.len() {
-            unsafe { *dp = 1; }
-        } else {
-            arr[i as usize] = v;
-        }
-    })
-}
-
-extern "C" fn nova_arr_pop(dp: *mut i64, h: i64) -> i64 {
-    JIT_ARENA.with(|a| {
-        match a.borrow_mut().0[h as usize].pop() {
-            Some(v) => v,
-            None => { unsafe { *dp = 1; } 0 } // interp returns null: deopt re-runs
-        }
-    })
-}
-
-fn jit_arena_reset() {
-    JIT_ARENA.with(|a| a.borrow_mut().1 = 0);
-}
-
-// f64 `%` and `**` have no Cranelift instruction; call back into Rust so the
-// results are bit-identical to the interpreter's `as_f(l) % as_f(r)` / powf.
-extern "C" fn nova_fmod(a: f64, b: f64) -> f64 { a % b }
-extern "C" fn nova_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
-
-// ---------------------------------------------------------------------------
 // Eligibility (a fixpoint over the call graph)
 // ---------------------------------------------------------------------------
 
@@ -119,8 +44,7 @@ pub fn eligible_set(prog: &Program) -> HashSet<String> {
         let mut remove = None;
         for name in &set {
             let f = funcs[name.as_str()];
-            let arrays = array_vars(f);
-            if collect_real_calls(&f.body, &arrays).iter().any(|c| !set.contains(c)) {
+            if collect_calls(&f.body).iter().any(|c| !set.contains(c)) {
                 remove = Some(name.clone());
                 break;
             }
@@ -135,99 +59,9 @@ pub fn eligible_set(prog: &Program) -> HashSet<String> {
 
 // structural integer-purity, allowing calls (validated by the fixpoint)
 fn locally_ok(f: &Func) -> bool {
-    let arrays = array_vars(f);
     !f.body.is_empty()
-        && f.body.iter().all(|s| stmt_pure(s, &arrays))
+        && f.body.iter().all(stmt_pure)
         && always_returns(&f.body)
-}
-
-// ---------------------------------------------------------------------------
-// Local-array support for the i64 track. A variable is an "array var" when it
-// is only ever assigned an integer array literal (or an alias of another array
-// var — aliases share a handle exactly like the interpreter's shared Rc). Such
-// arrays may be indexed, index-assigned, len()'d, push()'d and pop()'d, and
-// must never escape (returned, passed to a call, or used as a scalar); then
-// they can live in the JIT arena instead of the heap.
-// ---------------------------------------------------------------------------
-
-fn as_ident(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::At { expr, .. } => as_ident(expr),
-        Expr::Ident(n) => Some(n),
-        _ => None,
-    }
-}
-
-fn strip_at(e: &Expr) -> &Expr {
-    match e { Expr::At { expr, .. } => strip_at(expr), other => other }
-}
-
-// Names assigned from an array literal or from another array var, to a fixpoint.
-pub(crate) fn array_vars(f: &Func) -> HashSet<String> {
-    let mut set: HashSet<String> = HashSet::new();
-    loop {
-        let before = set.len();
-        collect_array_assigns(&f.body, &mut set);
-        if set.len() == before { break; }
-    }
-    // a name also assigned any non-array value is not a stable array var
-    let mut bad: HashSet<String> = HashSet::new();
-    check_array_assign_conflicts(&f.body, &set, &mut bad);
-    for b in bad { set.remove(&b); }
-    set
-}
-
-fn collect_array_assigns(body: &[Stmt], set: &mut HashSet<String>) {
-    for s in body {
-        match s {
-            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
-                match strip_at(value) {
-                    Expr::Array(_) => { set.insert(name.clone()); }
-                    Expr::Ident(src) if set.contains(src) => { set.insert(name.clone()); }
-                    _ => {}
-                }
-            }
-            Stmt::If { then, els, .. } => {
-                collect_array_assigns(then, set);
-                if let Some(e) = els { collect_array_assigns(e, set); }
-            }
-            Stmt::While { body, .. } | Stmt::ForRange { body, .. } =>
-                collect_array_assigns(body, set),
-            _ => {}
-        }
-    }
-}
-
-fn check_array_assign_conflicts(body: &[Stmt], set: &HashSet<String>, bad: &mut HashSet<String>) {
-    for s in body {
-        match s {
-            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } if set.contains(name) => {
-                match strip_at(value) {
-                    Expr::Array(_) => {}
-                    Expr::Ident(src) if set.contains(src) => {}
-                    _ => { bad.insert(name.clone()); }
-                }
-            }
-            Stmt::If { then, els, .. } => {
-                check_array_assign_conflicts(then, set, bad);
-                if let Some(e) = els { check_array_assign_conflicts(e, set, bad); }
-            }
-            Stmt::While { body, .. } | Stmt::ForRange { body, .. } =>
-                check_array_assign_conflicts(body, set, bad),
-            _ => {}
-        }
-    }
-}
-
-// is this call one of the array builtins applied to a local array var?
-fn array_builtin_call(callee: &str, args: &[Expr], arrays: &HashSet<String>) -> bool {
-    match callee {
-        "len" | "pop" => args.len() == 1
-            && as_ident(&args[0]).map_or(false, |n| arrays.contains(n)),
-        "push" => args.len() == 2
-            && as_ident(&args[0]).map_or(false, |n| arrays.contains(n)),
-        _ => false,
-    }
 }
 
 // the body always yields an integer value (never falls through to an implicit
@@ -241,74 +75,36 @@ fn always_returns(body: &[Stmt]) -> bool {
     }
 }
 
-fn stmt_pure(s: &Stmt, arrays: &HashSet<String>) -> bool {
+fn stmt_pure(s: &Stmt) -> bool {
     match s {
-        Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
-            if arrays.contains(name) {
-                // an array var may only be (re)assigned an array literal of
-                // scalars or an alias of another array var
-                match strip_at(value) {
-                    Expr::Array(elems) => elems.iter().all(|e| expr_pure(e, arrays)),
-                    Expr::Ident(src) => arrays.contains(src),
-                    _ => false,
-                }
-            } else {
-                expr_pure(value, arrays)
-            }
-        }
-        Stmt::Expr(e) => {
-            // allow `push(arr, v)` as a statement (it returns null in the interp)
-            if let Expr::Call { callee, args } = strip_at(e) {
-                if callee == "push" && array_builtin_call(callee, args, arrays) {
-                    return expr_pure(&args[1], arrays);
-                }
-            }
-            expr_pure(e, arrays)
-        }
-        Stmt::Return(Some(e)) => expr_pure(e, arrays),
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_pure(value),
+        Stmt::Expr(e) => expr_pure(e),
+        Stmt::Return(Some(e)) => expr_pure(e),
         Stmt::Return(None) => false,
-        Stmt::IndexAssign { base, index, value } =>
-            as_ident(base).map_or(false, |n| arrays.contains(n))
-            && expr_pure(index, arrays) && expr_pure(value, arrays),
         Stmt::If { cond, then, els } =>
-            expr_pure(cond, arrays) && then.iter().all(|s| stmt_pure(s, arrays))
-            && els.as_ref().map_or(true, |e| e.iter().all(|s| stmt_pure(s, arrays))),
-        Stmt::While { cond, body } =>
-            expr_pure(cond, arrays) && body.iter().all(|s| stmt_pure(s, arrays)),
+            expr_pure(cond) && then.iter().all(stmt_pure)
+            && els.as_ref().map_or(true, |e| e.iter().all(stmt_pure)),
+        Stmt::While { cond, body } => expr_pure(cond) && body.iter().all(stmt_pure),
         Stmt::ForRange { start, end, body, .. } =>
-            expr_pure(start, arrays) && expr_pure(end, arrays)
-            && body.iter().all(|s| stmt_pure(s, arrays)),
+            expr_pure(start) && expr_pure(end) && body.iter().all(stmt_pure),
         Stmt::Break(None) | Stmt::Continue => true,
         _ => false,
     }
 }
 
-fn expr_pure(e: &Expr, arrays: &HashSet<String>) -> bool {
+fn expr_pure(e: &Expr) -> bool {
     match e {
-        Expr::At { expr, .. } => expr_pure(expr, arrays),
-        Expr::Int(_) => true,
-        Expr::Ident(n) => !arrays.contains(n), // an array var is not a scalar
+        Expr::At { expr, .. } => expr_pure(expr),
+        Expr::Int(_) | Expr::Ident(_) => true,
         Expr::Unary { op, expr } =>
-            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && expr_pure(expr, arrays),
-        Expr::Binary { op, lhs, rhs } =>
-            binop_pure(*op) && expr_pure(lhs, arrays) && expr_pure(rhs, arrays),
-        Expr::If { cond, then, els } =>
-            expr_pure(cond, arrays) && expr_pure(then, arrays) && expr_pure(els, arrays),
+            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && expr_pure(expr),
+        Expr::Binary { op, lhs, rhs } => binop_pure(*op) && expr_pure(lhs) && expr_pure(rhs),
+        Expr::If { cond, then, els } => expr_pure(cond) && expr_pure(then) && expr_pure(els),
         Expr::Block { stmts, tail } =>
-            stmts.iter().all(|s| stmt_pure(s, arrays))
-            && tail.as_ref().map_or(false, |t| expr_pure(t, arrays)),
-        Expr::Index { base, index } =>
-            as_ident(base).map_or(false, |n| arrays.contains(n))
-            && expr_pure(index, arrays),
-        // len/pop on a local array var yield scalars; other calls must have
-        // <= MAX_ARITY scalar args (callee eligibility enforced by the fixpoint)
-        Expr::Call { callee, args } => {
-            if array_builtin_call(callee, args, arrays) {
-                callee != "push" // push yields null; only allowed as a statement
-            } else {
-                args.len() <= MAX_ARITY && args.iter().all(|a| expr_pure(a, arrays))
-            }
-        }
+            stmts.iter().all(stmt_pure) && tail.as_ref().map_or(false, |t| expr_pure(t)),
+        // a call with <= MAX_ARITY integer args; callee eligibility is enforced
+        // by the fixpoint via `collect_calls`
+        Expr::Call { args, .. } => args.len() <= MAX_ARITY && args.iter().all(expr_pure),
         _ => false,
     }
 }
@@ -330,7 +126,9 @@ pub fn float_eligible_set(prog: &Program, int_set: &HashSet<String>) -> HashSet<
     let mut set: HashSet<String> = funcs.values()
         .filter(|f| f.params.len() <= MAX_ARITY
             && !int_set.contains(&f.name)         // int track takes precedence
-            && FloatCheck::check_fn(f))
+            && !f.body.is_empty()
+            && f.body.iter().all(f_stmt_pure)
+            && always_returns(&f.body))
         .map(|f| f.name.clone())
         .collect();
     loop {
@@ -347,114 +145,46 @@ pub fn float_eligible_set(prog: &Program, int_set: &HashSet<String>) -> HashSet<
     set
 }
 
-// Static kind of a numeric expression in the float track: definitely-Float or
-// definitely-Int. Int values (literals, for-range counters) may mix freely
-// with floats — the interpreter promotes via as_f, and we mirror that with an
-// exact i64->f64 convert — but Int∘Int arithmetic must stay off this track
-// (integer division/remainder truncate; overflow promotes to BigInt).
-#[derive(Clone, Copy, PartialEq)]
-enum FKind { F, I }
-
-struct FloatCheck { kinds: HashMap<String, FKind> }
-
-impl FloatCheck {
-    fn check_fn(f: &Func) -> bool {
-        let mut c = FloatCheck { kinds: HashMap::new() };
-        for p in &f.params { c.kinds.insert(p.clone(), FKind::F); }
-        !f.body.is_empty() && c.stmts(&f.body) && always_returns(&f.body)
+fn f_stmt_pure(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => f_expr(value),
+        Stmt::Expr(e) => f_expr(e),
+        Stmt::Return(Some(e)) => f_expr(e),
+        Stmt::If { cond, then, els } =>
+            f_cond(cond) && then.iter().all(f_stmt_pure)
+            && els.as_ref().map_or(true, |e| e.iter().all(f_stmt_pure)),
+        Stmt::While { cond, body } => f_cond(cond) && body.iter().all(f_stmt_pure),
+        Stmt::Break(None) | Stmt::Continue => true,
+        _ => false, // ForRange is integer-based; everything else as in the i64 track
     }
+}
 
-    fn stmts(&mut self, body: &[Stmt]) -> bool { body.iter().all(|s| self.stmt(s)) }
-
-    // a variable's kind must stay stable across every assignment
-    fn bind(&mut self, name: &str, k: FKind) -> bool {
-        match self.kinds.get(name) {
-            Some(prev) => *prev == k,
-            None => { self.kinds.insert(name.to_string(), k); true }
-        }
+fn f_expr(e: &Expr) -> bool {
+    match e {
+        Expr::At { expr, .. } => f_expr(expr),
+        Expr::Float(_) | Expr::Ident(_) => true,
+        Expr::Unary { op: UnOp::Neg, expr } => f_expr(expr),
+        Expr::Binary { op, lhs, rhs } =>
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+            && f_expr(lhs) && f_expr(rhs),
+        Expr::If { cond, then, els } => f_cond(cond) && f_expr(then) && f_expr(els),
+        Expr::Block { stmts, tail } =>
+            stmts.iter().all(f_stmt_pure) && tail.as_ref().map_or(false, |t| f_expr(t)),
+        Expr::Call { args, .. } => args.len() <= MAX_ARITY && args.iter().all(f_expr),
+        _ => false,
     }
+}
 
-    fn stmt(&mut self, s: &Stmt) -> bool {
-        match s {
-            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
-                match self.expr(value) { Some(k) => self.bind(name, k), None => false }
-            }
-            Stmt::Expr(e) => self.expr(e).is_some(),
-            Stmt::Return(Some(e)) => self.expr(e) == Some(FKind::F),
-            Stmt::If { cond, then, els } =>
-                self.cond(cond) && self.stmts(then)
-                && els.as_ref().map_or(true, |e| self.stmts(e)),
-            Stmt::While { cond, body } => self.cond(cond) && self.stmts(body),
-            Stmt::ForRange { var, start, end, body, .. } =>
-                self.expr(start) == Some(FKind::I)
-                && self.expr(end) == Some(FKind::I)
-                && self.bind(var, FKind::I)
-                && self.stmts(body),
-            Stmt::Break(None) | Stmt::Continue => true,
-            _ => false,
-        }
-    }
-
-    fn expr(&mut self, e: &Expr) -> Option<FKind> {
-        match e {
-            Expr::At { expr, .. } => self.expr(expr),
-            Expr::Float(_) => Some(FKind::F),
-            Expr::Int(_) => Some(FKind::I),
-            Expr::Ident(n) => self.kinds.get(n).copied(),
-            Expr::Unary { op: UnOp::Neg, expr } => {
-                match self.expr(expr) { Some(FKind::F) => Some(FKind::F), _ => None }
-            }
-            Expr::Binary { op, lhs, rhs }
-                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
-                                | BinOp::Rem | BinOp::Pow) =>
-            {
-                let l = self.expr(lhs)?;
-                let r = self.expr(rhs)?;
-                if l == FKind::I && r == FKind::I { None } else { Some(FKind::F) }
-            }
-            Expr::If { cond, then, els } => {
-                if !self.cond(cond) { return None; }
-                let t = self.expr(then)?;
-                let e2 = self.expr(els)?;
-                if t == e2 { Some(t) } else { None }
-            }
-            Expr::Block { stmts, tail } => {
-                if !self.stmts(stmts) { return None; }
-                self.expr(tail.as_ref()?)
-            }
-            Expr::Call { args, .. } => {
-                if args.len() > MAX_ARITY { return None; }
-                // callees receive f64 through the ABI, so every argument must
-                // be definitely-Float (an Int arg would take the callee's
-                // integer arms in the interpreter)
-                for a in args { if self.expr(a) != Some(FKind::F) { return None; } }
-                Some(FKind::F)
-            }
-            _ => None,
-        }
-    }
-
-    // boolean condition: comparisons over any numeric mix (the interpreter
-    // compares every numeric pair through as_f), combined with && || !.
-    // Eq/Ne of two Ints stays off the track: values_eq compares those exactly.
-    fn cond(&mut self, e: &Expr) -> bool {
-        match e {
-            Expr::At { expr, .. } => self.cond(expr),
-            Expr::Unary { op: UnOp::Not, expr } => self.cond(expr),
-            Expr::Binary { op: BinOp::And | BinOp::Or, lhs, rhs } =>
-                self.cond(lhs) && self.cond(rhs),
-            Expr::Binary { op, lhs, rhs }
-                if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
-                self.expr(lhs).is_some() && self.expr(rhs).is_some(),
-            Expr::Binary { op: BinOp::Eq | BinOp::Ne, lhs, rhs } => {
-                match (self.expr(lhs), self.expr(rhs)) {
-                    (Some(FKind::I), Some(FKind::I)) => false,
-                    (Some(_), Some(_)) => true,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+// boolean condition over floats: comparisons of float exprs, combined with && || !
+fn f_cond(e: &Expr) -> bool {
+    match e {
+        Expr::At { expr, .. } => f_cond(expr),
+        Expr::Unary { op: UnOp::Not, expr } => f_cond(expr),
+        Expr::Binary { op: BinOp::And | BinOp::Or, lhs, rhs } => f_cond(lhs) && f_cond(rhs),
+        Expr::Binary { op, lhs, rhs } =>
+            matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+            && f_expr(lhs) && f_expr(rhs),
+        _ => false,
     }
 }
 
@@ -470,70 +200,6 @@ fn collect_calls(body: &[Stmt]) -> Vec<String> {
     let mut out = Vec::new();
     for s in body { calls_stmt(s, &mut out); }
     out
-}
-
-// like collect_calls, but array builtins on local array vars (len/push/pop)
-// are not real calls — they lower to arena helpers, not Nova functions
-fn collect_real_calls(body: &[Stmt], arrays: &HashSet<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    for s in body { real_calls_stmt(s, arrays, &mut out); }
-    out
-}
-fn real_calls_stmt(s: &Stmt, arrays: &HashSet<String>, out: &mut Vec<String>) {
-    match s {
-        Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value)
-        | Stmt::Return(Some(value)) => real_calls_expr(value, arrays, out),
-        Stmt::IndexAssign { base, index, value } => {
-            real_calls_expr(base, arrays, out);
-            real_calls_expr(index, arrays, out);
-            real_calls_expr(value, arrays, out);
-        }
-        Stmt::If { cond, then, els } => {
-            real_calls_expr(cond, arrays, out);
-            for s in then { real_calls_stmt(s, arrays, out); }
-            if let Some(e) = els { for s in e { real_calls_stmt(s, arrays, out); } }
-        }
-        Stmt::While { cond, body } => {
-            real_calls_expr(cond, arrays, out);
-            for s in body { real_calls_stmt(s, arrays, out); }
-        }
-        Stmt::ForRange { start, end, body, .. } => {
-            real_calls_expr(start, arrays, out);
-            real_calls_expr(end, arrays, out);
-            for s in body { real_calls_stmt(s, arrays, out); }
-        }
-        _ => {}
-    }
-}
-fn real_calls_expr(e: &Expr, arrays: &HashSet<String>, out: &mut Vec<String>) {
-    match e {
-        Expr::At { expr, .. } | Expr::Unary { expr, .. } => real_calls_expr(expr, arrays, out),
-        Expr::Binary { lhs, rhs, .. } => {
-            real_calls_expr(lhs, arrays, out);
-            real_calls_expr(rhs, arrays, out);
-        }
-        Expr::If { cond, then, els } => {
-            real_calls_expr(cond, arrays, out);
-            real_calls_expr(then, arrays, out);
-            real_calls_expr(els, arrays, out);
-        }
-        Expr::Block { stmts, tail } => {
-            for s in stmts { real_calls_stmt(s, arrays, out); }
-            if let Some(t) = tail { real_calls_expr(t, arrays, out); }
-        }
-        Expr::Index { base, index } => {
-            real_calls_expr(base, arrays, out);
-            real_calls_expr(index, arrays, out);
-        }
-        Expr::Call { callee, args } => {
-            if !array_builtin_call(callee, args, arrays) {
-                out.push(callee.clone());
-            }
-            // still scan args (a push value may itself contain a real call)
-            for a in args { real_calls_expr(a, arrays, out); }
-        }
-        _ => {}
-    }
 }
 fn calls_stmt(s: &Stmt, out: &mut Vec<String>) {
     match s {
@@ -608,42 +274,8 @@ impl Jit {
         flags.set("opt_level", "speed").ok()?;
         let isa = cranelift_native::builder().ok()?
             .finish(settings::Flags::new(flags)).ok()?;
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        builder.symbol("nova_arr_new", nova_arr_new as *const u8);
-        builder.symbol("nova_arr_push", nova_arr_push as *const u8);
-        builder.symbol("nova_arr_len", nova_arr_len as *const u8);
-        builder.symbol("nova_arr_get", nova_arr_get as *const u8);
-        builder.symbol("nova_arr_set", nova_arr_set as *const u8);
-        builder.symbol("nova_arr_pop", nova_arr_pop as *const u8);
-        builder.symbol("nova_fmod", nova_fmod as *const u8);
-        builder.symbol("nova_fpow", nova_fpow as *const u8);
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         let mut module = JITModule::new(builder);
-
-        // imported runtime helpers (arena arrays + f64 %/**)
-        let mut helpers: HashMap<&'static str, FuncId> = HashMap::new();
-        {
-            let f64t = types::F64;
-            let sigs: [(&'static str, &[Type], &[Type]); 8] = [
-                ("nova_arr_new", &[], &[I64]),
-                ("nova_arr_push", &[I64, I64], &[]),
-                ("nova_arr_len", &[I64], &[I64]),
-                ("nova_arr_get", &[I64, I64, I64], &[I64]),
-                ("nova_arr_set", &[I64, I64, I64, I64], &[]),
-                ("nova_arr_pop", &[I64, I64], &[I64]),
-                ("nova_fmod", &[f64t, f64t], &[f64t]),
-                ("nova_fpow", &[f64t, f64t], &[f64t]),
-            ];
-            for (name, params, rets) in sigs {
-                let mut sig = module.make_signature();
-                for p in params { sig.params.push(AbiParam::new(*p)); }
-                for r in rets { sig.returns.push(AbiParam::new(*r)); }
-                let id = module.declare_function(name, Linkage::Import, &sig).ok()?;
-                helpers.insert(name, id);
-            }
-        }
-        let libm: HashMap<&'static str, FuncId> = [
-            ("fmod", helpers["nova_fmod"]), ("fpow", helpers["nova_fpow"]),
-        ].into_iter().collect();
 
         // 1) declare every eligible function so calls can reference them
         let mut names: Vec<&str> = eligible.iter().map(|s| s.as_str()).collect();
@@ -670,9 +302,8 @@ impl Jit {
             for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
             ctx.func.signature.returns.push(AbiParam::new(I64));
             {
-                let arrays = array_vars(f);
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, &f.params);
+                let mut g = FnGen::new(&mut b, &mut module, &ids, &f.params);
                 g.lower(&f.body)?;
                 b.finalize();
             }
@@ -703,7 +334,7 @@ impl Jit {
             ctx.func.signature.returns.push(AbiParam::new(types::F64));
             {
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let mut g = FloatGen::new(&mut b, &mut module, &fids, &libm, &f.params);
+                let mut g = FloatGen::new(&mut b, &mut module, &fids, &f.params);
                 g.lower(&f.body)?;
                 b.finalize();
             }
@@ -764,9 +395,6 @@ impl Jit {
                 _ => unreachable!("arity > MAX_ARITY is not compiled"),
             }
         };
-        // local arrays live only for the duration of one top-level native call;
-        // resetting here also makes the deopt re-run on the VM start clean
-        jit_arena_reset();
         (raw, d != 0)
     }
 }
@@ -807,10 +435,7 @@ struct FloatGen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     module: &'a mut JITModule,
     ids: &'a HashMap<String, (FuncId, usize)>,
-    libm: &'a HashMap<&'static str, FuncId>,
-    // variables carry their static kind: F64 values, or I64 for-range
-    // counters / int-literal bindings that promote via as_f at each use
-    vars: HashMap<String, (Variable, FKind)>,
+    vars: HashMap<String, Variable>,
     n_vars: usize,
     loops: Vec<LoopCtx>,
     returned: bool,
@@ -818,42 +443,27 @@ struct FloatGen<'a, 'b> {
 
 impl<'a, 'b> FloatGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut JITModule,
-           ids: &'a HashMap<String, (FuncId, usize)>,
-           libm: &'a HashMap<&'static str, FuncId>, params: &[String]) -> Self {
+           ids: &'a HashMap<String, (FuncId, usize)>, params: &[String]) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         b.seal_block(entry);
         let param_vals: Vec<Value> = b.block_params(entry).to_vec();
-        let mut g = FloatGen {
-            b, module, ids, libm, vars: HashMap::new(), n_vars: 0,
-            loops: Vec::new(), returned: false,
-        };
+        let mut g = FloatGen { b, module, ids, vars: HashMap::new(), n_vars: 0, loops: Vec::new(), returned: false };
         for (i, p) in params.iter().enumerate() {
-            let v = g.declare(p, FKind::F);
+            let v = g.declare(p);
             g.b.def_var(v, param_vals[i]);
         }
         g
     }
 
-    fn declare(&mut self, name: &str, kind: FKind) -> Variable {
-        if let Some((v, k)) = self.vars.get(name) {
-            debug_assert!(*k == kind, "kind changed for {}", name);
-            return *v;
-        }
+    fn declare(&mut self, name: &str) -> Variable {
+        if let Some(v) = self.vars.get(name) { return *v; }
         let v = Variable::new(self.n_vars);
         self.n_vars += 1;
-        self.b.declare_var(v, if kind == FKind::F { types::F64 } else { I64 });
-        self.vars.insert(name.to_string(), (v, kind));
+        self.b.declare_var(v, types::F64);
+        self.vars.insert(name.to_string(), v);
         v
-    }
-
-    // promote an (value, kind) pair to f64 — the interpreter's as_f
-    fn to_f(&mut self, v: Value, k: FKind) -> Value {
-        match k {
-            FKind::F => v,
-            FKind::I => self.b.ins().fcvt_from_sint(types::F64, v),
-        }
     }
 
     fn lower(&mut self, body: &[Stmt]) -> Option<()> {
@@ -869,14 +479,13 @@ impl<'a, 'b> FloatGen<'a, 'b> {
         if self.returned { return Some(()); }
         match s {
             Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
-                let (v, k) = self.expr(value)?;
-                let var = self.declare(name, k);
+                let v = self.expr(value)?;
+                let var = self.declare(name);
                 self.b.def_var(var, v);
             }
             Stmt::Expr(e) => { self.expr(e)?; }
             Stmt::Return(Some(e)) => {
-                let (v, k) = self.expr(e)?;
-                let v = self.to_f(v, k);
+                let v = self.expr(e)?;
                 self.b.ins().return_(&[v]);
                 self.returned = true;
             }
@@ -920,50 +529,6 @@ impl<'a, 'b> FloatGen<'a, 'b> {
                 self.b.seal_block(exit);
                 self.returned = false;
             }
-            Stmt::ForRange { var, start, end, inclusive, body } => {
-                // i64 counter exactly like the interpreter's ForRange; the loop
-                // var is I-kind and promotes at float uses inside the body
-                let (s0, sk) = self.expr(start)?;
-                if sk != FKind::I { return None; }
-                let (e0, ek) = self.expr(end)?;
-                if ek != FKind::I { return None; }
-                let iv = self.declare(var, FKind::I);
-                self.b.def_var(iv, s0);
-                let limit = {
-                    let v = Variable::new(self.n_vars);
-                    self.n_vars += 1;
-                    self.b.declare_var(v, I64);
-                    v
-                };
-                self.b.def_var(limit, e0);
-
-                let header = self.b.create_block();
-                let body_b = self.b.create_block();
-                let exit = self.b.create_block();
-                self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(header);
-                let i = self.b.use_var(iv);
-                let lim = self.b.use_var(limit);
-                let cc = if *inclusive { IntCC::SignedLessThanOrEqual } else { IntCC::SignedLessThan };
-                let cont = self.b.ins().icmp(cc, i, lim);
-                self.b.ins().brif(cont, body_b, &[], exit, &[]);
-                self.b.switch_to_block(body_b);
-                self.b.seal_block(body_b);
-                self.loops.push(LoopCtx { header, exit });
-                self.returned = false;
-                for st in body { self.stmt(st)?; }
-                if !self.returned {
-                    let i = self.b.use_var(iv);
-                    let next = self.b.ins().iadd_imm(i, 1);
-                    self.b.def_var(iv, next);
-                    self.b.ins().jump(header, &[]);
-                }
-                self.loops.pop();
-                self.b.seal_block(header);
-                self.b.switch_to_block(exit);
-                self.b.seal_block(exit);
-                self.returned = false;
-            }
             Stmt::Break(None) => {
                 let exit = self.loops.last()?.exit;
                 self.b.ins().jump(exit, &[]);
@@ -979,8 +544,7 @@ impl<'a, 'b> FloatGen<'a, 'b> {
         Some(())
     }
 
-    // boolean condition (i64 0/1): numeric comparisons through as_f (exactly
-    // the interpreter's is_num arms) + short-circuit && || !
+    // boolean condition (i64 0/1): float comparisons + short-circuit && || !
     fn cond(&mut self, e: &Expr) -> Option<Value> {
         match e {
             Expr::At { expr, .. } => self.cond(expr),
@@ -1019,10 +583,8 @@ impl<'a, 'b> FloatGen<'a, 'b> {
                 Some(self.b.block_params(merge)[0])
             }
             Expr::Binary { op, lhs, rhs } => {
-                let (a, ak) = self.expr(lhs)?;
-                let (bv, bk) = self.expr(rhs)?;
-                let a = self.to_f(a, ak);
-                let bv = self.to_f(bv, bk);
+                let a = self.expr(lhs)?;
+                let bv = self.expr(rhs)?;
                 let cc = match op {
                     BinOp::Eq => FloatCC::Equal,
                     BinOp::Ne => FloatCC::NotEqual,
@@ -1039,49 +601,37 @@ impl<'a, 'b> FloatGen<'a, 'b> {
         }
     }
 
-    fn expr(&mut self, e: &Expr) -> Option<(Value, FKind)> {
+    fn expr(&mut self, e: &Expr) -> Option<Value> {
         match e {
             Expr::At { expr, .. } => self.expr(expr),
-            Expr::Float(x) => Some((self.b.ins().f64const(*x), FKind::F)),
-            Expr::Int(n) => Some((self.b.ins().iconst(I64, *n), FKind::I)),
+            Expr::Float(x) => Some(self.b.ins().f64const(*x)),
             Expr::Ident(name) => {
-                let (v, k) = *self.vars.get(name)?;
-                Some((self.b.use_var(v), k))
+                let v = *self.vars.get(name)?;
+                Some(self.b.use_var(v))
             }
             Expr::Unary { op: UnOp::Neg, expr } => {
-                let (v, k) = self.expr(expr)?;
-                if k != FKind::F { return None; }
-                Some((self.b.ins().fneg(v), FKind::F))
+                let v = self.expr(expr)?;
+                Some(self.b.ins().fneg(v))
             }
             Expr::Binary { op, lhs, rhs } => {
-                let (a, ak) = self.expr(lhs)?;
-                let (bv, bk) = self.expr(rhs)?;
-                if ak == FKind::I && bk == FKind::I { return None; }
-                let a = self.to_f(a, ak);
-                let bv = self.to_f(bv, bk);
-                let v = match op {
+                let a = self.expr(lhs)?;
+                let bv = self.expr(rhs)?;
+                Some(match op {
                     BinOp::Add => self.b.ins().fadd(a, bv),
                     BinOp::Sub => self.b.ins().fsub(a, bv),
                     BinOp::Mul => self.b.ins().fmul(a, bv),
                     BinOp::Div => self.b.ins().fdiv(a, bv), // /0.0 -> inf, as the interp
-                    BinOp::Rem => self.libcall("fmod", a, bv)?,
-                    BinOp::Pow => self.libcall("fpow", a, bv)?,
                     _ => return None,
-                };
-                Some((v, FKind::F))
+                })
             }
             Expr::Call { callee, args } => {
                 let (id, arity) = *self.ids.get(callee.as_str())?;
                 if args.len() != arity { return None; }
                 let fref = self.module.declare_func_in_func(id, self.b.func);
                 let mut argv = Vec::with_capacity(arity);
-                for a in args {
-                    let (v, k) = self.expr(a)?;
-                    if k != FKind::F { return None; }
-                    argv.push(v);
-                }
+                for a in args { argv.push(self.expr(a)?); }
                 let inst = self.b.ins().call(fref, &argv);
-                Some((self.b.inst_results(inst)[0], FKind::F))
+                Some(self.b.inst_results(inst)[0])
             }
             Expr::If { cond, then, els } => {
                 let c = self.cond(cond)?;
@@ -1092,17 +642,15 @@ impl<'a, 'b> FloatGen<'a, 'b> {
                 self.b.ins().brif(c, then_b, &[], else_b, &[]);
                 self.b.switch_to_block(then_b);
                 self.b.seal_block(then_b);
-                let (tv, tk) = self.expr(then)?;
-                if tk != FKind::F { return None; }
+                let tv = self.expr(then)?;
                 self.b.ins().jump(merge, &[tv]);
                 self.b.switch_to_block(else_b);
                 self.b.seal_block(else_b);
-                let (ev, ek) = self.expr(els)?;
-                if ek != FKind::F { return None; }
+                let ev = self.expr(els)?;
                 self.b.ins().jump(merge, &[ev]);
                 self.b.switch_to_block(merge);
                 self.b.seal_block(merge);
-                Some((self.b.block_params(merge)[0], FKind::F))
+                Some(self.b.block_params(merge)[0])
             }
             Expr::Block { stmts, tail } => {
                 for s in stmts { self.stmt(s)?; }
@@ -1110,14 +658,6 @@ impl<'a, 'b> FloatGen<'a, 'b> {
             }
             _ => None,
         }
-    }
-
-    // f64 % and ** through the Rust helpers, bit-identical to the interpreter
-    fn libcall(&mut self, which: &str, a: Value, bv: Value) -> Option<Value> {
-        let id = *self.libm.get(which)?;
-        let fref = self.module.declare_func_in_func(id, self.b.func);
-        let inst = self.b.ins().call(fref, &[a, bv]);
-        Some(self.b.inst_results(inst)[0])
     }
 }
 
@@ -1245,8 +785,6 @@ struct FnGen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     module: &'a mut JITModule,
     ids: &'a HashMap<String, (FuncId, usize)>,
-    helpers: &'a HashMap<&'static str, FuncId>,
-    arrays: HashSet<String>, // local array vars: I64 arena handles
     vars: HashMap<String, Variable>,
     n_vars: usize,
     deopt_ptr: Value,
@@ -1257,9 +795,7 @@ struct FnGen<'a, 'b> {
 
 impl<'a, 'b> FnGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut JITModule,
-           ids: &'a HashMap<String, (FuncId, usize)>,
-           helpers: &'a HashMap<&'static str, FuncId>,
-           arrays: HashSet<String>, params: &[String]) -> Self {
+           ids: &'a HashMap<String, (FuncId, usize)>, params: &[String]) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -1267,7 +803,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         let param_vals: Vec<Value> = b.block_params(entry)[1..].to_vec();
         let deopt_block = b.create_block();
         let mut g = FnGen {
-            b, module, ids, helpers, arrays, vars: HashMap::new(), n_vars: 0,
+            b, module, ids, vars: HashMap::new(), n_vars: 0,
             deopt_ptr, deopt_block, loops: Vec::new(), returned: false,
         };
         for (i, p) in params.iter().enumerate() {
@@ -1275,32 +811,6 @@ impl<'a, 'b> FnGen<'a, 'b> {
             g.b.def_var(v, param_vals[i]);
         }
         g
-    }
-
-    // call an imported runtime helper; `fallible` loads and guards the deopt flag
-    fn helper_call(&mut self, name: &str, args: &[Value], fallible: bool) -> Option<Value> {
-        let id = *self.helpers.get(name)?;
-        let fref = self.module.declare_func_in_func(id, self.b.func);
-        let inst = self.b.ins().call(fref, args);
-        let res = self.b.inst_results(inst).first().copied();
-        if fallible {
-            let flag = self.b.ins().load(I64, MemFlags::trusted(), self.deopt_ptr, 0);
-            self.guard_deopt(flag);
-        }
-        res
-    }
-
-    // build a fresh arena array from a literal and bind it to `name`
-    fn build_array(&mut self, name: &str, elems: &[Expr]) -> Option<()> {
-        let h = self.helper_call("nova_arr_new", &[], false)?;
-        let var = self.declare(name);
-        self.b.def_var(var, h);
-        for el in elems {
-            let v = self.expr(el)?;
-            let h = self.b.use_var(var);
-            self.helper_call("nova_arr_push", &[h, v], false);
-        }
-        Some(())
     }
 
     fn declare(&mut self, name: &str) -> Variable {
@@ -1345,50 +855,15 @@ impl<'a, 'b> FnGen<'a, 'b> {
         if self.returned { return Some(()); }
         match s {
             Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
-                if self.arrays.contains(name) {
-                    match strip_at(value) {
-                        Expr::Array(elems) => { self.build_array(name, elems)?; }
-                        Expr::Ident(src) => {
-                            // alias: same handle, same shared storage as the interp's Rc
-                            let sv = *self.vars.get(src)?;
-                            let h = self.b.use_var(sv);
-                            let var = self.declare(name);
-                            self.b.def_var(var, h);
-                        }
-                        _ => return None,
-                    }
-                } else {
-                    let v = self.expr(value)?;
-                    let var = self.declare(name);
-                    self.b.def_var(var, v);
-                }
+                let v = self.expr(value)?;
+                let var = self.declare(name);
+                self.b.def_var(var, v);
             }
-            Stmt::Expr(e) => {
-                if let Expr::Call { callee, args } = strip_at(e) {
-                    if callee == "push" && array_builtin_call(callee, args, &self.arrays) {
-                        let name = as_ident(&args[0])?;
-                        let av = *self.vars.get(name)?;
-                        let h = self.b.use_var(av);
-                        let v = self.expr(&args[1])?;
-                        self.helper_call("nova_arr_push", &[h, v], false);
-                        return Some(());
-                    }
-                }
-                self.expr(e)?;
-            }
+            Stmt::Expr(e) => { self.expr(e)?; }
             Stmt::Return(Some(e)) => {
                 let v = self.expr(e)?;
                 self.b.ins().return_(&[v]);
                 self.returned = true;
-            }
-            Stmt::IndexAssign { base, index, value } => {
-                let name = as_ident(base)?;
-                if !self.arrays.contains(name) { return None; }
-                let av = *self.vars.get(name)?;
-                let h = self.b.use_var(av);
-                let i = self.expr(index)?;
-                let v = self.expr(value)?;
-                self.helper_call("nova_arr_set", &[self.deopt_ptr, h, i, v], true);
             }
             Stmt::If { cond, then, els } => self.if_stmt(cond, then, els.as_deref())?,
             Stmt::While { cond, body } => self.while_stmt(cond, body)?,
@@ -1534,28 +1009,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 }
             }
             Expr::Binary { op, lhs, rhs } => self.binop(*op, lhs, rhs),
-            Expr::Index { base, index } => {
-                let name = as_ident(base)?;
-                if !self.arrays.contains(name) { return None; }
-                let av = *self.vars.get(name)?;
-                let h = self.b.use_var(av);
-                let i = self.expr(index)?;
-                self.helper_call("nova_arr_get", &[self.deopt_ptr, h, i], true)
-            }
-            Expr::Call { callee, args } => {
-                if array_builtin_call(callee, args, &self.arrays) {
-                    let name = as_ident(&args[0])?;
-                    let av = *self.vars.get(name)?;
-                    let h = self.b.use_var(av);
-                    return match callee.as_str() {
-                        "len" => self.helper_call("nova_arr_len", &[h], false),
-                        // empty pop -> interp yields null: deopt re-runs on the VM
-                        "pop" => self.helper_call("nova_arr_pop", &[self.deopt_ptr, h], true),
-                        _ => None, // push is statement-only
-                    };
-                }
-                self.call(callee, args)
-            }
+            Expr::Call { callee, args } => self.call(callee, args),
             Expr::If { cond, then, els } => {
                 let c = self.truthy(cond)?;
                 let then_b = self.b.create_block();
@@ -1627,7 +1081,11 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 self.guard_deopt(both);
                 if matches!(op, Div) { self.b.ins().sdiv(a, b) } else { self.b.ins().srem(a, b) }
             }
-            Pow => self.pow_checked(a, b),
+            Pow => {
+                let one = self.b.ins().iconst(I64, 1);
+                self.guard_deopt(one);
+                self.b.ins().iconst(I64, 0)
+            }
             BitOr => self.b.ins().bor(a, b),
             BitXor => self.b.ins().bxor(a, b),
             BitAnd => self.b.ins().band(a, b),
@@ -1718,70 +1176,6 @@ impl<'a, 'b> FnGen<'a, 'b> {
         let ovf = self.b.ins().uextend(I64, ovf);
         self.guard_deopt(ovf);
         r
-    }
-
-    // Integer `**`, transcribing i64::checked_pow's square-and-multiply exactly:
-    // any intermediate overflow deopts (the interpreter promotes to BigInt), a
-    // negative exponent deopts (interp returns a Float), and exponents beyond
-    // u32::MAX deopt (interp switches to powf).
-    fn pow_checked(&mut self, base0: Value, exp0: Value) -> Value {
-        let zero = self.b.ins().iconst(I64, 0);
-        let neg = self.b.ins().icmp(IntCC::SignedLessThan, exp0, zero);
-        let neg = self.b.ins().uextend(I64, neg);
-        self.guard_deopt(neg);
-        let umax = self.b.ins().iconst(I64, u32::MAX as i64);
-        let big = self.b.ins().icmp(IntCC::SignedGreaterThan, exp0, umax);
-        let big = self.b.ins().uextend(I64, big);
-        self.guard_deopt(big);
-
-        let acc_v = self.fresh_var();
-        let base_v = self.fresh_var();
-        let exp_v = self.fresh_var();
-        let one = self.b.ins().iconst(I64, 1);
-        self.b.def_var(acc_v, one);
-        self.b.def_var(base_v, base0);
-        self.b.def_var(exp_v, exp0);
-
-        let header = self.b.create_block();
-        let odd = self.b.create_block();
-        let shift = self.b.create_block();
-        let merge = self.b.create_block();
-        self.b.append_block_param(merge, I64);
-
-        // exp == 0 -> 1
-        let is_zero = self.b.ins().icmp(IntCC::Equal, exp0, zero);
-        let one2 = self.b.ins().iconst(I64, 1);
-        self.b.ins().brif(is_zero, merge, &[one2], header, &[]);
-
-        self.b.switch_to_block(header);
-        let e = self.b.use_var(exp_v);
-        let bit = self.b.ins().band_imm(e, 1);
-        self.b.ins().brif(bit, odd, &[], shift, &[]);
-
-        self.b.switch_to_block(odd);
-        self.b.seal_block(odd);
-        let acc = self.b.use_var(acc_v);
-        let bas = self.b.use_var(base_v);
-        let acc2 = self.mul_checked(acc, bas);
-        self.b.def_var(acc_v, acc2);
-        let e = self.b.use_var(exp_v);
-        let is_one = self.b.ins().icmp_imm(IntCC::Equal, e, 1);
-        self.b.ins().brif(is_one, merge, &[acc2], shift, &[]);
-
-        self.b.switch_to_block(shift);
-        self.b.seal_block(shift);
-        let e = self.b.use_var(exp_v);
-        let e2 = self.b.ins().ushr_imm(e, 1);
-        self.b.def_var(exp_v, e2);
-        let bas = self.b.use_var(base_v);
-        let sq = self.mul_checked(bas, bas);
-        self.b.def_var(base_v, sq);
-        self.b.ins().jump(header, &[]);
-
-        self.b.seal_block(header);
-        self.b.switch_to_block(merge);
-        self.b.seal_block(merge);
-        self.b.block_params(merge)[0]
     }
 
     fn mul_checked(&mut self, a: Value, b: Value) -> Value {
@@ -1951,73 +1345,8 @@ mod jit_tests {
              fn main(){ let t = 0.0; let i = 0.0; while i < 500.0 { t = hot(t); i = i + 1.0 } t }", 50);
         assert!(names.contains(&"hot".to_string()), "hot float fn must compile");
     }
-    // --- Phase 6: int **, f64 % and **, mixed int/float, local arrays ---
-    #[test] fn pow_small_ints() {
-        same_jit("fn f(a,b){ a ** b } fn main(){ f(2,10) + f(3,0) + f(1,4294967295) + f(0-2,3) }");
-    }
-    #[test] fn pow_overflow_promotes_bigint() {
-        // 2**63 overflows i64 -> deopt -> VM/interp promote to BigInt
-        same_jit("fn f(a,b){ a ** b } fn main(){ f(2,63) }");
-    }
-    #[test] fn pow_negative_exponent_deopts_to_float() {
-        same_jit("fn f(a,b){ a ** b } fn main(){ f(2, 0-2) }");
-    }
-    #[test] fn pow_in_loop() {
-        same_jit("fn s(n){ t=0; for i in 0..n { t = t + 2 ** i }; t } fn main(){ s(20) }");
-    }
-    #[test] fn float_rem_and_pow() {
-        same_jit("fn f(a,b){ (a % b) + (a ** b) + ((0.0-a) % b) } fn main(){ f(7.5, 2.25) + f(9.0, 0.5) }");
-    }
-    #[test] fn float_mixed_int_literals() {
-        // int literals in float math now compile natively on the f64 track
-        same_jit("fn f(a){ a * 2 + 1 } fn main(){ f(1.5) }");
-    }
-    #[test] fn float_mixed_compare_with_int_zero() {
-        same_jit("fn f(x){ if x > 0 { x * 0.5 } else { 0.0 - x } } fn main(){ f(3.5) + f(0.0-2.0) }");
-    }
-    #[test] fn float_for_range_body() {
-        same_jit("fn s(n){ t = 0.0; for i in 0..1000 { t = t + i * 0.001 + n * 0 }; t } fn main(){ s(0.0) }");
-    }
-    #[test] fn float_int_division_stays_off_track() {
-        // 7/2 is exact integer division in the interp; the f64 track must reject it
-        use super::{float_eligible_set, eligible_set};
-        let mut prog = parse_program("fn f(a){ (7/2) + a } fn main(){ f(0.5) }").unwrap();
-        fold_program(&mut prog);
-        let ints = eligible_set(&prog);
-        assert!(!float_eligible_set(&prog, &ints).contains("f"));
-    }
-    #[test] fn array_sum() {
-        same_jit("fn s(n){ a=[]; for i in 0..n { push(a, i*i) }; t=0; for i in 0..len(a) { t=t+a[i] }; t } fn main(){ s(100) }");
-    }
-    #[test] fn array_sieve() {
-        same_jit("fn primes(n){ s=[]; for i in 0..n { push(s, 1) }; s[0]=0; s[1]=0; i=2; while i*i<n { if s[i]==1 { j=i*i; while j<n { s[j]=0; j=j+i } }; i=i+1 }; c=0; for k in 0..n { c=c+s[k] }; c } fn main(){ primes(1000) }");
-    }
-    #[test] fn array_alias_shares_storage() {
-        same_jit("fn f(){ a=[1,2,3]; b=a; b[0]=99; a[0]+a[1] } fn main(){ f() }");
-    }
-    #[test] fn array_pop_and_oob_deopt() {
-        // in-range pops native; the out-of-bounds read deopts and re-raises the
-        // interpreter's exact error on the VM
-        same_jit("fn f(){ a=[10,20]; x=pop(a); a[5] + x } fn main(){ f() }");
-    }
-    #[test] fn array_fn_is_eligible() {
-        use super::eligible_set;
-        let mut prog = parse_program(
-            "fn s(n){ a=[]; for i in 0..n { push(a, i) }; len(a) } fn main(){ s(5) }").unwrap();
-        fold_program(&mut prog);
-        assert!(eligible_set(&prog).contains("s"), "array fn must be on the i64 track");
-    }
-    #[test] fn array_escape_is_ineligible() {
-        use super::eligible_set;
-        let mut prog = parse_program(
-            "fn f(){ a=[1]; a } fn main(){ len(f()) }").unwrap();
-        fold_program(&mut prog);
-        assert!(!eligible_set(&prog).contains("f"), "escaping array must stay off the JIT");
-    }
-    #[test] fn array_tiered_hot() {
-        let names = same_tiered(
-            "fn s(n){ a=[]; for i in 0..n { push(a, i) }; t=0; for i in 0..len(a) { t=t+a[i] }; t }\n\
-             fn main(){ t=0; for k in 0..300 { t = t + s(20) }; t }", 50);
-        assert!(names.contains(&"s".to_string()), "hot array fn must compile");
+    #[test] fn float_mixed_stays_on_vm() {
+        // int literal inside float math -> ineligible; must still be identical (VM path)
+        same_jit("fn f(a){ a * 2 } fn main(){ f(1.5) }");
     }
 }

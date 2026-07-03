@@ -169,81 +169,37 @@ static void sb_put(SB *sb, const char *s, i64 n) {
 }
 static void sb_puts(SB *sb, const char *s) { sb_put(sb, s, (i64)strlen(s)); }
 
-/* Nova floats print exactly like interp.rs: integral & finite -> Rust {:.1}
- * (full decimal expansion + ".0", NEVER e-notation, even for 1e301); anything
- * else -> Rust {} = the shortest digit string that round-trips, laid out in
- * plain decimal. We find the shortest digits with a correctly-rounded %.*e
- * probe (glibc rounds to nearest-even like Rust's grisu/ryu), then rebuild the
- * decimal form ourselves: non-integral doubles always satisfy |x| < 2^52, so
- * the digits never run out before the decimal point. */
+/* Rust {} on f64 = shortest string that round-trips. Try increasing precision
+ * with %g (which Rust's output is a subset of, modulo e-notation styling). */
 static void fmt_f64(SB *sb, double x) {
+    char tmp[64];
     if (x != x) { sb_puts(sb, "NaN"); return; }
     if (x > 1.7e308 && x / 2 == x) { sb_puts(sb, "inf"); return; }
     if (x < -1.7e308 && x / 2 == x) { sb_puts(sb, "-inf"); return; }
-    /* integral test without libm: every |x| >= 2^52 is integral; below that
-     * the i64 cast is exact */
-    int integral = (x >= 4503599627370496.0 || x <= -4503599627370496.0)
-                || ((double)(i64)x == x);
-    char big[352];
-    if (integral) {
-        snprintf(big, sizeof big, "%.1f", x); /* == Rust {:.1}, incl. "-0.0" */
-        sb_puts(sb, big);
+    double frac = x - (double)(i64)x;
+    if (frac == 0.0 && x < 9.2e18 && x > -9.2e18) {
+        /* integral & finite: Rust prints {:.1} => "3.0" (interp special-case) */
+        snprintf(tmp, sizeof tmp, "%.1f", x);
+        sb_puts(sb, tmp);
         return;
     }
-    char tmp[64];
-    int prec = 1;
-    for (; prec <= 17; prec++) {
-        snprintf(tmp, sizeof tmp, "%.*e", prec - 1, x);
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(tmp, sizeof tmp, "%.*g", prec, x);
         if (strtod(tmp, NULL) == x) break;
     }
-    /* tmp = "[-]d[.ddd]e±XX" -> digits + base-10 exponent */
-    char digits[32]; int nd = 0; int exp10 = 0; int neg = 0;
-    const char *p = tmp;
-    if (*p == '-') { neg = 1; p++; }
-    for (; *p && *p != 'e'; p++) {
-        if (*p != '.') digits[nd++] = *p;
-    }
-    if (*p == 'e') exp10 = (int)strtol(p + 1, NULL, 10);
-    /* Tie correction: when x lies EXACTLY halfway between the two nd-digit
-     * candidates, glibc rounds the last digit to even but Rust's ryu rounds
-     * up. A double's exact decimal expansion has at most 767 significant
-     * digits, so "%.770e" prints it in full: a tie means digit nd is '5' and
-     * everything after it is '0'. Rebuild as truncation+1 (with carry). */
-    {
-        char full[800];
-        snprintf(full, sizeof full, "%.770e", x);
-        char fd[784]; int fn = 0; int fexp = 0;
-        const char *q = full;
-        if (*q == '-') q++;
-        for (; *q && *q != 'e'; q++) { if (*q != '.') fd[fn++] = *q; }
-        if (*q == 'e') fexp = (int)strtol(q + 1, NULL, 10);
-        if (fn > nd && fd[nd] == '5') {
-            int tie = 1;
-            for (int i = nd + 1; i < fn; i++) { if (fd[i] != '0') { tie = 0; break; } }
-            if (tie) {
-                memcpy(digits, fd, (size_t)nd);
-                exp10 = fexp;
-                int i = nd - 1;
-                for (; i >= 0; i--) {
-                    if (digits[i] != '9') { digits[i]++; break; }
-                    digits[i] = '0';
-                }
-                if (i < 0) { digits[0] = '1'; nd = 1; exp10++; }
-            }
+    /* normalize C e-notation (1e+05 / 1.5e-07) to Rust style (1e5 / 1.5e-7) */
+    char out[64]; i64 o = 0;
+    for (char *p = tmp; *p; p++) {
+        if (*p == 'e') {
+            out[o++] = 'e';
+            p++;
+            if (*p == '+') p++;
+            else if (*p == '-') { out[o++] = '-'; p++; }
+            while (*p == '0' && *(p + 1)) p++;
+            while (*p) out[o++] = *p++;
+            break;
         }
-    }
-    char out[400]; int o = 0;
-    if (neg) out[o++] = '-';
-    if (exp10 < 0) {
-        out[o++] = '0'; out[o++] = '.';
-        for (int i = 0; i < -exp10 - 1; i++) out[o++] = '0';
-        for (int i = 0; i < nd; i++) out[o++] = digits[i];
-    } else {
-        /* non-integral => the point lands inside the digit string */
-        for (int i = 0; i <= exp10; i++) out[o++] = i < nd ? digits[i] : '0';
-        out[o++] = '.';
-        for (int i = exp10 + 1; i < nd; i++) out[o++] = digits[i];
-        if (o > 0 && out[o - 1] == '.') out[o++] = '0';
+        out[o++] = *p;
     }
     out[o] = 0;
     sb_puts(sb, out);
