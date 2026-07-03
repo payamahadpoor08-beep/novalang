@@ -1,0 +1,50 @@
+struct Point {
+  x: i32,
+  y: i32,
+}
+
+impl Point {
+  fn dist_sq(self) -> i32 {
+    self.x * self.x + self.y * self.y
+  }
+}
+
+fn fib(n) {
+  if n < 2 {
+    n
+  } else {
+    fib(n - 1) + fib(n - 2)
+  }
+}
+
+fn abs_val(n) {
+  if n < 0 {
+    0 - n
+  } else {
+    n
+  }
+}
+
+fn main() {
+  greeting = "Nova with clean syntax!"
+  print(greeting)
+
+  print("fib(10) =")
+  print(fib(10))
+
+  p = Point { x: 3, y: 4 }
+  print("distance squared:")
+  print(p.dist_sq())
+
+  nums = [1, 2, 3, 4, 5]
+  squared = map(nums, x => x * x)
+  print("squared:")
+  print(squared)
+
+  total = reduce(squared, (a, b) => a + b, 0)
+  print("sum of squares:")
+  print(total)
+
+  print("abs(-7) =")
+  print(abs_val(0 - 7))
+}

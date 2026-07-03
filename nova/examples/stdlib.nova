@@ -1,0 +1,24 @@
+use math.{lcm, tau, phi, cbrt, sign, hypot, clamp, lerp, factorial, log2}
+use strings.{ends_with, repeat, capitalize, title, pad_left, find, substring, levenshtein}
+
+fn main() {
+  print("=== math ===")
+  print(lcm(4, 6))
+  print(cbrt(27.0))
+  print(sign(-5))
+  print(hypot(3.0, 4.0))
+  print(clamp(15.0, 0.0, 10.0))
+  print(lerp(0.0, 100.0, 0.5))
+  print(factorial(6))
+  print(log2(8.0))
+
+  print("=== strings ===")
+  print(ends_with("nova.rs", ".rs"))
+  print(repeat("ab", 3))
+  print(capitalize("hello"))
+  print(title("hello nova world"))
+  print(pad_left("42", 5, "0"))
+  print(find("hello", "ll"))
+  print(substring("hello world", 6))
+  print(levenshtein("kitten", "sitting"))
+}

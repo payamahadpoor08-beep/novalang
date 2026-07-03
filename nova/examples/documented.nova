@@ -1,0 +1,24 @@
+//! Geometry helpers — a small, fully documented module.
+//! Run `nova doc examples/documented.nova` to render this as Markdown.
+
+/// A point in the 2D plane.
+struct Point { x: Int, y: Int }
+
+/// Returns the squared distance between two points.
+/// Avoids a square root, so the result stays an integer.
+fn dist_sq(a, b) {
+  let dx = a.x - b.x
+  let dy = a.y - b.y
+  dx * dx + dy * dy
+}
+
+/// The origin point (0, 0).
+const ORIGIN_X = 0
+
+fn main() {
+  let p = Point { x: 3, y: 4 }
+  let o = Point { x: ORIGIN_X, y: 0 }
+  print(dist_sq(p, o))   // 25
+}
+
+test "distance squared" { assert_eq(dist_sq(Point { x: 3, y: 4 }, Point { x: 0, y: 0 }), 25) }

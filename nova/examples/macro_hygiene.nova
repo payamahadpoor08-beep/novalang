@@ -1,0 +1,15 @@
+// Hygienic macros: a macro may use its own `let` bindings, and they never
+// capture (or get captured by) variables at the call site. The macro's `tmp`
+// below is renamed to a unique name at each expansion.
+
+macro double { ($x:expr) => { let tmp = $x; tmp + tmp } }
+
+fn main() {
+  let tmp = 100             // same name as the macro's internal binding
+  print(double!(tmp))       // 200  — the macro doubles the caller's `tmp`
+  print(tmp)                // 100  — the caller's `tmp` is untouched
+  print(double!(5 + 1))     // 12
+}
+
+test "macro doubles caller value" { let tmp = 7; assert_eq(double!(tmp), 14) }
+test "macro arg expression"       { assert_eq(double!(3 * 2), 12) }

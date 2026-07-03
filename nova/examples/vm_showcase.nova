@@ -1,0 +1,57 @@
+// vm_showcase.nova — exercises the bytecode VM's native heap opcodes end to end.
+//   nova run   vm_showcase.nova    # tree-walking interpreter
+//   nova vm    vm_showcase.nova    # bytecode VM (byte-identical output, faster)
+//   nova bench vm_showcase.nova    # times both
+//   nova disasm vm_showcase.nova   # shows the compiled bytecode
+//
+// Everything here compiles to native opcodes: array/map/set literals, ranges,
+// indexing and slicing, struct construction + field access, f-strings, and
+// index/field assignment — no delegation to the interpreter.
+
+data Point(x, y)
+
+fn sum_array(a) {
+  let total = 0;
+  for v in a { total = total + v; }
+  total
+}
+
+fn build_squares(n) {
+  let out = [];
+  for i in 1..=n { push(out, i * i); }   // push mutates the array in place
+  out
+}
+
+fn main() {
+  // arrays + indexing + slicing
+  let nums = [10, 20, 30, 40, 50];
+  print(nums[0] + nums[4]);          // 60
+  print(nums[1..4]);                 // [20, 30, 40]
+  print(sum_array(nums));            // 150
+
+  // index assignment mutates in place
+  nums[2] = 99;
+  print(nums[2]);                    // 99
+
+  // ranges materialize to arrays
+  print(build_squares(6));           // [1, 4, 9, 16, 25, 36]
+
+  // maps: insert, overwrite, read
+  let ages = #{"ada": 36, "alan": 41};
+  ages["ada"] = 37;
+  print(ages["ada"] + ages["alan"]); // 78
+
+  // structs: construct, read fields, assign a field
+  let p = Point { x: 3, y: 4 };
+  print(p.x * p.x + p.y * p.y);      // 25
+  p.x = 30;
+  print(f"point is ({p.x}, {p.y})"); // point is (30, 4)
+
+  // f-strings over computed values
+  let name = "Nova";
+  print(f"{name}: {sum_array([1, 2, 3])} items");  // Nova: 6 items
+}
+
+test "sum_array"     { assert_eq(sum_array([1, 2, 3, 4]), 10) }
+test "build_squares" { assert_eq(build_squares(4), [1, 4, 9, 16]) }
+test "slice"         { assert_eq([0, 1, 2, 3, 4][1..3], [1, 2]) }

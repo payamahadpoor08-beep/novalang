@@ -1,0 +1,12 @@
+fn greet(name) { "hello, " + name + "!" }
+fn main() {
+  print(greet("nova"))
+  let s = "abcdef"
+  print(s[2])
+  print(s[1..4])
+  print(s[..3] + s[3..])
+  print(len(s))
+  print("x" + 1 + "y" + 2.5)
+  print("a" == "a")
+  print("a" == "b")
+}

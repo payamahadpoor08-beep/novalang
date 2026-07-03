@@ -1,0 +1,38 @@
+// A pure-compute program that runs on BOTH backends:
+//   nova run compute.nova     # the tree-walking interpreter
+//   nova vm  compute.nova      # the bytecode VM (same output, faster)
+//   nova bench compute.nova    # times both and prints the speedup
+//
+// The VM compiles the scalar/control-flow/function core of Nova to bytecode for
+// speed (Phase 1) and runs the rest of the language correctly by delegating to
+// the interpreter (Phase 2), so `nova vm` output is identical to `nova run`.
+
+fn fib(n) {
+  if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn sum_to(n) {
+  let total = 0;
+  for i in 1..=n { total = total + i; }
+  total
+}
+
+fn gcd(a, b) {
+  while b != 0 {
+    let t = b;
+    b = a % b;
+    a = t;
+  }
+  a
+}
+
+fn main() {
+  print(fib(20));        // 6765
+  print(sum_to(100));    // 5050
+  print(gcd(48, 36));    // 12
+  print(2 ** 16);        // 65536
+}
+
+test "fib"    { assert_eq(fib(10), 55) }
+test "sum_to" { assert_eq(sum_to(10), 55) }
+test "gcd"    { assert_eq(gcd(48, 36), 12) }

@@ -1,0 +1,54 @@
+fn main() {
+  print("=== dictionary basics ===")
+  scores = dict()
+  map_set(scores, "Ali", 85)
+  map_set(scores, "Sara", 92)
+  map_set(scores, "Reza", 78)
+
+  print("Sara's score:")
+  print(map_get(scores, "Sara"))
+
+  print("all names:")
+  print(map_keys(scores))
+
+  print("all scores:")
+  print(map_values(scores))
+
+  print("has Ali?")
+  print(map_has(scores, "Ali"))
+  print("has Nobody?")
+  print(map_has(scores, "Nobody"))
+
+  print("=== index syntax ===")
+  ages = dict()
+  ages["Payam"] = 24
+  ages["Nova"] = 1
+  print("Payam's age via index:")
+  print(ages["Payam"])
+
+  ages["Payam"] = 25
+  print("after birthday:")
+  print(ages["Payam"])
+
+  print("=== word frequency counter ===")
+  words = ["apple", "banana", "apple", "cherry", "banana", "apple"]
+  freq = dict()
+  for w in words {
+    if map_has(freq, w) {
+      map_set(freq, w, map_get(freq, w) + 1)
+    } else {
+      map_set(freq, w, 1)
+    }
+  }
+  print("frequencies:")
+  print(freq)
+  print("apple count:")
+  print(map_get(freq, "apple"))
+
+  print("=== default values ===")
+  print("missing key with default:")
+  print(map_get(scores, "Ghost", -1))
+
+  print("map size:")
+  print(map_len(scores))
+}

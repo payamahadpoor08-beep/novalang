@@ -1,0 +1,560 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ doc_comment | inner_doc | block_comment | line_comment }
+
+line_comment  = _{ "//" ~ (!"\n" ~ ANY)* }
+block_comment = _{ "/*" ~ (block_comment | !"*/" ~ ANY)* ~ "*/" }
+doc_comment   = ${ "///" ~ (!"\n" ~ ANY)* }
+inner_doc     = ${ "//!" ~ (!"\n" ~ ANY)* }
+
+kw_fn       = @{ "fn"       ~ !ident_continue }
+kw_let      = @{ "let"      ~ !ident_continue }
+kw_mut      = @{ "mut"      ~ !ident_continue }
+kw_if       = @{ "if"       ~ !ident_continue }
+kw_else     = @{ "else"     ~ !ident_continue }
+kw_for      = @{ "for"      ~ !ident_continue }
+kw_while    = @{ "while"    ~ !ident_continue }
+kw_loop     = @{ "loop"     ~ !ident_continue }
+kw_break    = @{ "break"    ~ !ident_continue }
+kw_continue = @{ "continue" ~ !ident_continue }
+kw_return   = @{ "return"   ~ !ident_continue }
+kw_struct   = @{ "struct"   ~ !ident_continue }
+kw_enum     = @{ "enum"     ~ !ident_continue }
+kw_trait    = @{ "trait"    ~ !ident_continue }
+kw_impl     = @{ "impl"     ~ !ident_continue }
+kw_use      = @{ "use"      ~ !ident_continue }
+kw_mod      = @{ "mod"      ~ !ident_continue }
+kw_match    = @{ "match"    ~ !ident_continue }
+kw_as       = @{ "as"       ~ !ident_continue }
+kw_pub      = @{ "pub"      ~ !ident_continue }
+kw_self     = @{ "self"     ~ !ident_continue }
+kw_super    = @{ "super"    ~ !ident_continue }
+kw_crate    = @{ "crate"    ~ !ident_continue }
+kw_true     = @{ "true"     ~ !ident_continue }
+kw_false    = @{ "false"    ~ !ident_continue }
+kw_null     = @{ "null"     ~ !ident_continue }
+
+hard_keyword = _{
+    kw_fn | kw_let | kw_mut | kw_if | kw_else | kw_for | kw_while | kw_loop
+  | kw_break | kw_continue | kw_return | kw_struct | kw_enum | kw_trait | kw_impl
+  | kw_use | kw_mod | kw_match | kw_as | kw_pub | kw_self | kw_super | kw_crate
+  | kw_spawn | kw_select | kw_await
+  | kw_true | kw_false | kw_null
+}
+
+kw_type      = @{ "type"      ~ !ident_continue }
+kw_const     = @{ "const"     ~ !ident_continue }
+kw_static    = @{ "static"    ~ !ident_continue }
+kw_async     = @{ "async"     ~ !ident_continue }
+kw_await     = @{ "await"     ~ !ident_continue }
+kw_move      = @{ "move"      ~ !ident_continue }
+kw_ref       = @{ "ref"       ~ !ident_continue }
+kw_in        = @{ "in"        ~ !ident_continue }
+kw_where     = @{ "where"     ~ !ident_continue }
+kw_data      = @{ "data"      ~ !ident_continue }
+kw_extern    = @{ "extern"    ~ !ident_continue }
+kw_macro     = @{ "macro"     ~ !ident_continue }
+kw_defer     = @{ "defer"     ~ !ident_continue }
+kw_yield     = @{ "yield"     ~ !ident_continue }
+kw_spawn     = @{ "spawn"     ~ !ident_continue }
+kw_select    = @{ "select"    ~ !ident_continue }
+kw_chan      = @{ "chan"       ~ !ident_continue }
+kw_linear    = @{ "linear"    ~ !ident_continue }
+kw_affine    = @{ "affine"    ~ !ident_continue }
+kw_shared    = @{ "shared"    ~ !ident_continue }
+kw_try       = @{ "try"       ~ !ident_continue }
+kw_catch     = @{ "catch"     ~ !ident_continue }
+kw_finally   = @{ "finally"   ~ !ident_continue }
+kw_throw     = @{ "throw"     ~ !ident_continue }
+kw_migrate   = @{ "migrate"   ~ !ident_continue }
+kw_from      = @{ "from"      ~ !ident_continue }
+kw_to        = @{ "to"        ~ !ident_continue }
+kw_ast       = @{ "ast"       ~ !ident_continue }
+kw_stream    = @{ "stream"    ~ !ident_continue }
+kw_test      = @{ "test"      ~ !ident_continue }
+kw_machine   = @{ "machine"   ~ !ident_continue }
+kw_initial   = @{ "initial"   ~ !ident_continue }
+kw_on        = @{ "on"        ~ !ident_continue }
+
+ident_start    = _{ ASCII_ALPHA | "_" }
+ident_continue = _{ ASCII_ALPHANUMERIC | "_" }
+ident          = @{ !hard_keyword ~ ident_start ~ ident_continue* }
+lifetime       = @{ "'" ~ ident_start ~ ident_continue* }
+
+int_lit    = @{ (hex_lit | bin_lit | oct_lit | dec_lit) ~ int_suffix? }
+dec_lit    = @{ ASCII_DIGIT ~ (ASCII_DIGIT | "_")* }
+hex_lit    = @{ "0x" ~ ASCII_HEX_DIGIT ~ (ASCII_HEX_DIGIT | "_")* }
+bin_lit    = @{ "0b" ~ ("0" | "1") ~ ("0" | "1" | "_")* }
+oct_lit    = @{ "0o" ~ '0'..'7' ~ ('0'..'7' | "_")* }
+int_suffix = @{ ("i" | "u") ~ ("8" | "16" | "32" | "64" | "128" | "size") }
+
+float_lit    = @{ dec_lit ~ "." ~ dec_lit ~ float_exp? ~ float_suffix?
+               | dec_lit ~ float_exp ~ float_suffix? }
+float_exp    = @{ ("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+ }
+float_suffix = @{ "f" ~ ("32" | "64") }
+
+escape         = _{ "\\" ~ ("b" | "t" | "n" | "f" | "r" | "\"" | "'" | "\\" | "0" | unicode_escape) }
+unicode_escape = _{ "u{" ~ ASCII_HEX_DIGIT+ ~ "}" }
+string_lit     = ${ "\"" ~ (!("\"" | "\\") ~ ANY | escape)* ~ "\"" }
+char_lit       = ${ "'" ~ (!("'" | "\\") ~ ANY | escape) ~ "'" }
+raw_string     = ${ "r" ~ PUSH("#"*) ~ "\"" ~ (!("\"" ~ PEEK) ~ ANY)* ~ "\"" ~ POP }
+
+fmt_string_lit = ${ "f\"" ~ (fmt_text | fmt_interp)* ~ "\"" }
+fmt_text       = ${ (!("\"" | "\\" | "{" | "}") ~ ANY | escape | "{{" | "}}")+ }
+fmt_interp     = !{ "{" ~ expr ~ (":" ~ fmt_spec)? ~ "}" }
+fmt_spec       = { (!("}" | "{") ~ ANY | "{" ~ fmt_spec ~ "}")* }
+
+tagged_string_lit = ${ ("json" | "sql" | "re") ~ "\"" ~ (!("\"" | "\\") ~ ANY | escape)* ~ "\"" }
+
+bool_lit = { kw_true | kw_false }
+null_lit = { kw_null }
+literal  = {
+    float_lit | int_lit | tagged_string_lit | fmt_string_lit
+  | raw_string | string_lit | char_lit | bool_lit | null_lit
+}
+
+expr_path         = { (kw_self | kw_super | kw_crate | ident) ~ ("." ~ ident)* }
+type_path_segment = { ident ~ generic_args? }
+type_path         = { (kw_self | kw_super | kw_crate | type_path_segment) ~ ("." ~ type_path_segment)* }
+
+use_decl   = { kw_use ~ (string_lit | use_tree) ~ ";"? }
+use_tree   = { use_group | use_glob | use_named }
+use_named  = { use_prefix ~ (kw_as ~ ident)? }
+use_glob   = { use_prefix ~ "." ~ "*" }
+use_group  = { use_prefix ~ "." ~ "{" ~ use_tree ~ ("," ~ use_tree)* ~ ","? ~ "}" }
+use_prefix = { (kw_self | kw_super | kw_crate | ident) ~ ("." ~ ident)* }
+
+mod_decl = { kw_mod ~ ident ~ ("." ~ ident)* ~ (";" | mod_body) }
+mod_body = { "{" ~ top_level* ~ "}" }
+
+program  = { SOI ~ inner_doc* ~ mod_decl? ~ top_level* ~ EOI }
+top_level = {
+      attribute* ~ visibility? ~ (use_decl | item)
+    | top_stmt
+}
+top_stmt = { let_stmt | defer_stmt | expr ~ ";"? }
+
+item = {
+      func_decl | data_decl | struct_decl | enum_decl
+    | trait_decl | impl_block | migrate_decl
+    | type_decl | const_decl | static_decl
+    | extern_block | macro_decl | proc_macro_decl
+    | machine_decl | test_block
+}
+
+test_block = { kw_test ~ string_lit ~ block }
+
+machine_decl    = { kw_machine ~ ident ~ "{" ~ machine_initial ~ machine_transition* ~ "}" }
+machine_initial = { kw_initial ~ ident }
+machine_transition = { ident ~ "->" ~ ident ~ kw_on ~ string_lit }
+
+func_decl = {
+    kw_async? ~ kw_fn ~ ident ~ generic_params?
+    ~ "(" ~ params? ~ ")"
+    ~ ret_type?
+    ~ effects_clause?
+    ~ where_clause?
+    ~ (block | "=>" ~ expr ~ ";"?)
+}
+
+ret_type       = { "->" ~ type_expr }
+effects_clause = { "!" ~ "[" ~ (effect ~ ("," ~ effect)* ~ ","?)? ~ "]" }
+effect         = { type_path | lifetime }
+
+params     = { param ~ ("," ~ param)* ~ ","? }
+param      = { attribute* ~ (self_param | kw_mut? ~ kw_ref? ~ ident ~ (":" ~ type_expr)? ~ ("=" ~ expr)?) }
+self_param = { "&" ~ lifetime? ~ kw_mut? ~ kw_self | kw_mut? ~ kw_self }
+
+data_decl   = { kw_data ~ ident ~ generic_params? ~ "(" ~ data_fields? ~ ")" ~ ";"? }
+data_fields = { data_field ~ ("," ~ data_field)* ~ ","? }
+data_field  = { kw_mut? ~ ident ~ (":" ~ type_expr)? ~ ("=" ~ expr)? }
+
+struct_decl  = { kw_struct ~ ident ~ generic_params? ~ where_clause? ~ struct_body }
+struct_body  = {
+      "(" ~ tuple_field ~ ("," ~ tuple_field)* ~ ","? ~ ")" ~ ";"
+    | "{" ~ (struct_field ~ ("," ~ struct_field)* ~ ","?)? ~ "}"
+    | ";"
+}
+struct_field = { attribute* ~ visibility? ~ kw_mut? ~ ident ~ ":" ~ type_expr }
+tuple_field  = { attribute* ~ visibility? ~ type_expr }
+
+enum_decl    = { kw_enum ~ ident ~ generic_params? ~ where_clause? ~ "{" ~ (enum_variant ~ ("," ~ enum_variant)* ~ ","?)? ~ "}" }
+enum_variant = { attribute* ~ ident ~ variant_data? ~ (kw_if ~ expr)? }
+variant_data = {
+      "(" ~ type_expr ~ ("," ~ type_expr)* ~ ","? ~ ")"
+    | "{" ~ ident ~ ":" ~ type_expr ~ ("," ~ ident ~ ":" ~ type_expr)* ~ ","? ~ "}"
+}
+
+trait_decl = {
+    kw_trait ~ ident ~ generic_params? ~ (":" ~ bounds)? ~ where_clause?
+    ~ "{" ~ trait_item* ~ "}"
+}
+trait_item = {
+    attribute* ~ (method_sig ~ (block | ";") | kw_const ~ ident ~ ":" ~ type_expr ~ ("=" ~ expr)? ~ ";")
+}
+method_sig = {
+    kw_async? ~ kw_fn ~ ident ~ generic_params?
+    ~ "(" ~ params? ~ ")" ~ ret_type? ~ effects_clause? ~ where_clause?
+}
+
+impl_block = {
+    kw_impl ~ generic_params? ~ type_expr ~ (kw_for ~ type_expr)? ~ where_clause?
+    ~ "{" ~ impl_item* ~ "}"
+}
+impl_item = { attribute* ~ visibility? ~ (func_decl | const_decl) }
+
+migrate_decl = { kw_migrate ~ kw_from ~ type_path ~ kw_to ~ type_path ~ block }
+
+generic_params = { "[" ~ generic_param ~ ("," ~ generic_param)* ~ ","? ~ "]" }
+generic_param  = { ident ~ ("[_]")? ~ (":" ~ bounds)? ~ ("=" ~ type_expr)? }
+bounds         = { bound ~ ("+" ~ bound)* }
+bound          = { type_path ~ ("[" ~ type_expr ~ "]")? | lifetime }
+where_clause   = { kw_where ~ where_item ~ ("," ~ where_item)* ~ ","? }
+where_item     = { type_expr ~ ":" ~ bounds }
+generic_args   = { "[" ~ generic_arg ~ ("," ~ generic_arg)* ~ ","? ~ "]" }
+generic_arg    = { lifetime | type_expr | literal }
+
+const_decl  = { kw_const ~ ident ~ (":" ~ type_expr)? ~ "=" ~ expr ~ ";"? }
+static_decl = { kw_static ~ kw_mut? ~ ident ~ (":" ~ type_expr)? ~ "=" ~ expr ~ ";"? }
+
+type_decl = {
+    kw_type ~ ident ~ generic_params? ~ where_clause?
+    ~ "=" ~ type_expr
+    ~ ("schema" ~ (raw_string | string_lit))?
+    ~ ";"
+}
+
+extern_block = { kw_extern ~ string_lit? ~ "{" ~ extern_item* ~ "}" }
+extern_item  = { attribute* ~ kw_fn ~ ident ~ "(" ~ (extern_arg ~ ("," ~ extern_arg)*)? ~ ","? ~ ")" ~ ret_type? ~ ";" }
+extern_arg   = _{ variadic | param }
+variadic     = { "..." }
+
+macro_decl    = { kw_macro ~ ident ~ "{" ~ macro_rule ~ ("," ~ macro_rule)* ~ ","? ~ "}" }
+macro_rule    = { macro_matcher ~ "=>" ~ macro_body }
+macro_matcher = { "(" ~ macro_token* ~ ")" }
+macro_body    = { "{" ~ macro_token* ~ "}" | "(" ~ macro_token* ~ ")" }
+macro_token   = {
+      "$" ~ ident ~ ":" ~ macro_spec ~ ("+" | "*" | "?")?
+    | "$" ~ ident
+    | "(" ~ macro_token* ~ ")"
+    | "{" ~ macro_token* ~ "}"
+    | "[" ~ macro_token* ~ "]"
+    | macro_kw
+    | !"=>" ~ (punctuation | ident | literal)
+}
+// keywords are allowed in macro bodies so a macro can expand to real statements
+macro_kw = @{ ("let" | "mut" | "if" | "else" | "for" | "while" | "loop"
+    | "return" | "match" | "in" | "break" | "continue" | "true" | "false" | "null") ~ !ident_continue }
+macro_spec = { "ident" | "expr" | "stmt" | "block" | "ty" | "pat" | "tt" | "path" | "vis" | "meta" | "lifetime" }
+
+proc_macro_decl = { kw_macro ~ "proc" ~ ident ~ "(" ~ "ast" ~ ")" ~ block }
+ast_quote       = { kw_ast ~ "!" ~ "{" ~ token_tree* ~ "}" }
+
+token_tree = { tt_group | ast_quote | literal | tt_ident | punctuation }
+tt_group   = { "(" ~ token_tree* ~ ")" | "[" ~ token_tree* ~ "]" | "{" ~ token_tree* ~ "}" }
+tt_ident   = @{ ident_start ~ ident_continue* }
+
+punctuation = @{
+    "<-" | "|>" | "->>"
+  | "<<=" | ">>=" | ">>>" | "<=>" | "??=" | "===" | "!=="
+  | "<<" | ">>" | "=>" | "==" | "!=" | ">=" | "<=" | "&&" | "||" | "**" | "??"
+  | "+" | "-" | "*" | "/" | "%" | "^" | "&" | "|" | "~" | "<" | ">"
+  | "!" | "=" | "." | "," | ";" | ":" | "@" | "#" | "$" | "?"
+}
+
+expr        = { stream_expr }
+stream_expr = { assign_expr ~ (stream_op ~ assign_expr)* }
+stream_op   = { "<-" | "->>" }
+
+assign_expr   = { pipeline_expr ~ (assign_op ~ assign_expr)? }
+assign_op     = { "=" | ":=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "??=" }
+pipeline_expr = { ternary_expr ~ ("|>" ~ ternary_expr)* }
+ternary_expr  = { range_expr ~ ("??" ~ range_expr)* }
+range_expr    = { or_expr ~ (("..=" | "..") ~ or_expr?)? | ("..=" | "..") ~ or_expr? }
+
+or_expr     = { and_expr ~ ("||" ~ and_expr)* }
+and_expr    = { eq_expr ~ ("&&" ~ eq_expr)* }
+eq_expr     = { rel_expr ~ (eq_op ~ rel_expr)* }
+eq_op       = { "===" | "!==" | "==" | "!=" }
+rel_expr    = { bitor_expr ~ (rel_op ~ bitor_expr)* }
+rel_op      = { kw_in | "<=>" | "<=" | ">=" | "<" ~ !"-" | ">" }
+bitor_expr  = { bitxor_expr ~ ("|" ~ !"|" ~ bitxor_expr)* }
+bitxor_expr = { bitand_expr ~ ("^" ~ bitand_expr)* }
+bitand_expr = { shift_expr ~ ("&" ~ !"&" ~ shift_expr)* }
+shift_expr  = { add_expr ~ (shift_op ~ add_expr)* }
+shift_op    = { "<<" | ">>>" | ">>" }
+add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
+add_op      = { "+" | "-" }
+mul_expr    = { cast_expr ~ (mul_op ~ cast_expr)* }
+mul_op      = { "*" | "/" | "%" }
+cast_expr   = { pow_expr ~ (kw_as ~ type_expr)* }
+pow_expr    = { postfix_expr ~ (pow_op ~ pow_expr)? }
+pow_op      = { "**" }
+
+postfix_expr = { unary_expr ~ postfix_op* }
+postfix_op   = { safe_field_op | await_op | call_op | index_op | field_op | try_op | yield_op }
+safe_field_op = { "?." ~ (ident | int_lit) }
+await_op      = { "." ~ kw_await }
+call_op       = { "(" ~ args? ~ ")" }
+index_op      = { "[" ~ subscript ~ "]" }
+field_op      = { "." ~ (ident | int_lit) }
+try_op        = { "?" ~ !("?" | ".") }
+yield_op      = { "." ~ kw_yield ~ expr? }
+
+unary_expr = { prefix_op* ~ primary_expr }
+prefix_op  = { "!" | "-" | "+" | "~" | "&" ~ kw_mut? | "*" | kw_move | kw_ref | kw_await }
+
+primary_expr = {
+      map_literal
+    | set_literal
+    | struct_literal
+    | lambda_expr
+    | grouped_expr
+    | flow_expr
+    | array_expr
+    | comprehension_expr
+    | attr_block
+    | block_expr
+    | if_expr
+    | match_expr
+    | try_catch_expr
+    | spawn_expr
+    | select_expr
+    | defer_expr
+    | macro_call
+    | literal
+    | expr_path
+}
+
+cond             = { ns_assign_expr }
+ns_assign_expr   = { ns_pipeline_expr ~ (assign_op ~ ns_assign_expr)? }
+ns_pipeline_expr = { ns_ternary_expr ~ ("|>" ~ ns_ternary_expr)* }
+ns_ternary_expr  = { ns_range_expr ~ ("??" ~ ns_range_expr)* }
+ns_range_expr    = { ns_or_expr ~ (("..=" | "..") ~ ns_or_expr?)? | ("..=" | "..") ~ ns_or_expr? }
+ns_or_expr       = { ns_and_expr ~ ("||" ~ ns_and_expr)* }
+ns_and_expr      = { ns_eq_expr ~ ("&&" ~ ns_eq_expr)* }
+ns_eq_expr       = { ns_rel_expr ~ (eq_op ~ ns_rel_expr)* }
+ns_rel_expr      = { ns_bitor_expr ~ (rel_op ~ ns_bitor_expr)* }
+ns_bitor_expr    = { ns_bitxor_expr ~ ("|" ~ !"|" ~ ns_bitxor_expr)* }
+ns_bitxor_expr   = { ns_bitand_expr ~ ("^" ~ ns_bitand_expr)* }
+ns_bitand_expr   = { ns_shift_expr ~ ("&" ~ !"&" ~ ns_shift_expr)* }
+ns_shift_expr    = { ns_add_expr ~ (shift_op ~ ns_add_expr)* }
+ns_add_expr      = { ns_mul_expr ~ (add_op ~ ns_mul_expr)* }
+ns_mul_expr      = { ns_cast_expr ~ (mul_op ~ ns_cast_expr)* }
+ns_cast_expr     = { ns_pow_expr ~ (kw_as ~ type_expr)* }
+ns_pow_expr      = { ns_postfix_expr ~ (pow_op ~ ns_pow_expr)? }
+ns_postfix_expr  = { ns_unary_expr ~ postfix_op* }
+ns_unary_expr    = { prefix_op* ~ ns_primary_expr }
+
+ns_primary_expr = {
+      map_literal | set_literal | grouped_expr | flow_expr
+    | array_expr | comprehension_expr | attr_block | block_expr
+    | if_expr | match_expr | try_catch_expr | spawn_expr | select_expr
+    | defer_expr | macro_call | literal | expr_path
+}
+
+map_literal        = { "#{" ~ (map_entry ~ ("," ~ map_entry)* ~ ","?)? ~ "}" }
+map_entry          = { expr ~ ":" ~ expr }
+set_literal        = { "#(" ~ (expr ~ ("," ~ expr)* ~ ","?)? ~ ")" }
+grouped_expr       = { "(" ~ (expr ~ ("," ~ expr)+ ~ ","? | expr ~ ","?)? ~ ")" }
+flow_expr          = { return_expr | break_expr | continue_expr | throw_expr }
+return_expr        = { kw_return ~ expr? }
+break_expr         = { kw_break ~ expr? }
+continue_expr      = { kw_continue }
+throw_expr         = { kw_throw ~ expr? }
+macro_call         = { expr_path ~ "!" ~ !"=" ~ token_tree }
+array_expr         = { "[" ~ (expr ~ ";" ~ expr | (expr ~ ("," ~ expr)* ~ ","?)?) ~ "]" }
+comprehension_expr = { "[" ~ expr ~ comp_clause+ ~ "]" }
+comp_clause        = { kw_for ~ pattern ~ kw_in ~ expr | kw_if ~ expr }
+struct_literal     = { type_path ~ "{" ~ (field_init ~ ("," ~ field_init)* ~ ("," ~ ".." ~ expr)? ~ ","? | ".." ~ expr)? ~ "}" }
+field_init         = { ident ~ (":" ~ expr)? }
+block_expr         = { block }
+block              = { "{" ~ stmt* ~ expr? ~ "}" }
+attr_block         = { attribute ~ block }
+defer_expr         = { kw_defer ~ (block | expr) }
+lambda_expr        = { kw_async? ~ kw_move? ~ (ident | "(" ~ params? ~ ")" | "|" ~ params? ~ "|") ~ "=>" ~ (block | expr) }
+try_catch_expr     = { kw_try ~ block ~ (kw_catch ~ ident? ~ block)? ~ (kw_finally ~ block)? }
+spawn_expr         = { kw_spawn ~ block }
+select_expr        = { kw_select ~ "{" ~ select_arm ~ ("," ~ select_arm)* ~ ","? ~ "}" }
+select_arm         = { (kw_chan ~ expr_path | expr_path) ~ "=>" ~ assign_expr }
+if_expr    = { kw_if ~ cond ~ block ~ (kw_else ~ (if_expr | block))? }
+match_expr = { kw_match ~ cond ~ "{" ~ match_arm ~ ("," ~ match_arm)* ~ ","? ~ "}" }
+match_arm  = { pattern ~ (kw_if ~ cond)? ~ "=>" ~ expr }
+while_expr = { kw_while ~ cond ~ block }
+for_expr   = { kw_for ~ pattern ~ kw_in ~ cond ~ block }
+loop_expr  = { kw_loop ~ block }
+
+pattern        = { pattern_or }
+pattern_or     = { pattern_range ~ ("|" ~ pattern_range)* }
+pattern_range  = { pattern_atom ~ (("..=" | "..") ~ pattern_atom)? }
+pattern_atom   = {
+      "_" ~ !ident_continue
+    | "-"? ~ literal
+    | tuple_pattern
+    | slice_pattern
+    | struct_pattern
+    | enum_pattern
+    | type_pattern
+    | view_pattern
+    | binding_pattern
+    | "..."
+}
+
+type_pattern   = { type_path ~ "(" ~ ")" }
+enum_pattern   = { type_path ~ "(" ~ pattern ~ ("," ~ pattern)* ~ ","? ~ ")" }
+view_pattern   = { ident ~ "(" ~ pattern ~ ")" }
+
+tuple_pattern  = { "(" ~ (pattern ~ ("," ~ pattern)* ~ ","?)? ~ ")" }
+slice_pattern  = { "[" ~ (slice_elem ~ ("," ~ slice_elem)* ~ ","?)? ~ "]" }
+slice_elem     = _{ rest_pattern | pattern }
+rest_pattern   = { "..." ~ ident? }
+struct_pattern = { type_path ~ "{" ~ (field_pattern ~ ("," ~ field_pattern)* ~ ("," ~ "...")? ~ ","? | "...")? ~ "}" }
+field_pattern  = { ident ~ (":" ~ pattern)? }
+binding_pattern = { kw_ref? ~ kw_mut? ~ ident ~ ("@" ~ pattern)? }
+
+type_expr         = { type_union }
+type_union        = { type_intersection ~ ("|" ~ type_intersection)* }
+type_intersection = { type_ref ~ ("&" ~ type_ref)* }
+type_ref          = { (kw_ref ~ kw_mut? | "&" ~ lifetime? ~ kw_mut?)* ~ type_term }
+type_term         = {
+    type_modifier? ~ (
+        fn_type | tuple_type | array_type | slice_type
+      | stream_type | refinement_type | type_path | "(" ~ type_expr ~ ")"
+    )
+}
+type_modifier   = { kw_linear | kw_affine | kw_shared }
+refinement_type = { type_path ~ kw_if ~ expr }
+fn_type         = { kw_fn ~ generic_params? ~ "(" ~ (type_expr ~ ("," ~ type_expr)* ~ ","?)? ~ ")" ~ ("->" ~ type_expr)? ~ effects_clause? }
+tuple_type      = { "(" ~ (type_expr ~ ("," ~ type_expr)* ~ ","?)? ~ ")" }
+array_type      = { "[" ~ type_expr ~ ";" ~ expr ~ "]" }
+slice_type      = { "[" ~ type_expr ~ "]" }
+stream_type     = { kw_stream ~ "[" ~ type_expr ~ "]" }
+
+stmt       = { let_stmt | yield_stmt | item_stmt | expr_stmt | defer_stmt }
+yield_stmt = { kw_yield ~ expr? ~ ";"? }
+let_stmt   = { kw_let ~ kw_mut? ~ attribute* ~ pattern ~ (":" ~ type_expr)? ~ ("=" ~ expr)? ~ ";"? }
+item_stmt  = { attribute* ~ visibility? ~ item }
+expr_stmt  = { expr_with_block ~ ";"? | expr ~ ";"? }
+expr_with_block = {
+    if_expr | match_expr | while_expr | for_expr | loop_expr
+  | try_catch_expr | attr_block | block_expr
+}
+defer_stmt = { kw_defer ~ (block | expr) ~ ";"? }
+
+args      = { arg ~ ("," ~ arg)* ~ ","? }
+arg       = { ident ~ ":" ~ expr | expr }
+subscript = { expr ~ ("," ~ expr)* }
+visibility = { kw_pub ~ ("(" ~ (kw_crate | kw_super | kw_self | kw_in ~ expr_path) ~ ")")? }
+
+attribute = {
+      "#!" ~ "[" ~ attr_list ~ "]"
+    | "#["  ~ attr_list ~ "]"
+}
+attr_list = { (compiler_attr | attr_item) ~ ("," ~ (compiler_attr | attr_item))* ~ ","? }
+attr_item = { attr_path ~ ("(" ~ attr_args? ~ ")" | "=" ~ literal)? }
+attr_path = { ident ~ ("." ~ ident)* }
+attr_args = { attr_arg ~ ("," ~ attr_arg)* ~ ","? }
+attr_arg  = { ident ~ "=" ~ literal | attr_item }
+
+compiler_attr = {
+      "compiler"     ~ "(" ~ "mode" ~ ":" ~ ("daemon" | "batch") ~ ("," ~ "cache" ~ ":" ~ bool_lit)? ~ ")"
+    | "predict"      ~ "(" ~ "level" ~ ":" ~ ("aggressive" | "conservative" | "off") ~ ")"
+    | "incremental"  ~ "(" ~ "depth" ~ ":" ~ ("infinite" | "function" | "module" | "crate") ~ ")"
+    | "hot_reload"   ~ "(" ~ "instant" ~ ":" ~ bool_lit ~ ("," ~ "scope" ~ ":" ~ ("function" | "module"))? ~ ")"
+    | "priority"     ~ "(" ~ ("high" | "low" | "auto") ~ ")"
+    | "snapshot"     ~ "(" ~ ("interval" ~ ":" ~ int_lit | "events") ~ ")"
+    | "migrate"      ~ "(" ~ migrate_attr_args ~ ")"
+    | "module"       ~ "(" ~ global_attr_item ~ ("," ~ global_attr_item)* ~ ")"
+    | "class"        ~ "(" ~ global_attr_item ~ ("," ~ global_attr_item)* ~ ")"
+    | "self_healing"  ~ "(" ~ "attempts" ~ ":" ~ int_lit ~ ("," ~ "mode" ~ ":" ~ ("conservative" | "normal" | "aggressive"))? ~ ")"
+    | "time_travel"   ~ "(" ~ "depth"    ~ ":" ~ int_lit ~ ")"
+    | "hot_swap"      ~ "(" ~ "scope"    ~ ":" ~ ident   ~ ")"
+    | "encrypt"       ~ "(" ~ string_lit? ~ ")"
+    | "intent"        ~ "(" ~ string_lit ~ ")"
+    | "blame"         ~ "(" ~ blame_args ~ ")"
+    | "version"       ~ "(" ~ version_args ~ ")"
+    | "proof"         ~ "(" ~ proof_args ~ ")"
+    | "budget"        ~ "(" ~ budget_args ~ ")"
+    | "pool"          ~ "(" ~ "size" ~ ":" ~ int_lit ~ ")"
+    | "pack"          ~ "(" ~ pack_args ~ ")"
+    | "deprecate"     ~ "(" ~ deprecate_args ~ ")"
+    | "rollback"      ~ "(" ~ "snapshot" ~ ":" ~ ident ~ ")"
+    | "experimental"  ~ ("(" ~ "since" ~ ":" ~ string_lit ~ ")")?
+    | "profile"       ~ ("(" ~ "level" ~ ":" ~ ("basic" | "detailed" | "full") ~ ")")?
+    | "test_matrix"   ~ "(" ~ test_matrix_args ~ ")"
+    | "audit"         ~ ("(" ~ "level" ~ ":" ~ ("error" | "warn" | "info" | "debug") ~ ")")?
+    | "timeout"       ~ "(" ~ int_lit ~ ("," ~ "panic" ~ ":" ~ bool_lit)? ~ ")"
+    | "retry"         ~ "(" ~ "attempts" ~ ":" ~ int_lit ~ ("," ~ "delay" ~ ":" ~ int_lit)? ~ ")"
+    | "cost"          ~ "(" ~ cost_arg ~ ")"
+    | "log"           ~ "(" ~ string_lit ~ ("," ~ log_level)? ~ ")"
+    | "cache"         ~ ("(" ~ "ttl" ~ ":" ~ int_lit ~ ")")?
+    | "compatible"    ~ "(" ~ string_lit ~ ")"
+    | "instrument"    ~ ("(" ~ string_lit ~ ("," ~ instrument_arg)* ~ ")")?
+    | "bench"         ~ "(" ~ bench_args ~ ")"
+    | "example"       ~ "(" ~ string_lit ~ ")"
+    | "require"       ~ "(" ~ string_lit ~ ("," ~ string_lit)* ~ ")"
+    | "deps"          ~ "(" ~ deps_args ~ ")"
+    | "requires"      ~ "(" ~ expr ~ ("," ~ expr)* ~ ")"
+    | "ensures"       ~ "(" ~ expr ~ ("," ~ expr)* ~ ")"
+    | "assumes"       ~ "(" ~ expr ~ ("," ~ expr)* ~ ")"
+    | "throws"        ~ "(" ~ type_path ~ ("," ~ type_path)* ~ ")"
+    | "test"          ~ "(" ~ string_lit ~ ")"
+    | "anti_debug" | "arena" | "atomic" | "batch" | "cold" | "comptime"
+    | "exhaust" | "force_inline" | "fuse" | "fuzz" | "ghost" | "hot"
+    | "inline_cache" | "memo" | "obfuscate" | "pin" | "prelude" | "simd"
+    | "tail_call" | "trace" | "unsafe" | "zero_alloc"
+}
+
+migrate_attr_args = {
+      "strategy" ~ ":" ~ ident
+    | "from" ~ ":" ~ string_lit ~ "," ~ "to" ~ ":" ~ string_lit
+}
+
+cost_arg   = { "O(" ~ cost_class ~ ")" }
+cost_class = { "n_log_n" | "n2" | "n3" | "log_n" | "constant" | "exp" | "n" | "1" }
+
+blame_args     = { blame_arg     ~ ("," ~ blame_arg)* ~ ","? }
+blame_arg      = { ident ~ ":" ~ string_lit }
+version_args   = { version_arg   ~ ("," ~ version_arg)* ~ ","? }
+version_arg    = { ident ~ ":" ~ string_lit }
+proof_args     = { proof_arg     ~ ("," ~ proof_arg)* ~ ","? }
+proof_arg      = { ident ~ ":" ~ string_lit }
+budget_args    = { budget_arg    ~ ("," ~ budget_arg)* ~ ","? }
+budget_arg     = { ident ~ ":" ~ string_lit }
+pack_args      = { pack_arg      ~ ("," ~ pack_arg)* ~ ","? }
+pack_arg       = { ident ~ ":" ~ (int_lit | string_lit) }
+deprecate_args = { deprecate_arg ~ ("," ~ deprecate_arg)* ~ ","? }
+deprecate_arg  = { ident ~ ":" ~ string_lit }
+
+test_matrix_args = { test_matrix_arg ~ ("," ~ test_matrix_arg)* ~ ","? }
+test_matrix_arg  = { ident ~ ":" ~ "[" ~ expr ~ ("," ~ expr)* ~ "]" }
+
+log_level      = { "trace" | "debug" | "info" | "warn" | "error" }
+instrument_arg = { ident ~ ":" ~ ident }
+bench_args     = { bench_arg ~ ("," ~ bench_arg)* ~ ","? }
+bench_arg      = { ident ~ ":" ~ int_lit }
+deps_args      = { deps_arg ~ ("," ~ deps_arg)* ~ ","? }
+deps_arg       = { ident ~ ":" ~ string_lit ~ (":" ~ string_lit)? }
+
+global_attr_item = {
+    deps_attr | log_attr | retry_attr | timeout_attr
+  | cache_attr | audit_attr | profile_attr | require_attr
+}
+deps_attr    = { "deps"    ~ "(" ~ deps_args ~ ")" }
+log_attr     = { "log"     ~ "(" ~ string_lit ~ ("," ~ log_level)? ~ ")" }
+retry_attr   = { "retry"   ~ "(" ~ "attempts" ~ ":" ~ int_lit ~ ("," ~ "delay" ~ ":" ~ int_lit)? ~ ")" }
+timeout_attr = { "timeout" ~ "(" ~ int_lit ~ ")" }
+cache_attr   = { "cache"   ~ ("(" ~ "ttl" ~ ":" ~ int_lit ~ ")")? }
+audit_attr   = { "audit"   ~ ("(" ~ "level" ~ ":" ~ ("error" | "warn" | "info" | "debug") ~ ")")? }
+profile_attr = { "profile" ~ ("(" ~ "level" ~ ":" ~ ("basic" | "detailed" | "full") ~ ")")? }
+require_attr = { "require" ~ "(" ~ string_lit ~ ("," ~ string_lit)* ~ ")" }
+
+hgx_file   = { SOI ~ hgx_table+ ~ EOI }
+hgx_table  = { "[" ~ table_name ~ "]" ~ NEWLINE ~ hgx_entry* }
+table_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+hgx_entry  = { hgx_key ~ "=" ~ hgx_value ~ NEWLINE }
+hgx_key    = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+hgx_value  = { hgx_inline_table | hgx_array | string_lit | bool_lit | number }
+number     = @{ "-"? ~ dec_lit ~ ("." ~ dec_lit)? }
+hgx_inline_table = { "{" ~ (hgx_key ~ "=" ~ hgx_value ~ ("," ~ hgx_key ~ "=" ~ hgx_value)*)? ~ "}" }
+hgx_array        = { "[" ~ (hgx_value ~ ("," ~ hgx_value)*)? ~ "]" }
+NEWLINE          = _{ "\r\n" | "\n" }

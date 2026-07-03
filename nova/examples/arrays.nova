@@ -1,0 +1,59 @@
+fn bubble_sort(arr) {
+  let n = len(arr);
+  let i = 0;
+  while i < n {
+    let j = 0;
+    while j < n - i - 1 {
+      if arr[j] > arr[j + 1] {
+        let tmp = arr[j];
+        arr[j] = arr[j + 1];
+        arr[j + 1] = tmp;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return arr;
+}
+
+fn sum(arr) {
+  let total = 0;
+  for x in arr {
+    total = total + x;
+  }
+  return total;
+}
+
+fn main() {
+  let nums = [5, 2, 8, 1, 9, 3];
+  print("original:");
+  print(nums);
+
+  let sorted = bubble_sort(nums);
+  print("sorted:");
+  print(sorted);
+
+  print("sum:");
+  print(sum(sorted));
+
+  print("length:");
+  print(len(sorted));
+
+  let stack = array();
+  push(stack, 10);
+  push(stack, 20);
+  push(stack, 30);
+  print("stack:");
+  print(stack);
+  print("popped:");
+  print(pop(stack));
+  print("stack now:");
+  print(stack);
+
+  print("sqrt(144):");
+  print(sqrt(144));
+
+  let word = "nova";
+  print("first char:");
+  print(word[0]);
+}

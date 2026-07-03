@@ -1,0 +1,10 @@
+fn main() {
+  print(1.5 + 2.25)
+  print(3.5 / 0.0)
+  print(0.0 / 0.0)
+  print(0.1 + 0.2)
+  print(1.0 == 1.0)
+  print(0.0 == -0.0)
+  print(2 + 0.5)
+  print(10 / 4.0)
+}

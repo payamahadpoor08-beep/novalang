@@ -1,0 +1,33 @@
+// Systems layer: process exec, directory listing, file round-trip. Deterministic
+// and idempotent (self-cleaning) so it produces identical output on every tier
+// and on repeated runs. Effectful builtins keep this on the interpreter/embed
+// path — never AOT-native — by construction.
+fn main() {
+  let dir = "/tmp/nova_corpus_sys"
+  mkdir(dir)
+  write_file(dir + "/one.txt", "1")
+  write_file(dir + "/two.txt", "22")
+
+  // list_dir is sorted; filter to our known files so a stray leftover never
+  // perturbs the output across tiers
+  let names = list_dir(dir)
+  let count = 0
+  for n in names {
+    if n == "one.txt" || n == "two.txt" {
+      print(n)
+      count = count + 1
+    }
+  }
+  print(count)
+
+  print(read_file(dir + "/two.txt"))
+  print(file_exists(dir + "/one.txt"))
+
+  let r = exec("echo", ["nova"])
+  print(r["code"])
+  print(r["stdout"])
+
+  remove_file(dir + "/one.txt")
+  remove_file(dir + "/two.txt")
+  print(file_exists(dir + "/one.txt"))
+}

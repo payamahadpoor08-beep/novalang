@@ -1,0 +1,13 @@
+fn evens() { let n = 0; while true { yield n; n = n + 2 } }
+fn upto(k) { for i in 0..k { yield i * i } }
+fn main() {
+  for x in evens() {
+    if x > 8 { break }
+    print(x)
+  }
+  print(evens().take(4))
+  print(upto(5).take(99))
+  let g = upto(3)
+  print(g.next())
+  print(g.next())
+}

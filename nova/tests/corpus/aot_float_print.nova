@@ -1,0 +1,12 @@
+fn half(x) { x / 2.0 }
+fn main() {
+  print(0.1 + 0.2)
+  print(100.0)
+  print(half(7.0))
+  print(1.0 / 3.0)
+  print(1.0e300 * 10.0)
+  print(0.0 / 0.0)
+  print(-0.5)
+  print(2.5e-10)
+  print(123456789.123)
+}

@@ -1,0 +1,40 @@
+struct Account {
+  owner: String,
+  balance: i32,
+}
+
+impl Account {
+  fn deposit(mut self, amount) {
+    self.balance = self.balance + amount;
+  }
+  fn withdraw(mut self, amount) -> bool {
+    if amount > self.balance {
+      return false;
+    }
+    self.balance = self.balance - amount;
+    return true;
+  }
+  fn report(self) {
+    print(self.owner + " has balance:");
+    print(self.balance);
+  }
+}
+
+fn main() {
+  let acc = Account { owner: "Payam", balance: 100 };
+  acc.report();
+
+  acc.deposit(50);
+  print("after deposit 50:");
+  acc.report();
+
+  let ok = acc.withdraw(30);
+  print("withdraw 30 succeeded:");
+  print(ok);
+  acc.report();
+
+  let fail = acc.withdraw(1000);
+  print("withdraw 1000 succeeded:");
+  print(fail);
+  acc.report();
+}

@@ -1,0 +1,51 @@
+// wc — line/word/char counter, a real CLI in Nova.
+//   nova run examples/apps/wc.nova <file>...    (or build it: nova build)
+
+fn count_words(text) {
+  let words = 0
+  let in_word = false
+  for c in text {
+    if c == " " || c == "\n" || c == "\t" || c == "\r" {
+      in_word = false
+    } else {
+      if !in_word { words = words + 1 }
+      in_word = true
+    }
+  }
+  words
+}
+
+fn count_lines(text) {
+  let n = 0
+  for c in text { if c == "\n" { n = n + 1 } }
+  n
+}
+
+fn main() {
+  let files = args()
+  if len(files) == 0 {
+    eprint("usage: wc <file>...")
+    exit(2)
+  }
+  let tl = 0
+  let tw = 0
+  let tc = 0
+  let failed = false
+  for path in files {
+    try {
+      let text = read_file(path)
+      let l = count_lines(text)
+      let w = count_words(text)
+      let c = len(text)
+      print(f"{l} {w} {c} {path}")
+      tl = tl + l
+      tw = tw + w
+      tc = tc + c
+    } catch e {
+      eprint(f"wc: {e}")
+      failed = true
+    }
+  }
+  if len(files) > 1 { print(f"{tl} {tw} {tc} total") }
+  if failed { exit(1) }
+}

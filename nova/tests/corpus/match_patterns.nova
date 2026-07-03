@@ -1,0 +1,25 @@
+enum Shape { Dot, Line(i32), Rect(i32, i32) }
+fn area(s) {
+  match s {
+    Dot => 0,
+    Line(_) => 0,
+    Rect(w, h) if w == h => w * w * 10,
+    Rect(w, h) => w * h,
+  }
+}
+fn main() {
+  print(area(Dot))
+  print(area(Line(9)))
+  print(area(Rect(3, 4)))
+  print(area(Rect(5, 5)))
+  let p = [1, 2, 3]
+  match p {
+    [a, b, c] => print(a + b + c),
+    _ => print(0),
+  }
+  match 42 {
+    0..=10 => print("small"),
+    11 | 42 => print("magic"),
+    _ => print("big"),
+  }
+}

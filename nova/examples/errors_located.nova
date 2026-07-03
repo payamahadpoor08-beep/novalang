@@ -1,0 +1,26 @@
+// Located error messages.
+//
+// Runtime, type, and lowering errors now carry a source position. For example,
+// running a program with these lines uncaught prints (to stderr):
+//
+//   print(a / 0)        =>  runtime error: line 3, col 3: division by zero
+//   print(x + 1)        =>  runtime error: line 2, col 3: undefined variable: x
+//   let s = "hi"; s - 1 =>  (nova check) line 2, col 15: operator `-` requires numbers
+//
+// This file itself runs cleanly: it guards the risky operations, and the catch
+// variable receives the (unlocated) message so you can handle it however you like.
+
+fn safe_div(a, b) {
+  result = 0
+  try { result = a / b } catch e { result = -1 }
+  result
+}
+
+fn main() {
+  print(safe_div(10, 2))     // 5
+  print(safe_div(10, 0))     // -1  (the division-by-zero error was caught)
+  print(2 + 3 * 4)           // 14
+}
+
+test "safe divide"      { assert_eq(safe_div(8, 2), 4) }
+test "caught zero"      { assert_eq(safe_div(8, 0), -1) }

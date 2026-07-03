@@ -1,0 +1,54 @@
+// Lazy generators: any function containing `yield` becomes a generator. Calling
+// it does not run the body — it returns a lazy sequence that produces values on
+// demand, so even infinite generators are usable.
+
+/// Yields the natural numbers 0, 1, 2, ... forever.
+fn naturals() {
+  i = 0
+  loop {
+    yield i
+    i = i + 1
+  }
+}
+
+/// Yields the Fibonacci sequence, lazily and without bound.
+fn fibs() {
+  a = 0
+  b = 1
+  loop {
+    yield a
+    t = a + b
+    a = b
+    b = t
+  }
+}
+
+/// A finite generator over the squares of 1..=n.
+fn squares(n) {
+  for i in 1..=n {
+    yield i * i
+  }
+}
+
+fn main() {
+  // `for` pulls a generator one value at a time; `break` stops an infinite one.
+  for n in naturals() {
+    if n >= 5 { break }
+    print(n)                 // 0 1 2 3 4
+  }
+
+  print(fibs().take(10))     // [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+  print(squares(4).take(99)) // [1, 4, 9, 16]
+
+  // `.next()` advances a generator by hand; null once exhausted.
+  let s = squares(2)
+  print(s.next())            // 1
+  print(s.next())            // 4
+  print(s.next())            // null
+}
+
+// Generator bodies should be pure: laziness is achieved by replaying the body up
+// to the requested yield, so side effects would repeat on each pull.
+test "finite take"   { assert_eq(squares(4).take(99), [1, 4, 9, 16]) }
+test "infinite take" { assert_eq(naturals().take(5), [0, 1, 2, 3, 4]) }
+test "fibonacci"     { assert_eq(fibs().take(8), [0, 1, 1, 2, 3, 5, 8, 13]) }

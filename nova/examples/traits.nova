@@ -1,0 +1,25 @@
+trait Describe {
+  fn describe(self) -> Str;
+  fn loud(self) -> Str { "default loud sound" }
+}
+
+struct Dog { name: Str }
+struct Cat { name: Str }
+
+impl Describe for Dog {
+  fn describe(self) -> Str { "a dog named " + self.name }
+  fn loud(self) -> Str { "WOOF" }
+}
+
+impl Describe for Cat {
+  fn describe(self) -> Str { "a cat named " + self.name }
+}
+
+fn main() {
+  d = Dog { name: "Rex" }
+  c = Cat { name: "Whiskers" }
+  print(d.describe())
+  print(c.describe())
+  print(d.loud())
+  print(c.loud())
+}

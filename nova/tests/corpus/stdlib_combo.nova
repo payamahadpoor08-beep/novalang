@@ -1,0 +1,13 @@
+use "std/list.nova";
+use "std/sort.nova";
+use "std/mathx.nova";
+use "std/strx.nova";
+fn main() {
+  let xs = [5, 3, 8, 1, 9, 2, 7]
+  print(quicksort(xs))
+  print(sum(map(xs, (x) => x * x)))
+  print(filter(primes_below(30), (p) => p % 10 == 3))
+  print(join_str(map([1, 2, 3], (x) => pad_left(f"{x}", 3, "0")), ","))
+  print(levenshtein("nova", "nim"))
+  print(binary_search(mergesort(xs), 7))
+}

@@ -1,0 +1,20 @@
+fn main() {
+  let fibs = array();
+  push(fibs, 0);
+  push(fibs, 1);
+  let i = 2;
+  while i < 15 {
+    let next = fibs[i - 1] + fibs[i - 2];
+    push(fibs, next);
+    i = i + 1;
+  }
+  print("first 15 fibonacci:");
+  print(fibs);
+
+  let doubled = array();
+  for x in fibs {
+    push(doubled, x * 2);
+  }
+  print("doubled:");
+  print(doubled);
+}

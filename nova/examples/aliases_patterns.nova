@@ -1,0 +1,43 @@
+// Type aliases and slice patterns.
+
+// A type alias gives a friendly name to an existing type. The checker resolves
+// it, so `UserId` is treated exactly as `Int` for type errors.
+type UserId = Int
+type Row = Array
+
+fn next_id(id: UserId) -> UserId {
+  id + 1
+}
+
+// Slice patterns destructure arrays by shape. `...` soaks up the middle and can
+// be bound to a name to capture the remaining elements.
+fn classify(xs) {
+  match xs {
+    []                   => "empty",
+    [only]               => f"single: {only}",
+    [head, ...tail]      => f"head {head}, tail {tail}",
+  }
+}
+
+fn ends(xs: Row) {
+  match xs {
+    [first, ...middle, last] => f"{first}..{last} (middle {middle})",
+    [x]                      => f"just {x}",
+    _                        => "empty",
+  }
+}
+
+fn main() {
+  print(next_id(99))              // 100
+  print(classify([]))            // empty
+  print(classify([7]))           // single: 7
+  print(classify([1, 2, 3]))     // head 1, tail [2, 3]
+  print(ends([10, 20, 30, 40]))  // 10..40 (middle [20, 30])
+  print(ends([5]))               // just 5
+}
+
+test "alias checks as Int" { assert_eq(next_id(1), 2) }
+test "empty slice"        { assert_eq(classify([]), "empty") }
+test "head and tail"      { assert_eq(classify([1, 2, 3]), "head 1, tail [2, 3]") }
+test "first middle last"  { assert_eq(ends([1, 2, 3, 4]), "1..4 (middle [2, 3])") }
+test "single element"     { assert_eq(ends([9]), "just 9") }

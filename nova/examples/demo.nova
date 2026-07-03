@@ -1,0 +1,52 @@
+fn fib(n) {
+  if n < 2 { return n; }
+  return fib(n - 1) + fib(n - 2);
+}
+
+fn is_prime(n) {
+  if n < 2 { return false; }
+  let i = 2;
+  while i * i <= n {
+    if n % i == 0 { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn sum_to(n) {
+  let total = 0;
+  for i in 1..=n {
+    total = total + i;
+  }
+  return total;
+}
+
+fn max(a, b) {
+  return if a > b { a } else { b };
+}
+
+fn main() {
+  print("=== Nova v0.1 demo ===");
+
+  print("fib(10) =");
+  print(fib(10));
+
+  print("primes under 20:");
+  for n in 2..20 {
+    if is_prime(n) {
+      print(n);
+    }
+  }
+
+  print("sum 1..=100 =");
+  print(sum_to(100));
+
+  print("max(17, 42) =");
+  print(max(17, 42));
+
+  let greeting = "hello" + " " + "nova";
+  print(greeting);
+
+  print("3 ** 4 =");
+  print(3 ** 4);
+}

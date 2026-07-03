@@ -1,0 +1,71 @@
+enum Option {
+  None,
+  Some(i32),
+}
+
+enum List {
+  Nil,
+  Cons(i32, List),
+}
+
+fn safe_div(a, b) {
+  if b == 0 {
+    return None;
+  }
+  return Some(a / b);
+}
+
+fn unwrap_or(opt, default) {
+  return match opt {
+    Some(x) => x,
+    None => default,
+  };
+}
+
+fn list_sum(lst) {
+  return match lst {
+    Nil => 0,
+    Cons(head, tail) => head + list_sum(tail),
+  };
+}
+
+fn list_len(lst) {
+  return match lst {
+    Nil => 0,
+    Cons(_, tail) => 1 + list_len(tail),
+  };
+}
+
+fn classify(n) {
+  return match n {
+    0 => "zero",
+    1 | 2 | 3 => "small",
+    4..=10 => "medium",
+    _ => "large",
+  };
+}
+
+fn main() {
+  print("=== Option ===");
+  let r1 = safe_div(10, 2);
+  let r2 = safe_div(10, 0);
+  print(r1);
+  print(r2);
+  print("unwrapped:");
+  print(unwrap_or(r1, -1));
+  print(unwrap_or(r2, -1));
+
+  print("=== linked list ===");
+  let lst = Cons(1, Cons(2, Cons(3, Cons(4, Nil))));
+  print("list:");
+  print(lst);
+  print("sum:");
+  print(list_sum(lst));
+  print("length:");
+  print(list_len(lst));
+
+  print("=== match with ranges & guards ===");
+  for n in 0..12 {
+    print(str(n) + " => " + classify(n));
+  }
+}

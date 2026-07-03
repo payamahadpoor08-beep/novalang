@@ -1,0 +1,40 @@
+enum Shape {
+  Circle(i32),
+  Rect(i32, i32),
+  Triangle(i32, i32),
+}
+
+fn area(s) {
+  return match s {
+    Circle(r) => 3 * r * r,
+    Rect(w, h) => w * h,
+    Triangle(b, h) => b * h / 2,
+  };
+}
+
+fn describe(s) {
+  return match s {
+    Circle(r) if r > 10 => "big circle",
+    Circle(_) => "small circle",
+    Rect(w, h) if w == h => "square",
+    Rect(_, _) => "rectangle",
+    _ => "triangle",
+  };
+}
+
+fn main() {
+  let shapes = array();
+  push(shapes, Circle(5));
+  push(shapes, Rect(4, 6));
+  push(shapes, Rect(5, 5));
+  push(shapes, Circle(20));
+  push(shapes, Triangle(3, 8));
+
+  for s in shapes {
+    print(str(s) + " -> area " + str(area(s)) + ", " + describe(s));
+  }
+
+  print("total area via reduce:");
+  let total = reduce(shapes, (sum, s) => sum + area(s), 0);
+  print(total);
+}

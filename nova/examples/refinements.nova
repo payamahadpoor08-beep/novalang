@@ -1,0 +1,38 @@
+// Refinement types and richer assertions.
+//
+// A refined type alias attaches a predicate over the value, written with `it`:
+//
+//   type Pos = Int if it > 0
+//
+// When a value is bound to that type via an annotated `let`, the predicate is
+// checked at runtime; a violation is a catchable error, e.g.
+//   let b: Pos = 0   =>  runtime error: line N, col C: refinement `Pos` violated by value 0
+
+type Pos = Int if it > 0;
+type NonEmpty = Str if len(it) > 0;
+
+fn main() {
+  let n: Pos = 7
+  let s: NonEmpty = "hi"
+  print(n)                 // 7
+  print(s)                 // hi
+
+  // Violations are catchable like any runtime error.
+  try {
+    let bad: Pos = -1
+    print(bad)             // unreachable: the let above already failed
+  } catch e {
+    print(e)               // refinement `Pos` violated by value -1
+  }
+
+  // Richer test assertions are available as builtins too.
+  assert_ne(1, 2)
+  assert_true(n > 0)
+  assert_gt(n, 0)
+  assert_contains([1, 2, 3], 2)
+  print("ok")
+}
+
+test "refined ok"        { let p: Pos = 3; assert_eq(p, 3) }
+test "assert_ne"         { assert_ne("a", "b") }
+test "assert_contains"   { assert_contains("hello", "ell") }

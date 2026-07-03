@@ -1,0 +1,9 @@
+//! A small geometry library, imported by app.nova.
+
+/// Area of a rectangle.
+fn area(w, h) { w * h }
+
+/// Area of a square (reuses `area`).
+fn square_area(s) { area(s, s) }
+
+const PI_TIMES_100 = 314

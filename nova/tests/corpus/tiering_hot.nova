@@ -1,0 +1,8 @@
+fn hot(n) { let s = 0; let i = 0; while i < n { s = s + i % 7; i = i + 1 } s }
+fn cold(x) { x * 1000 }
+fn main() {
+  let total = 0
+  for k in 0..500 { total = total + hot(50) }
+  print(total)
+  print(cold(3))
+}

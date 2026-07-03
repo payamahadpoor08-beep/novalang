@@ -1,0 +1,39 @@
+use rand.{seed, random, rand_int, rand_float, rand_bool, choice, shuffle}
+use time.{now, now_millis}
+
+fn main() {
+  print("=== rand (seeded for reproducibility) ===")
+  seed(42)
+  print(random())
+  print(random())
+  print(rand_int(1, 6))
+  print(rand_int(1, 6))
+  print(rand_int(1, 6))
+  print(rand_float(0.0, 10.0))
+  print(rand_bool())
+  print(choice(["apple", "banana", "cherry", "date"]))
+  print(shuffle([1, 2, 3, 4, 5]))
+
+  print("=== same seed -> same sequence ===")
+  seed(42)
+  print(random())
+  seed(42)
+  print(random())
+
+  print("=== dice simulation ===")
+  seed(7)
+  counts = [0, 0, 0, 0, 0, 0]
+  i = 0
+  while i < 6000 {
+    roll = rand_int(1, 6)
+    counts[roll - 1] = counts[roll - 1] + 1
+    i += 1
+  }
+  print(counts)
+
+  print("=== time ===")
+  t = now()
+  print(t > 1700000000.0)
+  ms = now_millis()
+  print(ms > 1700000000000)
+}

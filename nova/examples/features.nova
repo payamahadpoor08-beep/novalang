@@ -1,0 +1,12 @@
+fn double(x) { x * 2 }
+fn inc(x) { x + 1 }
+
+fn main() {
+  print(5 |> double |> inc |> double)
+  ages = #{"Ali": 30, "Sara": 25}
+  print(ages["Sara"])
+  s = #(1, 2, 2, 3, 3, 3)
+  print(map_len(s))
+  defer print("done")
+  print("working")
+}

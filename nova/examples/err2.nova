@@ -1,0 +1,27 @@
+struct AppError {
+  code: i32,
+  message: String,
+}
+
+fn risky(n) {
+  if n < 0 {
+    throw AppError { code: 400, message: "negative input" }
+  }
+  if n > 100 {
+    throw AppError { code: 500, message: "too large" }
+  }
+  n * 2
+}
+
+fn main() {
+  inputs = [50, -1, 200, 30]
+  for x in inputs {
+    try {
+      r = risky(x)
+      print("ok:")
+      print(r)
+    } catch err {
+      print("error " + str(err.code) + ": " + err.message)
+    }
+  }
+}

@@ -1,0 +1,8 @@
+fn fac(n) { let p = 1; for i in 2..=n { p = p * i } p }
+fn main() {
+  print(fac(20))
+  print(fac(25))
+  print(fac(30))
+  print(2 ** 100)
+  print(fac(25) % 1000007)
+}

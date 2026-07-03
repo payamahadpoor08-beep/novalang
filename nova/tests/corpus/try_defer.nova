@@ -1,0 +1,65 @@
+// Native VM exceptions and defers: try/catch/finally in loops, across calls,
+// with defers unwinding in LIFO order. Runs natively on the VM (no fallback).
+
+fn risky(n) {
+  if n > 2 { throw "too big: " + str(n) }
+  n * 10
+}
+
+fn parse_or(v, dflt) {
+  try { return to_int(v) } catch e { return dflt }
+}
+
+fn with_cleanup() {
+  log = []
+  defer push(log, "close-a")
+  defer push(log, "close-b")
+  push(log, "work")
+  log
+}
+
+fn finally_wins() {
+  try { return "body" } finally { return "finally" }
+}
+
+fn main() {
+  for i in 0..5 {
+    try { print(risky(i)) } catch e { print("err: " + e) }
+  }
+
+  print(parse_or("41", -1) + 1)
+  print(parse_or("nope", -1))
+
+  print(with_cleanup())
+  print(finally_wins())
+
+  // runtime errors are catchable; the catch var persists after the try
+  try { x = 1 / 0 } catch reason {}
+  print("caught: " + reason)
+
+  // break crosses try + finally, defers run per iteration during unwind
+  i = 0
+  while i < 5 {
+    try {
+      defer print("defer " + str(i))
+      if i == 2 { break }
+      print("iter " + str(i))
+    } finally {
+      print("fin " + str(i))
+    }
+    i = i + 1
+  }
+  print("stopped at " + str(i))
+
+  // nested try: inner rethrows, outer catches
+  try {
+    try { throw "inner" } catch e { throw e + "+outer" }
+  } catch e {
+    print(e)
+  }
+
+  // try without catch swallows a thrown value; finally still runs
+  r = 0
+  try { throw "ignored"; r = 1 } finally { r = r + 10 }
+  print(r)
+}

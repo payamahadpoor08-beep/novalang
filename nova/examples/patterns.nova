@@ -1,0 +1,24 @@
+// Tuple & struct destructuring patterns, compound assignment, casts, [v;n].
+struct Point { x: Int, y: Int }
+
+fn main() {
+  print([0; 4])                 // [0, 0, 0, 0]
+  print(3.9 as Int)             // 3
+  x = 12
+  x &= 10                       // 8
+  x |= 5                        // 13
+  print(x)
+  pair = [10, 20]
+  print(match pair { (a, b) => a + b, _ => 0 })      // 30
+  p = Point { x: 6, y: 7 }
+  print(match p { Point { x: a, y: b } => a * b, _ => 0 })  // 42
+  print(match p { Point { x } => x, _ => 0 })        // 6
+}
+
+test "tuple pattern" { assert_eq(match [1,2] { (a,b) => a+b, _ => 0 }, 3) }
+test "struct pattern" {
+  q = Point { x: 2, y: 5 }
+  assert_eq(match q { Point { x: a, y: b } => a+b, _ => 0 }, 7)
+}
+test "compound bitwise" { x = 7  x <<= 2  assert_eq(x, 28) }
+test "cast" { assert_eq(9.8 as Int, 9) }

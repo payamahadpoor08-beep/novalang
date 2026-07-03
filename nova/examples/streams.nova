@@ -1,0 +1,20 @@
+// The stream operator `->>` feeds every element of a collection into a channel.
+// `src ->> sink` is `for x in src { sink <- x }` and evaluates to the channel,
+// so it composes with Nova's channels, `recv`, `select`, and spawned producers.
+
+fn main() {
+  let ch = chan();
+  [1, 2, 3, 4] ->> ch;                 // stream four values into the channel
+  let total = recv(ch) + recv(ch) + recv(ch) + recv(ch);
+  print(total);                        // 10
+
+  // the result is the channel, so it chains and can be read afterwards
+  let out = ["a", "b"] ->> chan();
+  print(recv(out) + recv(out));        // ab
+}
+
+test "stream sums" {
+  let ch = chan();
+  [10, 20, 30] ->> ch;
+  assert_eq(recv(ch) + recv(ch) + recv(ch), 60);
+}

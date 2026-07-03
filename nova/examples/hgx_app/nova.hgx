@@ -1,0 +1,12 @@
+# sample Nova project config
+[package]
+name = "greeter"
+version = "0.1.0"
+entry = "src/main.nova"
+
+[build]
+opt-level = "release"
+jit-threshold = 100
+
+[target]
+default = "pc"
