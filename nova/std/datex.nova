@@ -1,0 +1,101 @@
+// std/datex — civil (Gregorian) date arithmetic over days-since-epoch
+// (1970-01-01 = day 0), using Howard Hinnant's exact integer algorithms.
+// Works with now_ms() for real timestamps: days = now_ms() / 86400000.
+
+fn is_leap(y) { y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) }
+
+fn days_in_month(y, m) {
+  if m == 2 { if is_leap(y) { 29 } else { 28 } }
+  else if m == 4 || m == 6 || m == 9 || m == 11 { 30 }
+  else { 31 }
+}
+
+// days since epoch -> [year, month, day]
+fn civil_from_days(z0) {
+  let z = z0 + 719468
+  let era = (if z >= 0 { z } else { z - 146096 }) / 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let d = doy - (153 * mp + 2) / 5 + 1
+  let m = if mp < 10 { mp + 3 } else { mp - 9 }
+  // `return` keeps the array literal from chaining onto the line above as an
+  // index expression (semicolons are optional in Nova)
+  return [if m <= 2 { y + 1 } else { y }, m, d]
+}
+
+// [year, month, day] -> days since epoch
+fn days_from_civil(y0, m, d) {
+  let y = if m <= 2 { y0 - 1 } else { y0 }
+  let era = (if y >= 0 { y } else { y - 399 }) / 400
+  let yoe = y - era * 400
+  let mp = if m > 2 { m - 3 } else { m + 9 }
+  let doy = (153 * mp + 2) / 5 + d - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468
+}
+
+// 0 = Monday ... 6 = Sunday (ISO)
+fn weekday(z) {
+  let w = if z >= 0 - 3 { (z + 3) % 7 } else { (z + 4) % 7 + 6 }
+  w
+}
+
+fn weekday_name(z) {
+  ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekday(z)]
+}
+
+fn add_days(date, n) {
+  civil_from_days(days_from_civil(date[0], date[1], date[2]) + n)
+}
+
+fn date_diff(a, b) {
+  days_from_civil(b[0], b[1], b[2]) - days_from_civil(a[0], a[1], a[2])
+}
+
+fn pad2(n) { if n < 10 { "0" + str(n) } else { str(n) } }
+
+// [2026, 7, 3] -> "2026-07-03"
+fn format_date(date) {
+  str(date[0]) + "-" + pad2(date[1]) + "-" + pad2(date[2])
+}
+
+fn date_from_ms(ms) { civil_from_days(ms / 86400000) }
+
+test "leap years" {
+  assert(is_leap(2000))
+  assert(is_leap(2024))
+  assert(!is_leap(1900))
+  assert(!is_leap(2026))
+  assert_eq(days_in_month(2024, 2), 29)
+  assert_eq(days_in_month(2026, 2), 28)
+  assert_eq(days_in_month(2026, 12), 31)
+}
+
+test "epoch and roundtrips" {
+  assert_eq(civil_from_days(0), [1970, 1, 1])
+  assert_eq(days_from_civil(1970, 1, 1), 0)
+  assert_eq(civil_from_days(19908), [2024, 7, 4])
+  // every conversion must round-trip across boundaries
+  for z in 0 - 1000..1000 {
+    let c = civil_from_days(z * 137)
+    assert_eq(days_from_civil(c[0], c[1], c[2]), z * 137)
+  }
+}
+
+test "weekdays" {
+  assert_eq(weekday_name(0), "Thu")          // 1970-01-01
+  assert_eq(weekday_name(days_from_civil(2026, 7, 3)), "Fri")
+  assert_eq(weekday_name(days_from_civil(2000, 1, 1)), "Sat")
+}
+
+test "arithmetic and formatting" {
+  assert_eq(add_days([2026, 12, 31], 1), [2027, 1, 1])
+  assert_eq(add_days([2024, 2, 28], 1), [2024, 2, 29])
+  assert_eq(add_days([2026, 1, 1], 0 - 1), [2025, 12, 31])
+  assert_eq(date_diff([2026, 1, 1], [2026, 7, 3]), 183)
+  assert_eq(format_date([2026, 7, 3]), "2026-07-03")
+  assert_eq(format_date([999, 1, 9]), "999-01-09")
+}
