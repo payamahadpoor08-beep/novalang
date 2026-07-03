@@ -13,7 +13,7 @@ mod diag;
 use std::io::{self, Write, BufRead};
 use std::process::exit;
 
-const VERSION: &str = "1.0";
+const VERSION: &str = "3.26.0";
 
 fn main() {
     // a binary produced by `nova build` carries its program in a trailer:
