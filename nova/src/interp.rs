@@ -15,10 +15,10 @@ pub type Scope = HashMap<String, Value>;
 // Internal marker: an Err carrying this string means "a Nova `throw` is unwinding";
 // the real thrown Value lives in Interp::pending_throw. Distinguishes user throws
 // from genuine runtime errors so try/catch only catches the former.
-const THROW_SENTINEL: &str = "\u{0}__nova_throw__";
+pub(crate) const THROW_SENTINEL: &str = "\u{0}__nova_throw__";
 // Internal control signal: unwinds a generator body to the `produce` boundary
 // once the requested yield is reached. Never caught by try/catch.
-const YIELD_STOP: &str = "\u{0}__nova_yield_stop__";
+pub(crate) const YIELD_STOP: &str = "\u{0}__nova_yield_stop__";
 
 thread_local! {
     // xorshift64* RNG state for the `rand` module. Seeded from the wall clock on
@@ -549,8 +549,20 @@ impl Interp {
         Err(THROW_SENTINEL.to_string())
     }
 
+    // The VM shares the interpreter's throw channel: these expose it so the
+    // bytecode tier reproduces `call_function`'s sentinel protocol exactly.
+    pub(crate) fn take_pending_throw(&self) -> Value {
+        self.pending_throw.borrow_mut().take().unwrap_or(Value::Null)
+    }
+    pub(crate) fn park_throw(&self, v: Value) {
+        *self.pending_throw.borrow_mut() = Some(v);
+    }
+    pub(crate) fn set_pos(&self, pos: (u32, u32)) {
+        self.cur_pos.set(pos);
+    }
+
     // Prefix a message with the current source position, when known.
-    fn locate(&self, msg: String) -> String {
+    pub(crate) fn locate(&self, msg: String) -> String {
         let (line, col) = self.cur_pos.get();
         if line == 0 { msg } else { format!("line {}, col {}: {}", line, col, msg) }
     }
