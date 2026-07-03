@@ -1,0 +1,108 @@
+// std/fmtx — text formatting: padding/alignment, thousands separators,
+// fixed-point rendering via integer math (no float-printing surprises).
+
+fn pad_l(s, width, pad) {
+  let out = s
+  while len(out) < width { out = pad + out }
+  out
+}
+
+fn pad_r(s, width, pad) {
+  let out = s
+  while len(out) < width { out = out + pad }
+  out
+}
+
+fn center(s, width, pad) {
+  let out = s
+  let left = true
+  while len(out) < width {
+    if left { out = pad + out } else { out = out + pad }
+    left = !left
+  }
+  out
+}
+
+// 1234567 -> "1,234,567" (handles negatives)
+fn thousands(n) {
+  let neg = n < 0
+  let digits = str(if neg { 0 - n } else { n })
+  let out = ""
+  let cnt = 0
+  let i = len(digits) - 1
+  while i >= 0 {
+    out = digits[i] + out
+    cnt = cnt + 1
+    if cnt % 3 == 0 && i > 0 { out = "," + out }
+    i = i - 1
+  }
+  if neg { "-" + out } else { out }
+}
+
+// integer power of ten (d small and non-negative)
+fn pow10(d) {
+  let p = 1
+  for i in 0..d { p = p * 10 }
+  p
+}
+
+// x rounded HALF-AWAY-FROM-ZERO to d decimals, rendered without float noise:
+// fixed(3.14159, 2) -> "3.14", fixed(2.5, 0) -> "3", fixed(-1.5, 0) -> "-2"
+// (ties are on the BINARY value: 1.005 is stored as 1.00499..., so it rounds down)
+fn fixed(x, d) {
+  let neg = x < 0.0
+  let ax = if neg { 0.0 - x } else { x }
+  let scale = pow10(d)
+  let scaled = to_int(ax * to_float(scale) + 0.5)
+  let whole = scaled / scale
+  let frac = scaled % scale
+  let out = str(whole)
+  if d > 0 { out = out + "." + pad_l(str(frac), d, "0") }
+  if neg && scaled != 0 { out = "-" + out }
+  out
+}
+
+// percentage with d decimals: ratio(1, 3, 1) -> "33.3%"
+fn percent(num, den, d) { fixed(to_float(num) * 100.0 / to_float(den), d) + "%" }
+
+// simple table row: pads each cell to its column width, joined by a separator
+fn row(cells, widths, sep) {
+  let out = ""
+  for i in 0..len(cells) {
+    let cell = pad_r(str(cells[i]), widths[i], " ")
+    if i == 0 { out = cell } else { out = out + sep + cell }
+  }
+  out
+}
+
+test "padding and centering" {
+  assert_eq(pad_l("7", 4, "0"), "0007")
+  assert_eq(pad_r("ab", 5, "."), "ab...")
+  assert_eq(center("hi", 6, "-"), "--hi--")
+  assert_eq(pad_l("long", 2, "0"), "long")
+}
+
+test "thousands" {
+  assert_eq(thousands(0), "0")
+  assert_eq(thousands(999), "999")
+  assert_eq(thousands(1000), "1,000")
+  assert_eq(thousands(1234567), "1,234,567")
+  assert_eq(thousands(0 - 9876543), "-9,876,543")
+}
+
+test "fixed point" {
+  assert_eq(fixed(3.14159, 2), "3.14")
+  assert_eq(fixed(2.5, 0), "3")
+  assert_eq(fixed(1.0, 3), "1.000")
+  assert_eq(fixed(0.0 - 1.5, 0), "-2")
+  assert_eq(fixed(0.0 - 1.005, 2), "-1.00") // binary 1.005 is 1.00499...
+  assert_eq(fixed(9.999, 2), "10.00")
+  assert_eq(fixed(0.0, 2), "0.00")
+}
+
+test "percent and rows" {
+  assert_eq(percent(1, 3, 1), "33.3%")
+  assert_eq(percent(2, 4, 0), "50%")
+  assert_eq(row(["id", "name"], [4, 6], "| "), "id  | name  ")
+  assert_eq(row([1, "nova"], [3, 4], " "), "1   nova")
+}

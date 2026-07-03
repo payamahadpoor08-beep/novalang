@@ -1031,6 +1031,9 @@ Execution tiers on `fib(35)` (same source, same output):
 | `std/strx.nova` | starts/ends_with, repeat, pad, reverse, palindrome, find/contains/replace, split/join, trim, levenshtein |
 | `std/ds.nova` | Stack, Queue (amortized), MinHeap (+heap_sort), Counter |
 | `std/func.nova` | compose/pipe, apply_n, flip, negate, fold_range, fixpoint, memoize |
+| `std/setx.nova` | insertion-ordered sets: add/has/remove, union/intersect/difference, subset/equality |
+| `std/fmtx.nova` | pad/center, thousands separators, integer-math fixed-point, percent, table rows |
+| `std/datex.nova` | civil date arithmetic (Hinnant algorithms): leap years, weekday, add_days/diff, ISO formatting, now_ms bridge |
 
 ## Differential test corpus (`tests/corpus/`)
 

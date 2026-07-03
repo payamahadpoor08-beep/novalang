@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: build + differential verification
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nova
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            nova/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('nova/Cargo.lock') }}
+
+      - name: Build (warnings are errors)
+        run: cargo build --release
+
+      - name: Unit + differential tests
+        run: cargo test --release
+
+      - name: Differential corpus (4 VM modes + AOT tier census)
+        run: bash tests/run_corpus.sh
+
+      - name: Standard library test blocks
+        run: |
+          for m in list sort mathx strx ds func json setx fmtx datex; do
+            ./target/release/nova test std/$m.nova
+          done
+
+      - name: Formatter idempotence
+        run: |
+          for f in examples/*.nova; do
+            a=$(./target/release/nova fmt "$f")
+            b=$(echo "$a" | ./target/release/nova fmt /dev/stdin)
+            [ "$a" = "$b" ] || { echo "fmt not idempotent: $f"; exit 1; }
+          done
