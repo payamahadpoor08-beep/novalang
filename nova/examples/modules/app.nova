@@ -1,0 +1,13 @@
+// Import every item from another Nova file with `use "path"`. Paths resolve
+// relative to this file; each file is loaded once (cycles and diamonds are safe).
+use "geometry.nova"
+
+fn main() {
+  print(area(3, 4))         // 12
+  print(square_area(5))     // 25
+  print(PI_TIMES_100)       // 314
+}
+
+test "imported area"  { assert_eq(area(3, 4), 12) }
+test "imported reuse" { assert_eq(square_area(5), 25) }
+test "imported const" { assert_eq(PI_TIMES_100, 314) }

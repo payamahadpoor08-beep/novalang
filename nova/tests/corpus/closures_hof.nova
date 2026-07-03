@@ -1,0 +1,17 @@
+fn make_counter() {
+  let n = [0]
+  let g = () => { n[0] = n[0] + 1; return n[0] }
+  g
+}
+fn twice(f, x) { f(f(x)) }
+fn main() {
+  let c = make_counter()
+  print(c())
+  print(c())
+  print(c())
+  print(twice((x) => x * 3, 2))
+  let fs = [(x) => x + 1, (x) => x * 10]
+  print(fs[0](5) + fs[1](5))
+  print(!true)
+  print(!((x) => false)(1))
+}

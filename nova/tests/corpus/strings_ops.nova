@@ -1,0 +1,11 @@
+fn main() {
+  let s = "hello world"
+  print(s.len())
+  print(s.upper())
+  print(s[0..5])
+  print(s[6..])
+  print(s[0])
+  print("a" + "b" + 1)
+  print(f"{s.upper()}! {1 + 2}")
+  for c in "abc" { print(c) }
+}

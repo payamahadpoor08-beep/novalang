@@ -1,0 +1,33 @@
+// Effect annotations.
+//
+// A function can declare which effects it is allowed to perform with `![..]`.
+// The checker (nova check) then enforces it: performing an effect outside the
+// declared set — directly via an effectful builtin like `print` (IO), or by
+// calling a function that declares that effect — is a compile-time error.
+//
+//   fn oops() ![]   { print("x") }   // error: performs `IO` not in ![]
+//   fn ok()   ![IO] { print("x") }   // fine
+//
+// Unannotated functions are not effect-checked (the system is gradual/opt-in).
+
+/// Declares the IO effect, so printing is allowed.
+fn announce(msg) ![IO] {
+  print(msg)
+}
+
+/// Pure: declares no effects and performs none.
+fn add(a, b) ![] {
+  a + b
+}
+
+/// IO propagates through calls: this calls `announce`, which is `![IO]`.
+fn greet(name) ![IO] {
+  announce("hello, " + name)
+}
+
+fn main() {
+  greet("Nova")          // hello, Nova
+  print(add(2, 3))       // 5
+}
+
+test "pure add" { assert_eq(add(2, 3), 5) }

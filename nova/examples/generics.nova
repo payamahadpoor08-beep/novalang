@@ -1,0 +1,17 @@
+fn id[T](x: T) -> T { x }
+fn pair[T](a: T, b: T) -> T { a }
+
+fn double(n: Int) -> Int { n * 2 }
+fn greet(name: Str) -> Str { "hello " + name }
+
+fn main() {
+  print("=== generics run fine (dynamic) ===")
+  print(id(42))
+  print(id("hello"))
+  print(id([1, 2, 3]))
+  print(pair(10, 20))
+
+  print("=== typed functions ===")
+  print(double(21))
+  print(greet("Nova"))
+}

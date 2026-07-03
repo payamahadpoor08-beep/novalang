@@ -1,0 +1,75 @@
+fn safe_divide(a, b) {
+  if b == 0 {
+    throw "division by zero!"
+  }
+  a / b
+}
+
+fn parse_age(s) {
+  n = int(s)
+  if n < 0 {
+    throw "age cannot be negative"
+  }
+  if n > 150 {
+    throw "age too large"
+  }
+  n
+}
+
+fn main() {
+  print("=== basic try/catch ===")
+  try {
+    result = safe_divide(10, 2)
+    print("10 / 2 =")
+    print(result)
+  } catch e {
+    print("error:")
+    print(e)
+  }
+
+  print("=== catching a throw ===")
+  try {
+    result = safe_divide(5, 0)
+    print("this won't print")
+  } catch e {
+    print("caught:")
+    print(e)
+  }
+
+  print("=== finally always runs ===")
+  try {
+    print("in try")
+    throw "boom"
+  } catch e {
+    print("in catch:")
+    print(e)
+  } finally {
+    print("in finally (always)")
+  }
+
+  print("=== validation with multiple throws ===")
+  ages = ["25", "-5", "200", "30"]
+  for a in ages {
+    try {
+      valid = parse_age(a)
+      print("valid age:")
+      print(valid)
+    } catch e {
+      print("rejected " + a + ": " + e)
+    }
+  }
+
+  print("=== nested try ===")
+  try {
+    try {
+      throw "inner error"
+    } catch e {
+      print("inner caught:")
+      print(e)
+      throw "rethrown from inner"
+    }
+  } catch e {
+    print("outer caught:")
+    print(e)
+  }
+}

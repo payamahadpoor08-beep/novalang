@@ -1,0 +1,15 @@
+// Arbitrary-precision integers — no 64-bit ceiling, limited only by memory.
+fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }
+
+fn main() {
+  print(fact(40))                    // 40! — way past i64
+  print(2 ** 256)                    // 78-digit number
+  print(9223372036854775807 + 1)     // i64::MAX + 1 auto-promotes
+  big = 123456789012345678901234567890
+  print(big * big)
+  print(len(str(10 ** 1000)))        // 1001 digits
+}
+
+test "factorial exact" { assert_eq(fact(25), 15511210043330985984000000) }
+test "overflow promotes" { assert_eq(9223372036854775807 + 1, 9223372036854775808) }
+test "power" { assert_eq(2 ** 64, 18446744073709551616) }

@@ -1,0 +1,19 @@
+// select: take the first ready channel.
+fn main() {
+  a = chan()
+  b = chan()
+  send_to(b, 42)                     // only b is ready
+  r = select { a => "a", b => "got " + str(_recv) }
+  print(r)                           // got 42
+
+  c = chan()
+  spawn { c <- 9 }                   // a task fills c; select drives it
+  print(select { c => _recv * 5 })   // 45
+}
+
+test "select picks ready channel" {
+  x = chan()
+  y = chan()
+  send_to(y, 7)
+  assert_eq(select { x => 0, y => _recv }, 7)
+}

@@ -1,0 +1,10 @@
+macro square { ($x:expr) => { $x * $x } }
+macro addone { ($x:expr) => { $x + 1 } }
+
+fn main() {
+  print(square!(5))
+  print(square!(3 + 1))
+  print(addone!(10))
+  print(2 ** 10)
+  print(45 ** 65)
+}

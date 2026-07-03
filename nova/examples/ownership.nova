@@ -1,0 +1,31 @@
+// Linear and affine types — static ownership / move checking.
+//
+// A `linear` parameter must be consumed exactly once; an `affine` parameter at
+// most once. The checker (nova check) enforces it. These would be errors:
+//
+//   fn dup(x: linear Int) { print(x); print(x) }  // use of moved value `x`
+//   fn lose(x: linear Int) { }                     // linear value `x` never used
+//   fn loop_(x: linear Int){ for i in 0..2 { use(x) } }  // used inside a loop
+//
+// Unannotated parameters are unchecked (the system is gradual), and the
+// interpreter ignores the modifiers — they are purely static.
+
+/// Takes ownership of `token` and consumes it exactly once.
+fn redeem(token: linear Int) -> Int {
+  token * 10
+}
+
+/// `affine`: may use `note` once, or drop it.
+fn maybe_log(note: affine Str, verbose) {
+  if verbose {
+    print(note)
+  }
+}
+
+fn main() {
+  print(redeem(7))        // 70
+  maybe_log("hello", true)   // hello
+  maybe_log("quiet", false)  // (dropped — affine allows not using it)
+}
+
+test "linear consumed once" { assert_eq(redeem(3), 30) }

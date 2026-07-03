@@ -1,0 +1,15 @@
+struct Point { x: Int, y: Int }
+impl Point {
+  fn norm2(self) { self.x * self.x + self.y * self.y }
+  fn shift(self, dx, dy) { Point { x: self.x + dx, y: self.y + dy } }
+}
+fn main() {
+  let p = Point { x: 3, y: 4 }
+  print(p.norm2())
+  let q = p.shift(1, 0 - 1)
+  print(q.x)
+  print(q.y)
+  p.x = 100
+  print(p.norm2())
+  print(q?.x)
+}

@@ -1,0 +1,35 @@
+struct Task {
+  name: String,
+  priority: i32,
+  done: bool,
+}
+
+fn main() {
+  let tasks = array();
+  push(tasks, Task { name: "write code", priority: 3, done: false });
+  push(tasks, Task { name: "test code", priority: 5, done: false });
+  push(tasks, Task { name: "coffee", priority: 1, done: true });
+  push(tasks, Task { name: "deploy", priority: 4, done: false });
+
+  print("all task names:");
+  let names = map(tasks, t => t.name);
+  print(names);
+
+  print("high priority (>= 4):");
+  let urgent = filter(tasks, t => t.priority >= 4);
+  for t in urgent {
+    print(t.name);
+  }
+
+  print("total priority points:");
+  let total = reduce(tasks, (sum, t) => sum + t.priority, 0);
+  print(total);
+
+  print("pending count:");
+  let pending = filter(tasks, t => t.done == false);
+  print(len(pending));
+
+  print("range builtin:");
+  print(range(5));
+  print(range(2, 8));
+}

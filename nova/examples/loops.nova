@@ -1,0 +1,10 @@
+fn main() {
+  count = 0
+  sum = 0
+  loop {
+    count += 1
+    if count > 100 { break }
+    sum += count
+  }
+  print(sum)
+}

@@ -1,0 +1,34 @@
+const MAX_USERS = 100;
+const PI = 3.14159;
+const APP_NAME = "Nova";
+const LIMITS = [10, 20, 30];
+
+data Point(x, y)
+data Color(r, g, b)
+
+fn main() {
+  print("=== constants ===")
+  print(MAX_USERS)
+  print(PI)
+  print(APP_NAME)
+  print(LIMITS)
+  print(LIMITS[1])
+
+  print("=== const in expression ===")
+  print(MAX_USERS * 2)
+  print(f"App: {APP_NAME}, max: {MAX_USERS}")
+
+  print("=== data types (like struct) ===")
+  p = Point { x: 3, y: 4 }
+  print(p.x)
+  print(p.y)
+  c = Color { r: 255, g: 128, b: 0 }
+  print(f"rgb({c.r}, {c.g}, {c.b})")
+
+  print("=== const as default/bound ===")
+  count = 0
+  while count < MAX_USERS {
+    count += 25
+  }
+  print(count)
+}

@@ -1,0 +1,11 @@
+struct Profile { bio: Str }
+struct User { name: Str, profile: Profile }
+fn main() {
+  u = User { name: "Sara", profile: Profile { bio: "dev" } }
+  print(u?.name)
+  print(u?.profile?.bio)
+  empty = null
+  print(empty?.name ?? "anonymous")
+  config = null
+  print(config ?? "default config")
+}

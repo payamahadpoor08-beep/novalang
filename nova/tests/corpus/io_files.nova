@@ -1,0 +1,14 @@
+fn main() {
+  let p = "/tmp/nova_corpus_io.txt"
+  write_file(p, "alpha\n")
+  append_file(p, "beta")
+  print(read_file(p))
+  print(file_exists(p))
+  remove_file(p)
+  print(file_exists(p))
+  try { read_file("/definitely/not/here") } catch e { print("caught missing file") }
+  print(to_int("  99 "))
+  print(to_int("abc"))
+  print(to_float("2.5"))
+  print(chr(ord("z")))
+}

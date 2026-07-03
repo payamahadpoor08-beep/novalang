@@ -1,0 +1,79 @@
+// std/func — function combinators.
+
+fn compose(f, g) { (x) => f(g(x)) }
+
+fn pipe2(f, g) { (x) => g(f(x)) }
+
+fn identity(x) { x }
+
+fn constant(v) { (x) => v }
+
+fn apply_n(f, n, x) {
+  let cur = x
+  for i in 0..n { cur = f(cur) }
+  cur
+}
+
+fn flip(f) { (a, b) => f(b, a) }
+
+fn negate(pred) { (x) => !pred(x) }
+
+// left fold over [lo, hi) applying f(acc, i)
+fn fold_range(lo, hi, init, f) {
+  let acc = init
+  for i in lo..hi { acc = f(acc, i) }
+  acc
+}
+
+// fixed-point iteration: apply f until the value stops changing (or limit)
+fn fixpoint(f, x, limit) {
+  let cur = x
+  for i in 0..limit {
+    let nxt = f(cur)
+    if nxt == cur { return cur }
+    cur = nxt
+  }
+  cur
+}
+
+// memoized wrapper for single-int-argument functions
+fn memoize1(f) {
+  let cache = #{}
+  let g = (x) => {
+    let hit = cache[x]
+    if hit != null { return hit }
+    let v = f(x)
+    cache[x] = v
+    return v
+  }
+  g
+}
+
+test "compose pipe" {
+  let inc = (x) => x + 1
+  let dbl = (x) => x * 2
+  assert_eq(compose(inc, dbl)(5), 11)   // inc(dbl(5))
+  assert_eq(pipe2(inc, dbl)(5), 12)     // dbl(inc(5))
+}
+test "identity constant apply_n" {
+  assert_eq(identity(42), 42)
+  assert_eq(constant(7)(999), 7)
+  assert_eq(apply_n((x) => x * 2, 5, 1), 32)
+}
+test "flip negate" {
+  let sub = (a, b) => a - b
+  assert_eq(flip(sub)(3, 10), 7)
+  let is_even = (x) => x % 2 == 0
+  assert(negate(is_even)(3))
+  assert(!negate(is_even)(4))
+}
+test "fold_range fixpoint" {
+  assert_eq(fold_range(1, 5, 0, (acc, i) => acc + i), 10)
+  assert_eq(fixpoint((x) => x / 2, 40, 100), 0)
+}
+test "memoize" {
+  let mfib = memoize1((n) => if n < 2 { n } else { 0 })
+  assert_eq(mfib(1), 1)
+  assert_eq(mfib(1), 1)
+  assert_eq(mfib(0), 0)
+}

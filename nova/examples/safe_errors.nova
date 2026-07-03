@@ -1,0 +1,35 @@
+// Catchable runtime errors and constant folding.
+
+// Runtime faults that used to abort the whole program — division by zero,
+// indexing past the end of an array — are now ordinary exceptions: a `try`
+// with a `catch` handles them and execution continues.
+fn safe_div(a, b) {
+  result = 0
+  try {
+    result = a / b
+  } catch e {
+    result = -1   // signal failure instead of crashing
+  }
+  result
+}
+
+fn main() {
+  print(safe_div(10, 2))   // 5
+  print(safe_div(10, 0))   // -1  (division by zero was caught)
+
+  try {
+    let xs = [1, 2, 3]
+    print(xs[10])
+  } catch e {
+    print("index error: " + e)
+  }
+
+  // Constant subexpressions are folded before execution; the results are
+  // identical to evaluating them at runtime.
+  print(2 + 3 * 4)         // 14
+  print(2 ** 10)           // 1024
+}
+
+test "safe divide ok"      { assert_eq(safe_div(9, 3), 3) }
+test "safe divide by zero" { assert_eq(safe_div(9, 0), -1) }
+test "folded arithmetic"   { assert_eq(2 + 3 * 4, 14) }

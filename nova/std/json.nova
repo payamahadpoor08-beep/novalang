@@ -1,0 +1,229 @@
+// std/json — JSON parser + serializer, written in Nova.
+// json_parse(s): objects -> maps, arrays -> arrays, numbers -> Int/Float,
+// true/false/null; throws "json error at <i>: <why>" on malformed input.
+// json_stringify(v): the reverse (maps/arrays/strings/ints/floats/bools/null).
+
+fn js_ws(s, i) {
+  while i < len(s) {
+    let c = s[i]
+    if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+    else { break }
+  }
+  i
+}
+
+fn js_fail(i, why) { throw f"json error at {i}: {why}" }
+
+// each js_* returns [value, next_index]
+fn js_value(s, i) {
+  i = js_ws(s, i)
+  if i >= len(s) { js_fail(i, "unexpected end of input") }
+  let c = s[i]
+  if c == "{" { return js_object(s, i) }
+  if c == "[" { return js_array(s, i) }
+  if c == "\"" { return js_string(s, i) }
+  if c == "t" {
+    if s[i..i+4] == "true" { return [true, i + 4] }
+    js_fail(i, "bad literal")
+  }
+  if c == "f" {
+    if s[i..i+5] == "false" { return [false, i + 5] }
+    js_fail(i, "bad literal")
+  }
+  if c == "n" {
+    if s[i..i+4] == "null" { return [null, i + 4] }
+    js_fail(i, "bad literal")
+  }
+  js_number(s, i)
+}
+
+fn js_digit(c) { c >= "0" && c <= "9" }
+
+fn js_number(s, i) {
+  let start = i
+  if i < len(s) && s[i] == "-" { i = i + 1 }
+  if i >= len(s) || !js_digit(s[i]) { js_fail(i, "bad number") }
+  while i < len(s) && js_digit(s[i]) { i = i + 1 }
+  let is_float = false
+  if i < len(s) && s[i] == "." {
+    is_float = true
+    i = i + 1
+    if i >= len(s) || !js_digit(s[i]) { js_fail(i, "bad fraction") }
+    while i < len(s) && js_digit(s[i]) { i = i + 1 }
+  }
+  if i < len(s) && (s[i] == "e" || s[i] == "E") {
+    is_float = true
+    i = i + 1
+    if i < len(s) && (s[i] == "+" || s[i] == "-") { i = i + 1 }
+    if i >= len(s) || !js_digit(s[i]) { js_fail(i, "bad exponent") }
+    while i < len(s) && js_digit(s[i]) { i = i + 1 }
+  }
+  let text = s[start..i]
+  if is_float { return [to_float(text), i] }
+  let n = to_int(text)
+  if n == null { return [to_float(text), i] }   // integer overflow -> float
+  [n, i]
+}
+
+fn js_string(s, i) {
+  i = i + 1  // opening quote
+  let out = ""
+  while true {
+    if i >= len(s) { js_fail(i, "unterminated string") }
+    let c = s[i]
+    if c == "\"" { return [out, i + 1] }
+    if c == "\\" {
+      i = i + 1
+      if i >= len(s) { js_fail(i, "bad escape") }
+      let e = s[i]
+      if e == "\"" { out = out + "\"" }
+      else if e == "\\" { out = out + "\\" }
+      else if e == "/" { out = out + "/" }
+      else if e == "n" { out = out + "\n" }
+      else if e == "t" { out = out + "\t" }
+      else if e == "r" { out = out + "\r" }
+      else if e == "b" || e == "f" { out = out + "" }
+      else if e == "u" {
+        if i + 4 >= len(s) { js_fail(i, "bad unicode escape") }
+        let code = js_hex4(s, i + 1)
+        out = out + chr(code)
+        i = i + 4
+      }
+      else { js_fail(i, "bad escape") }
+    } else {
+      out = out + c
+    }
+    i = i + 1
+  }
+}
+
+fn js_hexval(c) {
+  if js_digit(c) { return ord(c) - 48 }
+  if c >= "a" && c <= "f" { return ord(c) - 87 }
+  if c >= "A" && c <= "F" { return ord(c) - 55 }
+  throw "json error: bad hex digit"
+}
+
+fn js_hex4(s, i) {
+  js_hexval(s[i]) * 4096 + js_hexval(s[i+1]) * 256 + js_hexval(s[i+2]) * 16 + js_hexval(s[i+3])
+}
+
+fn js_array(s, i) {
+  i = js_ws(s, i + 1)
+  let out = []
+  if i < len(s) && s[i] == "]" { return [out, i + 1] }
+  while true {
+    let r = js_value(s, i)
+    push(out, r[0])
+    i = js_ws(s, r[1])
+    if i >= len(s) { js_fail(i, "unterminated array") }
+    if s[i] == "]" { return [out, i + 1] }
+    if s[i] != "," { js_fail(i, "expected , or ]") }
+    i = i + 1
+  }
+}
+
+fn js_object(s, i) {
+  i = js_ws(s, i + 1)
+  let out = #{}
+  if i < len(s) && s[i] == "}" { return [out, i + 1] }
+  while true {
+    i = js_ws(s, i)
+    if i >= len(s) || s[i] != "\"" { js_fail(i, "expected string key") }
+    let k = js_string(s, i)
+    i = js_ws(s, k[1])
+    if i >= len(s) || s[i] != ":" { js_fail(i, "expected :") }
+    let v = js_value(s, i + 1)
+    out[k[0]] = v[0]
+    i = js_ws(s, v[1])
+    if i >= len(s) { js_fail(i, "unterminated object") }
+    if s[i] == "}" { return [out, i + 1] }
+    if s[i] != "," { js_fail(i, "expected , or }") }
+    i = i + 1
+  }
+}
+
+fn json_parse(s) {
+  let r = js_value(s, 0)
+  let i = js_ws(s, r[1])
+  if i != len(s) { js_fail(i, "trailing characters") }
+  r[0]
+}
+
+fn js_escape(s) {
+  let out = ""
+  for c in s {
+    if c == "\"" { out = out + "\\\"" }
+    else if c == "\\" { out = out + "\\\\" }
+    else if c == "\n" { out = out + "\\n" }
+    else if c == "\t" { out = out + "\\t" }
+    else if c == "\r" { out = out + "\\r" }
+    else { out = out + c }
+  }
+  out
+}
+
+fn json_stringify(v) {
+  if v == null { return "null" }
+  if type_of(v) == "bool" { return f"{v}" }
+  if type_of(v) == "int" || type_of(v) == "float" { return f"{v}" }
+  if type_of(v) == "string" { return "\"" + js_escape(v) + "\"" }
+  if type_of(v) == "array" {
+    let out = "["
+    let first = true
+    for x in v {
+      if first { first = false } else { out = out + "," }
+      out = out + json_stringify(x)
+    }
+    return out + "]"
+  }
+  if type_of(v) == "map" {
+    let out = "{"
+    let first = true
+    for k in map_keys(v) {
+      if first { first = false } else { out = out + "," }
+      out = out + json_stringify(k) + ":" + json_stringify(v[k])
+    }
+    return out + "}"
+  }
+  throw f"json_stringify: unsupported type {type_of(v)}"
+}
+
+test "parse scalars" {
+  assert_eq(json_parse("42"), 42)
+  assert_eq(json_parse("-7"), 0 - 7)
+  assert_eq(json_parse("3.5"), 3.5)
+  assert_eq(json_parse("1e3"), 1000.0)
+  assert_eq(json_parse("true"), true)
+  assert_eq(json_parse("false"), false)
+  assert_eq(json_parse("null"), null)
+  assert_eq(json_parse("\"hi\\nthere\""), "hi\nthere")
+  assert_eq(json_parse("\"\\u0041\\u00e9\""), "Aé")
+}
+test "parse arrays objects" {
+  assert_eq(json_parse("[1, 2, 3]"), [1, 2, 3])
+  assert_eq(json_parse("[]"), [])
+  assert_eq(json_parse("[[1],[2,[3]]]"), [[1], [2, [3]]])
+  let o = json_parse("{\"a\": 1, \"b\": [true, null]}")
+  assert_eq(o["a"], 1)
+  assert_eq(o["b"], [true, null])
+  let n = json_parse("{ \"x\" : { \"y\" : \"z\" } }")
+  assert_eq(n["x"]["y"], "z")
+}
+test "stringify roundtrip" {
+  let v = json_parse("{\"name\":\"nova\",\"n\":3,\"xs\":[1,2.5,false,null],\"s\":\"a\\\"b\"}")
+  let again = json_parse(json_stringify(v))
+  assert_eq(again["name"], "nova")
+  assert_eq(again["n"], 3)
+  assert_eq(again["xs"], [1, 2.5, false, null])
+  assert_eq(again["s"], "a\"b")
+}
+test "malformed throws" {
+  let caught = 0
+  try { json_parse("{") } catch e { caught = caught + 1 }
+  try { json_parse("[1,]") } catch e { caught = caught + 1 }
+  try { json_parse("\"open") } catch e { caught = caught + 1 }
+  try { json_parse("12 34") } catch e { caught = caught + 1 }
+  try { json_parse("{'a':1}") } catch e { caught = caught + 1 }
+  assert_eq(caught, 5)
+}

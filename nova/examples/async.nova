@@ -1,0 +1,113 @@
+// async.nova — Nova's async/await, spawn, channels, and select in action.
+// Run:  nova run examples/async.nova
+
+// --- async functions return a Future; .await drives it to a value ---
+async fn compute(n) {
+  n * n
+}
+
+async fn greet(name) {
+  "hello, " + name
+}
+
+// async functions can await other async functions
+async fn pipeline(n) {
+  a = compute(n).await        // 16 when n = 4
+  b = compute(a).await        // 256
+  a + b                       // 272
+}
+
+// --- spawn returns a JoinHandle; awaiting it yields the task's result ---
+fn spawn_demo() {
+  handle = spawn {
+    total = 0
+    for i in 1..=5 { total = total + i }
+    total                      // tail value becomes the task result
+  }
+  print("spawned a task, now awaiting it")
+  handle.await                 // 15
+}
+
+// --- channels: produce on one task, consume on another ---
+fn channel_demo() {
+  ch = chan()
+  // a producer task pushes three values then closes the channel
+  spawn {
+    ch <- 10
+    ch <- 20
+    ch <- 30
+    close(ch)
+  }
+  // drain the channel until the producer closes it
+  sum = 0
+  count = 0
+  while count < 3 {
+    v = recv(ch)
+    sum = sum + v
+    count = count + 1
+  }
+  sum                          // 60
+}
+
+// --- fan-in: two producer tasks, one consumer draining the channel ---
+fn fanin_demo() {
+  ch = chan()
+  spawn {
+    ch <- 1
+    ch <- 2
+  }
+  spawn {
+    ch <- 100
+    ch <- 200
+  }
+  total = 0
+  count = 0
+  while count < 4 {
+    total = total + recv(ch)
+    count = count + 1
+  }
+  total                          // 303
+}
+
+// --- await works on plain values too (already-resolved no-op) ---
+async fn maybe(x) {
+  if x > 0 { x } else { 0 - x }   // abs, async-style
+}
+
+fn main() {
+  print("== await ==")
+  print(compute(4).await)        // 16
+  print(greet("Nova").await)     // hello, Nova
+  print(pipeline(4).await)       // 272
+
+  print("== spawn ==")
+  print(spawn_demo())            // 15
+
+  print("== channels ==")
+  print(channel_demo())          // 60
+
+  print("== fan-in ==")
+  print(fanin_demo())            // 303
+
+  print("== abs via async ==")
+  print(maybe(0 - 7).await)      // 7
+
+  print("== fire-and-forget ==")
+  spawn { print("  background task ran") }
+  print("main is done; background drains after")
+}
+
+test "await resolves a future" {
+  assert_eq(compute(5).await, 25)
+}
+
+test "spawn returns task result" {
+  h = spawn { 7 * 6 }
+  assert_eq(h.await, 42)
+}
+
+test "channels carry values" {
+  ch = chan()
+  spawn { ch <- 1  ch <- 2  ch <- 3 }
+  assert_eq(recv(ch) + recv(ch) + recv(ch), 6)
+}

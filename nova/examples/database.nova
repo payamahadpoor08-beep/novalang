@@ -1,0 +1,31 @@
+struct User {
+  name: String,
+  age: i32,
+}
+
+fn main() {
+  db = dict()
+  map_set(db, 1, User { name: "Ali", age: 30 })
+  map_set(db, 2, User { name: "Sara", age: 25 })
+  map_set(db, 3, User { name: "Reza", age: 35 })
+
+  print("user 2:")
+  u = map_get(db, 2)
+  print(u.name + " is " + str(u.age))
+
+  print("all user ids:")
+  print(map_keys(db))
+
+  print("all users over 28:")
+  ids = map_keys(db)
+  for id in ids {
+    user = map_get(db, id)
+    if user.age > 28 {
+      print(user.name)
+    }
+  }
+
+  total_age = reduce(map_keys(db), (sum, id) => sum + map_get(db, id).age, 0)
+  print("total age:")
+  print(total_age)
+}

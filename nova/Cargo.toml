@@ -1,0 +1,18 @@
+[package]
+name = "nova"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+pest = "=2.7.8"
+pest_derive = "=2.7.8"
+cranelift = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+cranelift-native = "0.116"
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"

@@ -1,0 +1,50 @@
+machine TrafficLight {
+  initial Red
+  Red -> Green on "go"
+  Green -> Yellow on "slow"
+  Yellow -> Red on "stop"
+}
+
+machine Door {
+  initial Closed
+  Closed -> Open on "open"
+  Open -> Closed on "close"
+  Closed -> Locked on "lock"
+  Locked -> Closed on "unlock"
+}
+
+fn main() {
+  print("=== traffic light ===")
+  light = TrafficLight()
+  print(state_of(light))
+  print(send(light, "go"))
+  print(send(light, "slow"))
+  print(send(light, "stop"))
+  print("current:")
+  print(state_of(light))
+
+  print("=== door with invalid transition ===")
+  door = Door()
+  print(state_of(door))
+  send(door, "open")
+  print(state_of(door))
+  send(door, "close")
+  send(door, "lock")
+  print("locked:")
+  print(state_of(door))
+
+  try {
+    send(door, "open")
+  } catch e {
+    print("rejected:")
+    print(e)
+  }
+
+  print("=== full cycle ===")
+  l2 = TrafficLight()
+  events = ["go", "slow", "stop", "go"]
+  for ev in events {
+    new_state = send(l2, ev)
+    print(ev + " -> " + new_state)
+  }
+}

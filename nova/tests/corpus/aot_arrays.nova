@@ -1,0 +1,14 @@
+fn main() {
+  let a = [10, 20, 30]
+  push(a, 40)
+  a[1] = 99
+  print(a)
+  print(a[1..])
+  print(pop(a))
+  print(a)
+  print([1, [2, 3], "s"])
+  print([1, 2] == [1, 2])
+  let total = 0
+  for x in a { total = total + x }
+  print(total)
+}

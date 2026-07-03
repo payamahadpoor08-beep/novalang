@@ -1,0 +1,41 @@
+struct Student {
+  name: String,
+  grade: i32,
+}
+
+fn average(students) {
+  let total = 0;
+  for s in students {
+    total = total + s.grade;
+  }
+  return total / len(students);
+}
+
+fn main() {
+  let class = array();
+  push(class, Student { name: "Ali", grade: 85 });
+  push(class, Student { name: "Sara", grade: 92 });
+  push(class, Student { name: "Reza", grade: 78 });
+
+  print("class size:");
+  print(len(class));
+
+  print("students:");
+  for s in class {
+    print(s.name + ": " + str(s.grade));
+  }
+
+  print("average grade:");
+  print(average(class));
+
+  print("first student via index:");
+  let first = class[0];
+  print(first.name);
+
+  print("top grade check:");
+  for s in class {
+    if s.grade >= 90 {
+      print(s.name + " has an A!");
+    }
+  }
+}

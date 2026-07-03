@@ -1,0 +1,40 @@
+use json.{json_parse, json_stringify, json_pretty}
+
+fn main() {
+  print("=== parse JSON ===")
+  data = json_parse("{\"name\": \"Payam\", \"age\": 24, \"active\": true, \"scores\": [85, 92, 78]}")
+  print(data["name"])
+  print(data["age"])
+  print(data["active"])
+  print(data["scores"])
+  print(data["scores"][1])
+
+  print("=== nested JSON ===")
+  nested = json_parse("{\"user\": {\"id\": 1, \"tags\": [\"a\", \"b\"]}, \"count\": 42}")
+  print(nested["user"]["id"])
+  print(nested["user"]["tags"][0])
+  print(nested["count"])
+
+  print("=== stringify ===")
+  m = dict()
+  m["lang"] = "Nova"
+  m["version"] = 17
+  m["stable"] = true
+  print(json_stringify(m))
+
+  print("=== arrays and types ===")
+  print(json_stringify([1, 2, 3]))
+  print(json_stringify("hello \"world\""))
+  print(json_stringify(null))
+  print(json_stringify(3.14))
+
+  print("=== round trip ===")
+  original = "{\"a\":1,\"b\":[2,3],\"c\":null}"
+  parsed = json_parse(original)
+  back = json_stringify(parsed)
+  print(back)
+
+  print("=== pretty print ===")
+  config = json_parse("{\"server\": {\"host\": \"localhost\", \"port\": 8080}, \"debug\": false}")
+  print(json_pretty(config))
+}

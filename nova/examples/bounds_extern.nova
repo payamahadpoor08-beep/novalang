@@ -1,0 +1,31 @@
+// Trait bounds (where clauses) and extern declarations.
+
+// A trait and two types: only Dog implements Greet.
+trait Greet { fn greet(self) -> Str; }
+
+struct Dog { name: Str }
+impl Greet for Dog { fn greet(self) -> Str { "woof, I am " + self.name } }
+
+// Generic functions can require that a type parameter implements a trait, either
+// with a `where` clause or an inline `[T: Trait]` bound. The checker verifies the
+// bound whenever the argument's concrete type is known; a type that does not
+// implement the trait is a compile-time error (`nova check`).
+fn announce[T](x: T) -> Str where T: Greet { x.greet() }
+fn shout[T: Greet](x: T) -> Str { x.greet() }
+
+// extern blocks declare foreign functions. Nova has no FFI yet, so the checker
+// knows their name and arity (fixed or variadic), but calling one is a clear
+// runtime error rather than a silent crash.
+extern "C" {
+  fn c_clock();
+  fn c_printf(fmt, ...);
+}
+
+fn main() {
+  let rex = Dog { name: "Rex" }
+  print(announce(rex))   // woof, I am Rex
+  print(shout(rex))      // woof, I am Rex
+}
+
+test "where bound calls method" { assert_eq(announce(Dog { name: "A" }), "woof, I am A") }
+test "inline bound calls method" { assert_eq(shout(Dog { name: "B" }), "woof, I am B") }
