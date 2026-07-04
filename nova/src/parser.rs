@@ -159,9 +159,19 @@ fn parse_attr(a: Pair<Rule>) -> Attr {
     let text = a.as_str();
     let name: String = text.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
     let mut args: Vec<(String, String)> = Vec::new();
-    // named `k = v` (attr_arg) plus any int/string/bool literals as positional args
-    collect_attr_values(a, &mut args);
-    Attr { name, args }
+    let mut exprs: Vec<Expr> = Vec::new();
+    // contract attributes carry real predicate expressions (`requires`/`ensures`/
+    // `assumes` take `expr` args); capture those as AST, everything else as strings
+    if matches!(name.as_str(), "requires" | "ensures" | "assumes") {
+        for inner in a.into_inner() {
+            if inner.as_rule() == Rule::expr {
+                if let Ok(e) = lower_expr(inner) { exprs.push(e); }
+            }
+        }
+    } else {
+        collect_attr_values(a, &mut args);
+    }
+    Attr { name, args, exprs }
 }
 
 fn collect_attr_values(p: Pair<Rule>, args: &mut Vec<(String, String)>) {

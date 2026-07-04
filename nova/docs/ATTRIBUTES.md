@@ -57,11 +57,45 @@ fn important() { 1 + 2 + 3 }
 // integrity_of("important") is stable across runs, distinct per function
 ```
 
+### `#[memo]` / `#[memoize]`
+Caches results by argument values — a pure function is computed once per distinct
+input. (`memo`'d `fib` runs in linear time.)
+
+### `#[requires(expr, …)]` / `#[assumes(expr, …)]` / `#[ensures(expr, …)]`
+**Design by contract.** `requires`/`assumes` predicates are checked at entry with
+the parameters in scope; `ensures` is checked at exit with `result` bound to the
+return value. A violation throws a catchable contract error.
+
+```nova
+#[requires(x >= 0)]
+#[ensures(result >= x)]
+fn double_up(x) { x + x }
+```
+
+### `#[retry(attempts: N)]`
+Alias of `#[self_healing]`: retry the call on a runtime error up to N times.
+
+### `#[trace]` / `#[log]` / `#[audit]`
+Prints a deterministic `trace: name(args) -> result` line on every call.
+
+### `#[profile]`
+Counts calls; `profile_of("name")` returns the count.
+
+### `#[deprecate(...)]` / `#[deprecated]`
+Prints a one-time warning to stderr on first call (with the optional note).
+
+### Introspection — `attrs_of("name")`
+Returns the array of every attribute name on a function. Because **all** attributes
+are captured (not just the behavioural ones), even attributes whose full behaviour
+is still on the roadmap are visible and usable via this builtin.
+
 ## Roadmap (parse-only today — being implemented in later phases)
 `#[encrypt]`, `#[time_travel]`, `#[obfuscate]`, `#[simd]`, `#[anti_debug]`,
-`#[anti_tamper]`, `#[polymorph]`. See `docs/ROADMAP.md`. These currently parse but
-are no-ops; they will be marked done in FEATURES.md only when each has a corpus
-test proving real behaviour.
+`#[anti_tamper]`, `#[polymorph]`, plus optimisation hints (`#[inline_cache]`,
+`#[tail_call]`, `#[cold]`/`#[hot]`) and metadata tags (`#[version]`, `#[since]`,
+`#[intent]`, `#[example]`, `#[throws]`, `#[budget]`, …). All are **captured and
+introspectable via `attrs_of`** today; each gains full behaviour in later phases and
+is marked done in FEATURES.md only when a corpus test proves it.
 
 ---
 

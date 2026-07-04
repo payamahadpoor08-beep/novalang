@@ -47,9 +47,15 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 | attribute | status |
 |---|---|
 | `#[zero_alloc]` | Check — `nova check` errors if the function allocates |
-| `#[self_healing(attempts: N)]` | Run — retries the call on runtime error |
+| `#[self_healing(attempts: N)]` / `#[retry(attempts: N)]` | Run — retries the call on runtime error |
 | `#[hot_swap]` + `hot_swap(name, closure)` | Run — runtime body replacement |
 | `#[integrity]` + `integrity_of(name)` | Run — stable tamper-detection hash |
+| `#[memo]` / `#[memoize]` | Run — result cache keyed by args |
+| `#[requires]` / `#[assumes]` / `#[ensures]` | Run — design-by-contract checks (real predicate exprs) |
+| `#[trace]` / `#[log]` / `#[audit]` | Run — prints `name(args) -> result` per call |
+| `#[profile]` + `profile_of(name)` | Run — call counting |
+| `#[deprecate]` / `#[deprecated]` | Run — one-time warning on use |
+| **any attribute** + `attrs_of(name)` | Run — all attributes captured + introspectable |
 
 ## Parse-only ⚠️ (accepted syntax, NOT yet executed/enforced)
 These build AST nodes but currently do nothing at runtime — the honest truth:

@@ -155,10 +155,13 @@ pub struct Func {
 
 // A parsed `#[name(k: v, ...)]` attribute. `args` holds the `(key, value)` pairs
 // (positional args use the value with an empty key), values kept as raw strings.
+// `exprs` holds expression arguments for contract attributes (`requires`,
+// `ensures`, `assumes`) which take real predicates rather than literals.
 #[derive(Debug, Clone)]
 pub struct Attr {
     pub name: String,
     pub args: Vec<(String, String)>,
+    pub exprs: Vec<Expr>,
 }
 
 impl Attr {

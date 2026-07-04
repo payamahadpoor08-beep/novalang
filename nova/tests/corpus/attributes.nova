@@ -39,5 +39,30 @@ fn main() {
 
   h1 = integrity_of("important")
   print(h1 == integrity_of("important"))   // true — stable
-  print(h1 != integrity_of("connect"))     // true — distinct per function
+  print(h1 != integrity_of("connect"))
+  phase2()
+}
+
+// --- Phase 2 attributes ---
+#[memo]
+fn slow_fib(n) { if n < 2 { n } else { slow_fib(n-1) + slow_fib(n-2) } }
+
+#[requires(x >= 0)]
+#[ensures(result >= x)]
+fn double_up(x) { x + x }
+
+#[trace]
+fn tag(v) { v * 10 }
+
+#[profile]
+fn ping(n) { n }
+
+fn phase2() {
+  print(slow_fib(25))          // 75025, memoized
+  print(double_up(6))          // 12, contracts hold
+  print(tag(4))                // trace line + 40
+  ping(1); ping(1); ping(1)
+  print(profile_of("ping"))    // 3
+  print(len(attrs_of("double_up")))  // 2
+  try { double_up(0-1) } catch e { print("bad: " + e) }
 }

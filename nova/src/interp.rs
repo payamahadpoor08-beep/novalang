@@ -434,6 +434,11 @@ pub struct Interp {
     // installed via the `hot_swap(name, closure)` builtin; consulted before the
     // original body runs.
     swapped: RefCell<HashMap<String, Value>>,
+    // `#[memo]` result cache, keyed by "name(args)"; `#[profile]` call counts;
+    // one-shot `#[deprecate]` warning set.
+    memo: RefCell<HashMap<String, Value>>,
+    profile: RefCell<HashMap<String, i64>>,
+    deprecated_warned: RefCell<std::collections::HashSet<String>>,
 }
 
 impl Interp {
@@ -564,6 +569,9 @@ impl Interp {
             scope_pool: RefCell::new(Vec::new()),
             arg_pool: RefCell::new(Vec::new()),
             swapped: RefCell::new(HashMap::new()),
+            memo: RefCell::new(HashMap::new()),
+            profile: RefCell::new(HashMap::new()),
+            deprecated_warned: RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -828,6 +836,96 @@ impl Interp {
         }))))
     }
 
+    // The full attribute-aware call path. Applies (in order): hot_swap replacement,
+    // memo cache lookup, requires/assumes entry contracts, retry/self_healing around
+    // the body, ensures exit contract, trace/log/audit printing, profile counting,
+    // deprecate warning, and memo store. Attributed functions are interp-only in the
+    // VM compiler, so this behaviour is identical on every tier.
+    fn call_attributed(&self, name: &str, func: &Func, args: Vec<Value>) -> Result<Value, String> {
+        let has = |n: &str| func.attrs.iter().any(|a| a.name == n);
+
+        // hot_swap: an installed replacement body wins entirely
+        if has("hot_swap") {
+            if let Some(swap) = self.swapped.borrow().get(name).cloned() {
+                return self.call_closure(&swap, args);
+            }
+        }
+
+        // deprecate / deprecated: warn once per function
+        if has("deprecate") || has("deprecated") {
+            if self.deprecated_warned.borrow_mut().insert(name.to_string()) {
+                let note = func.attrs.iter().find(|a| a.name.starts_with("deprecat"))
+                    .and_then(|a| a.args.iter().find(|(_, _)| true).map(|(_, v)| v.clone()))
+                    .unwrap_or_default();
+                eprintln!("warning: `{}` is deprecated{}", name,
+                    if note.is_empty() { String::new() } else { format!(": {}", note) });
+            }
+        }
+
+        // memo / memoize: return a cached result if present
+        let memo_key = if has("memo") || has("memoize") {
+            Some(format!("{}|{}", name, args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")))
+        } else { None };
+        if let Some(k) = &memo_key {
+            if let Some(v) = self.memo.borrow().get(k) { return Ok(v.clone()); }
+        }
+
+        // requires / assumes: entry contracts, evaluated with params bound to args
+        for att in func.attrs.iter().filter(|a| a.name == "requires" || a.name == "assumes") {
+            let mut scope = Scope::with_capacity(func.params.len());
+            for (p, v) in func.params.iter().zip(args.iter()) { scope.insert(p.clone(), v.clone()); }
+            for pred in &att.exprs {
+                if !self.eval(pred, &scope)?.is_truthy() {
+                    return self.fail_assert(format!("{} contract violated in `{}`", att.name, name));
+                }
+            }
+        }
+
+        // retry / self_healing: run the body, retrying on error up to N attempts
+        let attempts = func.attrs.iter()
+            .filter(|a| a.name == "self_healing" || a.name == "retry")
+            .filter_map(|a| a.int_arg("attempts")).max().unwrap_or(1).max(1);
+        let mut result = Ok(Value::Null);
+        for _ in 0..attempts {
+            result = self.run_user_body(func, args.clone());
+            if result.is_ok() { break; }
+        }
+
+        // ensures: exit contract, evaluated with params + `result` bound
+        if let Ok(ret) = &result {
+            for att in func.attrs.iter().filter(|a| a.name == "ensures") {
+                let mut scope = Scope::with_capacity(func.params.len() + 1);
+                for (p, v) in func.params.iter().zip(args.iter()) { scope.insert(p.clone(), v.clone()); }
+                scope.insert("result".to_string(), ret.clone());
+                for pred in &att.exprs {
+                    if !self.eval(pred, &scope)?.is_truthy() {
+                        return self.fail_assert(format!("ensures contract violated in `{}`", name));
+                    }
+                }
+            }
+        }
+
+        // trace / log / audit: print a deterministic call record
+        if has("trace") || has("log") || has("audit") {
+            let a = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            match &result {
+                Ok(v) => println!("trace: {}({}) -> {}", name, a, v),
+                Err(_) => println!("trace: {}({}) -> <error>", name, a),
+            }
+        }
+
+        // profile: count calls (queryable via profile_of)
+        if has("profile") {
+            *self.profile.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
+        }
+
+        // memo: store a successful result
+        if let (Some(k), Ok(v)) = (&memo_key, &result) {
+            self.memo.borrow_mut().insert(k.clone(), v.clone());
+        }
+        result
+    }
+
     // Run a non-generator, non-async user function body over a pooled scope frame,
     // converting the resulting Flow to a value exactly as the call boundary does.
     fn run_user_body(&self, func: &Func, mut args: Vec<Value>) -> Result<Value, String> {
@@ -865,24 +963,9 @@ impl Interp {
                 ));
             }
             // Attribute-bearing functions take a slower, explicit path (rare — the
-            // common case skips this in one branch). `#[hot_swap]` runs a body
-            // installed at runtime; `#[self_healing(attempts: N)]` retries the call
-            // on a runtime error before giving up.
+            // common case skips this in one branch).
             if !func.attrs.is_empty() {
-                if func.attrs.iter().any(|a| a.name == "hot_swap") {
-                    if let Some(swap) = self.swapped.borrow().get(name).cloned() {
-                        return self.call_closure(&swap, args);
-                    }
-                }
-                if let Some(att) = func.attrs.iter().find(|a| a.name == "self_healing") {
-                    let attempts = att.int_arg("attempts").unwrap_or(1).max(1);
-                    let mut last: Result<Value, String> = Ok(Value::Null);
-                    for _ in 0..attempts {
-                        last = self.run_user_body(func, args.clone());
-                        if last.is_ok() { return last; }
-                    }
-                    return last;
-                }
+                return self.call_attributed(name, func, args);
             }
             // generators/async capture their scope and outlive this call, so they
             // build a plain frame; ordinary calls borrow one from the pool.
@@ -926,6 +1009,22 @@ impl Interp {
                     Some(_) => return Err(format!("hot_swap: `{}` is not #[hot_swap]", tgt)),
                     None => return Err(format!("hot_swap: no function `{}`", tgt)),
                 }
+            }
+            // introspection: the attribute names on a function (every attribute is
+            // captured, so even not-yet-behavioural ones are visible and usable).
+            "attrs_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("attrs_of expects a function name".into()) };
+                let f = self.funcs.get(&tgt)
+                    .ok_or_else(|| format!("attrs_of: no function `{}`", tgt))?;
+                let names: Vec<Value> = f.attrs.iter().map(|a| Value::Str(a.name.clone())).collect();
+                return Ok(Value::Array(Rc::new(RefCell::new(names))));
+            }
+            // `#[profile]` support: how many times a profiled function was called.
+            "profile_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("profile_of expects a function name".into()) };
+                return Ok(Value::Int(*self.profile.borrow().get(&tgt).unwrap_or(&0)));
             }
             // `#[integrity]` support: a stable content hash of a function's body,
             // so a program can verify its own code hasn't been altered.
@@ -3991,6 +4090,34 @@ mod attr_tests {
         assert!(errors.iter().any(|e| e.contains("bad") && e.contains("zero_alloc")),
             "must flag the allocating function: {:?}", errors);
         assert!(!errors.iter().any(|e| e.contains("`ok`")), "pure fn must pass: {:?}", errors);
+    }
+
+    #[test]
+    fn memo_caches_and_contracts_enforce() {
+        let src = "#[memo] fn sq(n){ n*n }\n\
+                   #[requires(x > 0)] #[ensures(result > x)] fn inc(x){ x+1 }\nfn main(){0}";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        // memo returns the same value; contract passes for valid input
+        assert_eq!(format!("{:?}", interp.call("sq", vec![Value::Int(5)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(25))));
+        assert_eq!(format!("{:?}", interp.call("sq", vec![Value::Int(5)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(25))));
+        assert!(interp.call("inc", vec![Value::Int(3)]).is_ok());
+        // requires(x > 0) violated -> error (throw sentinel)
+        assert!(interp.call("inc", vec![Value::Int(0)]).is_err());
+    }
+
+    #[test]
+    fn profile_counts_and_attrs_of_lists() {
+        let src = "#[profile] fn p(n){ n }\n#[memo] #[trace] fn q(n){ n }\nfn main(){0}";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        for _ in 0..4 { let _ = interp.call("p", vec![Value::Int(1)]); }
+        assert_eq!(format!("{:?}", interp.call("profile_of", vec![Value::Str("p".into())])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(4))));
+        let a = interp.call("attrs_of", vec![Value::Str("q".into())]).unwrap();
+        if let Value::Array(arr) = a { assert_eq!(arr.borrow().len(), 2); } else { panic!("expected array"); }
     }
 
     #[test]
