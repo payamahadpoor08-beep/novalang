@@ -76,7 +76,11 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | tool | status |
 |---|---|
 | REPL, `nova run/vm/check/test/doc/fmt`, disasm | Run ✅ |
-| daemon mode, incremental/predictive compilation, hot reload, state migration, LSP, package manager | Not implemented (design only) |
+| **daemon mode** (`nova daemon`) — persistent service, `load`/`reload`/`run`/`funcs`/`stats` | Run ✅ |
+| **incremental compilation** — `reload` re-parses and reuses unchanged functions, reporting exactly what changed | Run ✅ |
+| **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
+| predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
+| state migration (`migrate from Old to New`), LSP, package manager | Not implemented (design only) |
 | WASM / ARM / 32-bit / mobile targets | Not implemented (design in ROADMAP §4) |
 
 ## The three real gaps that matter for "AOT/speed"

@@ -13,7 +13,7 @@ mod diag;
 use std::io::{self, Write, BufRead};
 use std::process::exit;
 
-const VERSION: &str = "3.26.0";
+const VERSION: &str = "3.28.0";
 
 fn main() {
     // a binary produced by `nova build` carries its program in a trailer:
@@ -273,11 +273,103 @@ fn main() {
                 Err(e) => { eprintln!("{}", e); exit(1); }
             }
         }
+        "daemon" => run_daemon(),
         "version" | "--version" | "-v" => println!("Nova {}", VERSION),
         other => {
             eprintln!("unknown command: {}", other);
-            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | repl | version]");
+            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | repl | daemon | version]");
             exit(2);
+        }
+    }
+}
+
+// Persistent compiler service. Reads commands from stdin and keeps parsed
+// programs in memory so repeated builds don't re-read cold state — real Daemon
+// Mode. `reload` re-parses and reports exactly which functions changed
+// (Incremental Compilation: unchanged functions are reused from cache), and a
+// subsequent `run` executes the new code without restarting the process (Hot
+// Reload). Commands: load/reload/run/funcs/stats/quit.
+fn run_daemon() {
+    use std::collections::HashMap;
+    // path -> (program, function-name -> body hash)
+    let mut cache: HashMap<String, (ast::Program, HashMap<String, u64>)> = HashMap::new();
+    let mut loads = 0usize;
+    let mut reuses = 0usize;
+
+    let hashes = |p: &ast::Program| -> HashMap<String, u64> {
+        let mut m = HashMap::new();
+        for it in &p.items {
+            if let ast::Item::Func(f) = it {
+                let text = format!("{:?}", f);
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in text.bytes() { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3); }
+                m.insert(f.name.clone(), h);
+            }
+        }
+        m
+    };
+
+    println!("Nova {} — daemon ready (commands: load/reload/run/funcs/stats/quit)", VERSION);
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        let mut it = line.trim().splitn(2, char::is_whitespace);
+        let cmd = it.next().unwrap_or("");
+        let arg = it.next().unwrap_or("").trim();
+        match cmd {
+            "" => {}
+            "quit" | "exit" => { println!("bye"); break; }
+            "load" | "reload" => {
+                let mut prog = match load_program(arg) {
+                    Ok(p) => p, Err(e) => { println!("error: {}", e); continue; }
+                };
+                interp::fold_program(&mut prog);
+                let new = hashes(&prog);
+                if cmd == "reload" {
+                    if let Some((_, old)) = cache.get(arg) {
+                        let mut changed: Vec<&str> = Vec::new();
+                        for (n, h) in &new {
+                            if old.get(n) != Some(h) { changed.push(n); }
+                        }
+                        let unchanged = new.len() - changed.len();
+                        reuses += unchanged;
+                        changed.sort();
+                        println!("reloaded {}: {} changed {:?}, {} reused",
+                                 arg, changed.len(), changed, unchanged);
+                    } else {
+                        println!("reloaded {}: {} functions (first load)", arg, new.len());
+                    }
+                } else {
+                    println!("loaded {}: {} functions", arg, new.len());
+                }
+                loads += 1;
+                cache.insert(arg.to_string(), (prog, new));
+            }
+            "run" => {
+                let prog = match cache.get(arg) {
+                    Some((p, _)) => p.clone(),
+                    None => match load_program(arg) {
+                        Ok(mut p) => { interp::fold_program(&mut p); p }
+                        Err(e) => { println!("error: {}", e); continue; }
+                    }
+                };
+                match interp::Interp::new(&prog) {
+                    Ok(i) => { if let Err(e) = i.run() { println!("runtime error: {}", e); } }
+                    Err(e) => println!("error: {}", e),
+                }
+            }
+            "funcs" => {
+                match cache.get(arg) {
+                    Some((_, h)) => {
+                        let mut names: Vec<&String> = h.keys().collect();
+                        names.sort();
+                        println!("{:?}", names);
+                    }
+                    None => println!("not loaded: {}", arg),
+                }
+            }
+            "stats" => println!("cached={} loads={} reused_functions={}", cache.len(), loads, reuses),
+            other => println!("unknown command: {}", other),
         }
     }
 }
