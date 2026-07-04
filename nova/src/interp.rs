@@ -2801,6 +2801,22 @@ pub(crate) fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, String>
             _ => {}
         }
     }
+    // Fast path for Float-op-Float — the common case in numeric/float code and
+    // in the bytecode VM's float loops. Matches the general `is_num` arms.
+    if let (Float(a), Float(b)) = (&l, &r) {
+        let (a, b) = (*a, *b);
+        match op {
+            BinOp::Add => return Ok(Float(a + b)),
+            BinOp::Sub => return Ok(Float(a - b)),
+            BinOp::Mul => return Ok(Float(a * b)),
+            BinOp::Div => return Ok(Float(a / b)),
+            BinOp::Lt => return Ok(Bool(a < b)),
+            BinOp::Le => return Ok(Bool(a <= b)),
+            BinOp::Gt => return Ok(Bool(a > b)),
+            BinOp::Ge => return Ok(Bool(a >= b)),
+            _ => {}
+        }
+    }
     // BigInt path: if either side is a BigInt (or an Int that must promote),
     // do exact integer math. Floats still win when present (handled below).
     if matches!((&l, &r), (BigInt(_), _) | (_, BigInt(_)))

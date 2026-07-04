@@ -73,6 +73,8 @@ enum Op {
     // --- fused superinstructions (peephole; semantics = the unfused sequence) ---
     IncLocal(u16, u32, BinOp),           // locals[s] = locals[s] <op> consts[k]
     LocalsBinJf(u16, u16, BinOp, usize), // if !(locals[a] <op> locals[b]) jump
+    BinLL(u16, u16, BinOp),              // push(locals[a] <op> locals[b])
+    BinLC(u16, u32, BinOp),              // push(locals[a] <op> consts[k])
 }
 
 // Everything `Op::Try` needs at runtime. The body/catch/finally code ranges live
@@ -1252,6 +1254,29 @@ fn fuse(code: Vec<Op>) -> Vec<Op> {
                 continue;
             }
         }
+        // 3-op operand fusions (tried after the 4-op patterns above, so those win
+        // when they apply). These evaluate a binary op straight from locals/consts
+        // with no intermediate stack traffic — the bulk of arithmetic in loops.
+        if i + 2 < n && !targets.contains(&(i + 1)) && !targets.contains(&(i + 2)) {
+            if let (Op::LoadLocal(a), Op::LoadLocal(b), Op::Bin(op)) =
+                (&out[i], &out[i + 1], &out[i + 2])
+            {
+                out[i] = Op::BinLL(*a, *b, *op);
+                out[i + 1] = Op::Nop;
+                out[i + 2] = Op::Nop;
+                i += 3;
+                continue;
+            }
+            if let (Op::LoadLocal(a), Op::Const(k), Op::Bin(op)) =
+                (&out[i], &out[i + 1], &out[i + 2])
+            {
+                out[i] = Op::BinLC(*a, *k, *op);
+                out[i + 1] = Op::Nop;
+                out[i + 2] = Op::Nop;
+                i += 3;
+                continue;
+            }
+        }
         i += 1;
     }
     compact(out)
@@ -1387,9 +1412,10 @@ pub fn verify(c: &Compiled) -> Result<(), String> {
                 if t > len { return Err(format!("`{}`@{}: jump target {} out of range {}", ch.name, i, t, len)); }
             }
             let slot = match op {
-                Op::LoadLocal(s) | Op::StoreLocal(s) | Op::IncLocal(s, _, _) => Some(*s as usize),
+                Op::LoadLocal(s) | Op::StoreLocal(s) | Op::IncLocal(s, _, _)
+                | Op::BinLC(s, _, _) => Some(*s as usize),
                 Op::IterStep(it, idx, var, _) => Some((*it).max(*idx).max(*var) as usize),
-                Op::LocalsBinJf(a, b, _, _) => Some((*a).max(*b) as usize),
+                Op::LocalsBinJf(a, b, _, _) | Op::BinLL(a, b, _) => Some((*a).max(*b) as usize),
                 _ => None,
             };
             if let Some(s) = slot {
@@ -1799,6 +1825,14 @@ impl<'a> Vm<'a> {
                 Op::LocalsBinJf(a, b, op, t) => {
                     let v = eval_binop(*op, locals[*a as usize].clone(), locals[*b as usize].clone())?;
                     if !v.is_truthy() { ip = *t; continue; }
+                }
+                Op::BinLL(a, b, op) => {
+                    let v = eval_binop(*op, locals[*a as usize].clone(), locals[*b as usize].clone())?;
+                    stack.push(v);
+                }
+                Op::BinLC(a, k, op) => {
+                    let v = eval_binop(*op, locals[*a as usize].clone(), chunk.consts[*k as usize].clone())?;
+                    stack.push(v);
                 }
                 Op::Try(mi) => {
                     // A statement-level transcription of the interpreter's
