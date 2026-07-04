@@ -147,6 +147,27 @@ pub struct Func {
     // true when declared `async fn`: calling it yields a Future instead of
     // running the body eagerly. Defaults to false for every existing path.
     pub is_async: bool,
+    // `#[...]` attributes attached to this function (empty for most). These carry
+    // real semantics — zero_alloc (a static allocation ban), self_healing (retry
+    // on error), hot_swap (runtime body replacement), integrity (tamper hash), …
+    pub attrs: Vec<Attr>,
+}
+
+// A parsed `#[name(k: v, ...)]` attribute. `args` holds the `(key, value)` pairs
+// (positional args use the value with an empty key), values kept as raw strings.
+#[derive(Debug, Clone)]
+pub struct Attr {
+    pub name: String,
+    pub args: Vec<(String, String)>,
+}
+
+impl Attr {
+    // integer-valued argument by key (or the first positional), if present
+    pub fn int_arg(&self, key: &str) -> Option<i64> {
+        self.args.iter()
+            .find(|(k, _)| k == key || k.is_empty())
+            .and_then(|(_, v)| v.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone)]

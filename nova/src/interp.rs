@@ -430,6 +430,10 @@ pub struct Interp {
     // free-list of argument vectors, so evaluating a call's arguments doesn't
     // heap-allocate a fresh Vec on every single call
     arg_pool: RefCell<Vec<Vec<Value>>>,
+    // runtime-replaced function bodies for `#[hot_swap]` functions: name -> closure
+    // installed via the `hot_swap(name, closure)` builtin; consulted before the
+    // original body runs.
+    swapped: RefCell<HashMap<String, Value>>,
 }
 
 impl Interp {
@@ -559,6 +563,7 @@ impl Interp {
             next_task_id: std::cell::Cell::new(1),
             scope_pool: RefCell::new(Vec::new()),
             arg_pool: RefCell::new(Vec::new()),
+            swapped: RefCell::new(HashMap::new()),
         })
     }
 
@@ -823,7 +828,28 @@ impl Interp {
         }))))
     }
 
-    pub(crate) fn call(&self, name: &str, mut args: Vec<Value>) -> Result<Value, String> {
+    // Run a non-generator, non-async user function body over a pooled scope frame,
+    // converting the resulting Flow to a value exactly as the call boundary does.
+    fn run_user_body(&self, func: &Func, mut args: Vec<Value>) -> Result<Value, String> {
+        let backing = self.scope_pool.borrow_mut().pop().unwrap_or_default();
+        let mut scope = Scope::from_backing(backing);
+        for (p, v) in func.params.iter().zip(args.drain(..)) { scope.insert(p.clone(), v); }
+        self.give_args(args);
+        let result = self.exec_block(&func.body, &mut scope);
+        let mut backing = scope.into_backing();
+        backing.clear();
+        self.scope_pool.borrow_mut().push(backing);
+        match result? {
+            Flow::Return(v) | Flow::Break(v) => Ok(v),
+            Flow::Continue | Flow::Normal => Ok(Value::Null),
+            Flow::Throw(e) => {
+                *self.pending_throw.borrow_mut() = Some(e);
+                Err(THROW_SENTINEL.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
         // A user-defined function shadows any same-named builtin or stdlib
         // function (so projects can define their own map/reduce/contains/...).
         // The VM behaves identically: compiled user chunks resolve first there.
@@ -837,6 +863,26 @@ impl Interp {
                     "function `{}` expects {} args, got {}",
                     name, func.params.len(), args.len()
                 ));
+            }
+            // Attribute-bearing functions take a slower, explicit path (rare — the
+            // common case skips this in one branch). `#[hot_swap]` runs a body
+            // installed at runtime; `#[self_healing(attempts: N)]` retries the call
+            // on a runtime error before giving up.
+            if !func.attrs.is_empty() {
+                if func.attrs.iter().any(|a| a.name == "hot_swap") {
+                    if let Some(swap) = self.swapped.borrow().get(name).cloned() {
+                        return self.call_closure(&swap, args);
+                    }
+                }
+                if let Some(att) = func.attrs.iter().find(|a| a.name == "self_healing") {
+                    let attempts = att.int_arg("attempts").unwrap_or(1).max(1);
+                    let mut last: Result<Value, String> = Ok(Value::Null);
+                    for _ in 0..attempts {
+                        last = self.run_user_body(func, args.clone());
+                        if last.is_ok() { return last; }
+                    }
+                    return last;
+                }
             }
             // generators/async capture their scope and outlive this call, so they
             // build a plain frame; ordinary calls borrow one from the pool.
@@ -854,23 +900,7 @@ impl Interp {
                     body: func.body.clone(), scope, state: FutureState::Pending,
                 }))));
             }
-            let backing = self.scope_pool.borrow_mut().pop().unwrap_or_default();
-            let mut scope = Scope::from_backing(backing);
-            for (p, v) in func.params.iter().zip(args.drain(..)) { scope.insert(p.clone(), v); }
-            self.give_args(args); // recycle the argument buffer
-            let result = self.exec_block(&func.body, &mut scope);
-            // recycle the frame (a closure created inside cloned it, so this is safe)
-            let mut backing = scope.into_backing();
-            backing.clear();
-            self.scope_pool.borrow_mut().push(backing);
-            return match result? {
-                Flow::Return(v) | Flow::Break(v) => Ok(v),
-                Flow::Continue | Flow::Normal => Ok(Value::Null),
-                Flow::Throw(e) => {
-                    *self.pending_throw.borrow_mut() = Some(e);
-                    Err(THROW_SENTINEL.to_string())
-                }
-            };
+            return self.run_user_body(func, args);
         }
         {
         // built-in functions
@@ -878,6 +908,33 @@ impl Interp {
             "type_of" => {
                 let v = args.get(0).ok_or("type_of expects 1 argument")?;
                 return Ok(Value::Str(v.type_name().to_string()));
+            }
+            // `#[hot_swap]` support: install a runtime replacement body for a
+            // function declared hot-swappable. Errors if the target isn't marked.
+            "hot_swap" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("hot_swap expects (name: string, closure)".into()) };
+                let clo = args.get(1).cloned().ok_or("hot_swap expects (name, closure)")?;
+                if !matches!(clo, Value::Closure(_)) {
+                    return Err("hot_swap: second argument must be a closure".into());
+                }
+                match self.funcs.get(&tgt) {
+                    Some(f) if f.attrs.iter().any(|a| a.name == "hot_swap") => {
+                        self.swapped.borrow_mut().insert(tgt, clo);
+                        return Ok(Value::Null);
+                    }
+                    Some(_) => return Err(format!("hot_swap: `{}` is not #[hot_swap]", tgt)),
+                    None => return Err(format!("hot_swap: no function `{}`", tgt)),
+                }
+            }
+            // `#[integrity]` support: a stable content hash of a function's body,
+            // so a program can verify its own code hasn't been altered.
+            "integrity_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("integrity_of expects a function name".into()) };
+                let f = self.funcs.get(&tgt)
+                    .ok_or_else(|| format!("integrity_of: no function `{}`", tgt))?;
+                return Ok(Value::Int(body_hash(f)));
             }
             // ---- system interface (Phase 9): argv, env, files, stdio ----
             "args" => {
@@ -2781,6 +2838,16 @@ pub(crate) fn eval_unop(op: UnOp, v: Value) -> Result<Value, String> {
     }
 }
 
+// A stable FNV-1a content hash of a function's body (for `#[integrity]`). Based on
+// the Debug rendering of the AST, so it changes iff the code changes; masked to a
+// non-negative i64 so it prints cleanly.
+fn body_hash(f: &Func) -> i64 {
+    let text = format!("{:?}{:?}", f.params, f.body);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3); }
+    (h >> 1) as i64
+}
+
 pub(crate) fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, String> {
     use Value::*;
     // Fast path for Int-op-Int — the dominant case in loops and arithmetic. This
@@ -3869,6 +3936,80 @@ fn fold_unary(op: UnOp, v: &Value) -> Option<Value> {
         (UnOp::Not, Value::Bool(b)) => Some(Value::Bool(!b)),
         (UnOp::BitNot, Value::Int(n)) => Some(Value::Int(!n)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod attr_tests {
+    use super::*;
+    use crate::parser::parse_program;
+
+    #[test]
+    fn self_healing_retries_until_success() {
+        // shared array state persists across retries (Rc-backed), so this
+        // succeeds on the third attempt with attempts: 5
+        let src = "#[self_healing(attempts: 5)]\n\
+                   fn f(s){ s[0]=s[0]+1; if s[0]<3 { throw \"x\" } s[0] }\n\
+                   fn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Int(0)])));
+        let r = interp.call("f", vec![arr]);
+        assert_eq!(format!("{:?}", r), format!("{:?}", Ok::<_, String>(Value::Int(3))));
+    }
+
+    #[test]
+    fn self_healing_exhausts_then_errors() {
+        let src = "#[self_healing(attempts: 3)]\n\
+                   fn f(c){ c[0]=c[0]+1; throw \"nope\" }\nfn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Int(0)])));
+        let r = interp.call("f", vec![arr.clone()]);
+        assert!(r.is_err(), "exhausted retries must error");
+        if let Value::Array(a) = &arr { assert_eq!(a.borrow()[0], Value::Int(3), "must try exactly 3 times"); }
+    }
+
+    #[test]
+    fn integrity_hash_is_stable_and_distinct() {
+        let src = "#[integrity] fn a(){ 1 + 2 }\n#[integrity] fn b(){ 1 + 3 }\nfn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        let h1 = interp.call("integrity_of", vec![Value::Str("a".into())]).unwrap();
+        let h2 = interp.call("integrity_of", vec![Value::Str("a".into())]).unwrap();
+        let h3 = interp.call("integrity_of", vec![Value::Str("b".into())]).unwrap();
+        assert_eq!(format!("{:?}", h1), format!("{:?}", h2), "same fn -> same hash");
+        assert_ne!(format!("{:?}", h1), format!("{:?}", h3), "different fn -> different hash");
+    }
+
+    #[test]
+    fn zero_alloc_flags_allocation_and_passes_pure() {
+        let src = "#[zero_alloc] fn ok(a,b){ a*b + a }\n\
+                   #[zero_alloc] fn bad(n){ xs = [n]; xs }\nfn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let (errors, _) = crate::types::Checker::new(&prog).check(&prog);
+        assert!(errors.iter().any(|e| e.contains("bad") && e.contains("zero_alloc")),
+            "must flag the allocating function: {:?}", errors);
+        assert!(!errors.iter().any(|e| e.contains("`ok`")), "pure fn must pass: {:?}", errors);
+    }
+
+    #[test]
+    fn hot_swap_replaces_body() {
+        let src = "#[hot_swap(scope: function)] fn g(x){ x + 1 }\nfn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        assert_eq!(format!("{:?}", interp.call("g", vec![Value::Int(10)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(11))));
+        // install a replacement: x => x * 100
+        let clo = Value::Closure(Rc::new(ClosureVal {
+            params: vec!["x".into()],
+            body: LambdaBody::Expr(Expr::Binary {
+                op: BinOp::Mul, lhs: Box::new(Expr::Ident("x".into())), rhs: Box::new(Expr::Int(100)) }),
+            captured: Scope::new(), vm_chunk: None,
+        }));
+        interp.call("hot_swap", vec![Value::Str("g".into()), clo]).unwrap();
+        assert_eq!(format!("{:?}", interp.call("g", vec![Value::Int(10)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(1000))));
     }
 }
 

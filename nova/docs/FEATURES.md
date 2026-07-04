@@ -41,6 +41,16 @@ marketing table. Legend:
 | AOT native (C + LLVM), **pure-int/float** kernels | Run — fib native 7ms ≈ C |
 | AOT native for **mixed/array** kernels | **Parse→embed** — see gap #1 below |
 
+## Attributes — now real (v3.28, Phase 1) ✅
+Attributes are no longer discarded; these carry tested semantics on every tier
+(see `docs/ATTRIBUTES.md`, `tests/corpus/attributes.nova`):
+| attribute | status |
+|---|---|
+| `#[zero_alloc]` | Check — `nova check` errors if the function allocates |
+| `#[self_healing(attempts: N)]` | Run — retries the call on runtime error |
+| `#[hot_swap]` + `hot_swap(name, closure)` | Run — runtime body replacement |
+| `#[integrity]` + `integrity_of(name)` | Run — stable tamper-detection hash |
+
 ## Parse-only ⚠️ (accepted syntax, NOT yet executed/enforced)
 These build AST nodes but currently do nothing at runtime — the honest truth:
 | feature | status |
@@ -51,7 +61,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | `comptime` | Parse only (no compile-time evaluation) |
 | effect polymorphism `![E]` | Parse only (monomorphic effects only) |
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
-| **all security/meta attributes** — `#[simd]`, `#[encrypt]`, `#[obfuscate]`, `#[self_healing]`, `#[time_travel]`, `#[hot_swap]`, `#[zero_alloc]`, `#[anti_debug]`, `#[anti_tamper]`, `#[integrity]`, `#[polymorph]` | **Parse only — pure no-ops.** They are accepted and ignored. None is implemented. |
+| remaining meta attributes — `#[simd]`, `#[encrypt]`, `#[obfuscate]`, `#[time_travel]`, `#[anti_debug]`, `#[anti_tamper]`, `#[polymorph]` | **Parse only — no-ops.** Being implemented in ROADMAP Phase 2. |
 
 ## Absent ❌ (not in grammar, despite the table)
 `union` types are not in the grammar and not implemented.

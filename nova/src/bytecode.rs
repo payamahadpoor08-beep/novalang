@@ -158,9 +158,13 @@ pub fn compile_program_opt(prog: &Program, optimize_flag: bool) -> Result<Compil
             _ => None,
         })
         .collect();
-    // functions whose statements are all VM-native; the rest run on the interpreter
+    // functions whose statements are all VM-native; the rest run on the interpreter.
+    // Functions carrying behavioural attributes (`#[self_healing]`, `#[hot_swap]`, …)
+    // are kept interp-only so their attribute semantics — applied at the
+    // interpreter's `call` boundary — take effect on every tier (the VM reaches
+    // them through `CallDyn` -> `call_named` -> `call`).
     let mut compiled_names: Vec<String> = funcs.values()
-        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined))
+        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined) && f.attrs.is_empty())
         .map(|f| f.name.clone())
         .collect();
     compiled_names.sort();

@@ -1,0 +1,43 @@
+// Function attributes with real, tested semantics. Every tier (run/vm/jit)
+// must print byte-identically: attributed functions run through the interpreter
+// path on all tiers, so their behaviour is uniform.
+
+// #[self_healing]: the call retries on a runtime error. State shared through an
+// array (Rc-backed) persists across retries, so this deterministically succeeds
+// on the third attempt.
+#[self_healing(attempts: 5)]
+fn connect(state) {
+  state[0] = state[0] + 1
+  if state[0] < 3 { throw "transient failure" }
+  state[0]
+}
+
+// retries exhausted -> the error propagates, catchable like any other.
+#[self_healing(attempts: 3)]
+fn always_fails(c) { c[0] = c[0] + 1; throw "permanent" }
+
+// #[hot_swap]: the body can be replaced at runtime.
+#[hot_swap(scope: function)]
+fn formatter(x) { "v1:" + str(x) }
+
+// #[integrity]: a stable content hash of the function, for tamper detection.
+#[integrity]
+fn important() { 1 + 2 + 3 }
+
+fn main() {
+  s = [0]
+  print(connect(s))                 // 3 (succeeded on retry)
+
+  fails = [0]
+  try { always_fails(fails) } catch e {
+    print("gave up after " + str(fails[0]) + " attempts: " + e)
+  }
+
+  print(formatter(7))               // v1:7
+  hot_swap("formatter", (x) => "v2:" + str(x * 10))
+  print(formatter(7))               // v2:70
+
+  h1 = integrity_of("important")
+  print(h1 == integrity_of("important"))   // true — stable
+  print(h1 != integrity_of("connect"))     // true — distinct per function
+}
