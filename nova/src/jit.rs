@@ -734,8 +734,23 @@ fn calls_expr(e: &Expr, out: &mut Vec<String>) {
 // JIT module
 // ---------------------------------------------------------------------------
 
+impl Drop for Jit {
+    fn drop(&mut self) {
+        // Release the executable arena. Safe: `Drop` runs only once execution is
+        // finished, so no JIT'd function pointer (in `code`/`fcode`/`ncode`) is
+        // ever called after this frees their memory.
+        if let Some(m) = self._module.take() {
+            unsafe { m.free_memory(); }
+        }
+    }
+}
+
 pub struct Jit {
-    _module: JITModule,
+    // Kept alive so the JIT'd code pages stay mapped. `Option` so `Drop` can take
+    // it and call `free_memory` (which consumes the module) — cranelift's own
+    // `Drop` does NOT release the executable arena, so without this every process
+    // that warms the JIT leaks its code memory until exit (valgrind-dirty).
+    _module: Option<JITModule>,
     // name -> (entry pointer, arity); i64 track
     code: HashMap<String, (*const u8, usize)>,
     // name -> (entry pointer, arity); f64 track (disjoint names)
@@ -925,7 +940,7 @@ impl Jit {
         for (name, (id, arity)) in &nids {
             ncode.insert(name.clone(), (module.get_finalized_function(*id), *arity));
         }
-        Some(Jit { _module: module, code, fcode, ncode, nret, ir })
+        Some(Jit { _module: Some(module), code, fcode, ncode, nret, ir })
     }
 
     pub fn is_compiled(&self, name: &str) -> bool { self.code.contains_key(name) }
