@@ -10,7 +10,78 @@ use num_traits::{ToPrimitive, Zero, Signed};
 
 use crate::ast::*;
 
-pub type Scope = HashMap<String, Value>;
+// A fast, deterministic hasher (FNV-1a) for the interpreter's name→definition
+// tables. `funcs`/`generators` are looked up on every single call, where the
+// standard library's SipHash — built for DoS resistance, not speed — dominates
+// the per-call cost. FNV is a few instructions per byte for these short keys.
+#[derive(Default)]
+pub struct FnvHasher(u64);
+impl std::hash::Hasher for FnvHasher {
+    #[inline] fn finish(&self) -> u64 { self.0 }
+    #[inline] fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for &b in bytes { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3); }
+        self.0 = h;
+    }
+}
+type FnvBuild = std::hash::BuildHasherDefault<FnvHasher>;
+type FastMap<K, V> = HashMap<K, V, FnvBuild>;
+type FastSet<K> = std::collections::HashSet<K, FnvBuild>;
+
+// A lexical scope: an insertion-ordered association list with last-wins
+// semantics (identical to the old `HashMap<String, Value>` for every operation
+// the interpreter performs, since names are unique per scope). The win is in
+// the hot paths: cloning a scope (done per call/block/match-arm/closure) is now
+// a `Vec` copy with cheap `Rc<str>` key bumps instead of rehashing and
+// re-allocating every key string, and small scopes resolve variables by a short
+// linear scan instead of hashing. Insert overwrites an existing binding in
+// place, so a loop that rebinds its variable each iteration never grows.
+#[derive(Clone, Default, Debug)]
+pub struct Scope {
+    entries: Vec<(Rc<str>, Value)>,
+}
+
+impl Scope {
+    #[inline]
+    pub fn new() -> Self { Scope { entries: Vec::new() } }
+    #[inline]
+    pub fn with_capacity(n: usize) -> Self { Scope { entries: Vec::with_capacity(n) } }
+
+    #[inline]
+    pub fn insert(&mut self, key: impl Into<Rc<str>>, value: Value) {
+        let key = key.into();
+        // reverse scan: a just-inserted binding (e.g. a loop variable) is found
+        // immediately, and shadowing rebinds hit the most recent entry first
+        for (k, v) in self.entries.iter_mut().rev() {
+            if **k == *key { *v = value; return; }
+        }
+        self.entries.push((key, value));
+    }
+
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        for (k, v) in self.entries.iter().rev() {
+            if **k == *key { return Some(v); }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool { self.get(key).is_some() }
+
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, (Rc<str>, Value)> { self.entries.iter() }
+
+    // Build a scope over a recycled backing buffer (from the interpreter's pool).
+    #[inline]
+    pub fn from_backing(mut entries: Vec<(Rc<str>, Value)>) -> Self {
+        entries.clear();
+        Scope { entries }
+    }
+    // Reclaim the backing buffer for reuse.
+    #[inline]
+    pub fn into_backing(self) -> Vec<(Rc<str>, Value)> { self.entries }
+}
 
 // Internal marker: an Err carrying this string means "a Nova `throw` is unwinding";
 // the real thrown Value lives in Interp::pending_throw. Distinguishes user throws
@@ -314,12 +385,12 @@ pub(crate) enum Flow {
 }
 
 pub struct Interp {
-    funcs: HashMap<String, Func>,
+    funcs: FastMap<String, Func>,
     structs: HashMap<String, StructDef>,
     // methods keyed by (type_name, method_name)
     methods: HashMap<(String, String), Func>,
     // variant_name -> (enum_name, arity)
-    variants: HashMap<String, (String, usize)>,
+    variants: FastMap<String, (String, usize)>,
     // module alias -> real module root (e.g. "m" -> "math")
     module_aliases: HashMap<String, String>,
     // carries a thrown value across function-call boundaries
@@ -329,7 +400,7 @@ pub struct Interp {
     // collected test blocks, in source order
     tests: Vec<crate::ast::TestBlock>,
     // state machines: name -> (initial_state, transitions[(from,to,event)])
-    machines: HashMap<String, (String, Vec<(String, String, String)>)>,
+    machines: FastMap<String, (String, Vec<(String, String, String)>)>,
     // global constants, evaluated at load time
     consts: RefCell<HashMap<String, Value>>,
     // pending const expressions to evaluate lazily on first run
@@ -337,9 +408,9 @@ pub struct Interp {
     // trait name -> (required method names, default method funcs)
     traits: HashMap<String, (Vec<String>, Vec<crate::ast::Func>)>,
     // names declared in `extern` blocks; calling one errors (no FFI yet)
-    extern_funcs: std::collections::HashSet<String>,
+    extern_funcs: FastSet<String>,
     // names of generator functions (their body contains `yield`)
-    generators: std::collections::HashSet<String>,
+    generators: FastSet<String>,
     // stack of active generator productions (supports nested generators)
     gen_ctx: RefCell<Vec<GenState>>,
     // source position (line, col) of the statement currently executing, for errors
@@ -353,21 +424,24 @@ pub struct Interp {
     task_bodies: RefCell<HashMap<u64, (Vec<Stmt>, Scope)>>,
     // monotonic id source for tasks
     next_task_id: std::cell::Cell<u64>,
+    // free-list of scope backing buffers, so ordinary (non-escaping) calls reuse
+    // an allocation instead of heap-allocating a fresh frame every time
+    scope_pool: RefCell<Vec<Vec<(Rc<str>, Value)>>>,
 }
 
 impl Interp {
     pub fn new(program: &Program) -> Result<Self, String> {
-        let mut funcs = HashMap::new();
+        let mut funcs: FastMap<String, Func> = FastMap::default();
         let mut structs = HashMap::new();
         let mut methods = HashMap::new();
-        let mut variants = HashMap::new();
+        let mut variants: FastMap<String, (String, usize)> = FastMap::default();
         let mut module_aliases = HashMap::new();
         let mut tests = Vec::new();
-        let mut machines = HashMap::new();
+        let mut machines: FastMap<String, (String, Vec<(String, String, String)>)> = FastMap::default();
         let mut const_exprs = Vec::new();
         let mut traits: HashMap<String, (Vec<String>, Vec<crate::ast::Func>)> = HashMap::new();
-        let mut extern_funcs = std::collections::HashSet::new();
-        let mut generators = std::collections::HashSet::new();
+        let mut extern_funcs: FastSet<String> = FastSet::default();
+        let mut generators: FastSet<String> = FastSet::default();
         let mut refinements: HashMap<String, Expr> = HashMap::new();
         // PASS 0: collect trait definitions first, so `impl Trait for Type` can
         // pull in default methods regardless of declaration order.
@@ -469,13 +543,14 @@ impl Interp {
             ready_queue: RefCell::new(std::collections::VecDeque::new()),
             task_bodies: RefCell::new(HashMap::new()),
             next_task_id: std::cell::Cell::new(1),
+            scope_pool: RefCell::new(Vec::new()),
         })
     }
 
     // Evaluate all global constants into the consts map (idempotent).
     pub(crate) fn init_consts(&self) -> Result<(), String> {
         if !self.consts.borrow().is_empty() || self.const_exprs.is_empty() { return Ok(()); }
-        let empty: Scope = HashMap::new();
+        let empty: Scope = Scope::new();
         for (name, expr) in &self.const_exprs {
             let v = self.eval(expr, &empty)?;
             self.consts.borrow_mut().insert(name.clone(), v);
@@ -495,7 +570,7 @@ impl Interp {
         let mut failed = 0;
         println!("running {} test(s)\n", self.tests.len());
         for t in &self.tests {
-            let mut scope: Scope = HashMap::new();
+            let mut scope: Scope = Scope::new();
             match self.exec_block(&t.body, &mut scope) {
                 Ok(_) => {
                     println!("  PASS  {}", t.name);
@@ -621,7 +696,7 @@ impl Interp {
                     self.machines.insert(m.name.clone(), (m.initial.clone(), m.transitions.clone()));
                 }
                 Item::Const { name, value } => {
-                    let empty: Scope = HashMap::new();
+                    let empty: Scope = Scope::new();
                     let v = self.eval(value, &empty)?;
                     self.consts.borrow_mut().insert(name.clone(), v);
                 }
@@ -737,7 +812,51 @@ impl Interp {
         // A user-defined function shadows any same-named builtin or stdlib
         // function (so projects can define their own map/reduce/contains/...).
         // The VM behaves identically: compiled user chunks resolve first there.
-        if !self.funcs.contains_key(name) {
+        //
+        // Hot path: resolve a user function in a SINGLE map lookup and run it
+        // directly, bypassing the ~150-arm builtin match entirely. This is the
+        // per-call cost of ordinary recursion, so it matters most.
+        if let Some(func) = self.funcs.get(name) {
+            if args.len() != func.params.len() {
+                return Err(format!(
+                    "function `{}` expects {} args, got {}",
+                    name, func.params.len(), args.len()
+                ));
+            }
+            // generators/async capture their scope and outlive this call, so they
+            // build a plain frame; ordinary calls borrow one from the pool.
+            if self.generators.contains(name) {
+                let mut scope = Scope::with_capacity(func.params.len());
+                for (p, v) in func.params.iter().zip(args.into_iter()) { scope.insert(p.clone(), v); }
+                return Ok(Value::Generator(Rc::new(GenVal {
+                    body: func.body.clone(), scope, cursor: RefCell::new(0),
+                })));
+            }
+            if func.is_async {
+                let mut scope = Scope::with_capacity(func.params.len());
+                for (p, v) in func.params.iter().zip(args.into_iter()) { scope.insert(p.clone(), v); }
+                return Ok(Value::Future(Rc::new(RefCell::new(FutureVal {
+                    body: func.body.clone(), scope, state: FutureState::Pending,
+                }))));
+            }
+            let backing = self.scope_pool.borrow_mut().pop().unwrap_or_default();
+            let mut scope = Scope::from_backing(backing);
+            for (p, v) in func.params.iter().zip(args.into_iter()) { scope.insert(p.clone(), v); }
+            let result = self.exec_block(&func.body, &mut scope);
+            // recycle the frame (a closure created inside cloned it, so this is safe)
+            let mut backing = scope.into_backing();
+            backing.clear();
+            self.scope_pool.borrow_mut().push(backing);
+            return match result? {
+                Flow::Return(v) | Flow::Break(v) => Ok(v),
+                Flow::Continue | Flow::Normal => Ok(Value::Null),
+                Flow::Throw(e) => {
+                    *self.pending_throw.borrow_mut() = Some(e);
+                    Err(THROW_SENTINEL.to_string())
+                }
+            };
+        }
+        {
         // built-in functions
         match name {
             "type_of" => {
@@ -1355,47 +1474,7 @@ impl Interp {
             ));
         }
 
-        let func = self.funcs.get(name)
-            .ok_or_else(|| format!("call to undefined function: {}", name))?;
-        if args.len() != func.params.len() {
-            return Err(format!(
-                "function `{}` expects {} args, got {}",
-                name, func.params.len(), args.len()
-            ));
-        }
-        let mut scope: Scope = HashMap::new();
-        for (p, v) in func.params.iter().zip(args.into_iter()) {
-            scope.insert(p.clone(), v);
-        }
-        // A generator function does not run now: it captures its body + bound args
-        // into a lazy Generator that produces values on demand.
-        if self.generators.contains(name) {
-            return Ok(Value::Generator(Rc::new(GenVal {
-                body: func.body.clone(),
-                scope,
-                cursor: RefCell::new(0),
-            })));
-        }
-        // An `async fn` does not run now: it captures its body + bound scope into
-        // a pending Future. The caller drives it with `.await`.
-        if func.is_async {
-            let fut = FutureVal {
-                body: func.body.clone(),
-                scope,
-                state: FutureState::Pending,
-            };
-            return Ok(Value::Future(Rc::new(RefCell::new(fut))));
-        }
-        match self.exec_block(&func.body, &mut scope)? {
-            Flow::Return(v) => Ok(v),
-            Flow::Break(v) => Ok(v),
-            Flow::Continue => Ok(Value::Null),
-            Flow::Throw(e) => {
-                *self.pending_throw.borrow_mut() = Some(e);
-                Err(THROW_SENTINEL.to_string())
-            }
-            Flow::Normal => Ok(Value::Null),
-        }
+        Err(format!("call to undefined function: {}", name))
     }
 
     // Produce the `k`-th (0-based) value of a generator by replaying its body and
@@ -1664,7 +1743,7 @@ impl Interp {
                 .ok_or_else(|| format!("type {} has no method: {}", type_name, method))?
                 .clone();
             // bind self + params
-            let mut mscope: Scope = HashMap::new();
+            let mut mscope: Scope = Scope::new();
             let mut pi = 0;
             // first param is `self` by convention if present
             if func.params.get(0).map(|p| p == "self").unwrap_or(false) {
@@ -2120,18 +2199,25 @@ impl Interp {
                 self.call_closure(&f, argvals)
             }
             Expr::Ident(name) => {
-                // a bare unit enum variant like `None` / `Nil`
-                if let Some((enum_name, arity)) = self.variants.get(name) {
-                    if *arity == 0 {
-                        return Ok(Value::Enum(Rc::new(EnumVal {
-                            enum_name: enum_name.clone(),
-                            variant: name.clone(),
-                            data: vec![],
-                        })));
+                // A bare unit enum variant (`None`/`Nil`) keeps its priority, but
+                // we only hash the variant table when the program actually has
+                // enums — so the common no-enum case resolves a local in one short
+                // scan instead of a SipHash miss on every variable read.
+                if !self.variants.is_empty() {
+                    if let Some((enum_name, arity)) = self.variants.get(name) {
+                        if *arity == 0 {
+                            return Ok(Value::Enum(Rc::new(EnumVal {
+                                enum_name: enum_name.clone(),
+                                variant: name.clone(),
+                                data: vec![],
+                            })));
+                        }
                     }
                 }
-                scope.get(name).cloned()
-                    .or_else(|| self.consts.borrow().get(name).cloned())
+                if let Some(v) = scope.get(name) {
+                    return Ok(v.clone());
+                }
+                self.consts.borrow().get(name).cloned()
                     .ok_or_else(|| format!("undefined variable: {}", name))
             }
             Expr::Unary { op, expr } => {
@@ -2155,6 +2241,25 @@ impl Interp {
                 }
                 let l = self.eval(lhs, scope)?;
                 let r = self.eval(rhs, scope)?;
+                // Fast path for the overwhelmingly common Int-op-Int case: skip
+                // the big `eval_binop` dispatch and go straight to a checked op
+                // (falling back to `eval_binop` on overflow so BigInt promotion
+                // and every other combination stays byte-identical).
+                if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+                    let (a, b) = (*a, *b);
+                    match op {
+                        BinOp::Add => if let Some(v) = a.checked_add(b) { return Ok(Value::Int(v)); },
+                        BinOp::Sub => if let Some(v) = a.checked_sub(b) { return Ok(Value::Int(v)); },
+                        BinOp::Mul => if let Some(v) = a.checked_mul(b) { return Ok(Value::Int(v)); },
+                        BinOp::Lt => return Ok(Value::Bool(a < b)),
+                        BinOp::Le => return Ok(Value::Bool(a <= b)),
+                        BinOp::Gt => return Ok(Value::Bool(a > b)),
+                        BinOp::Ge => return Ok(Value::Bool(a >= b)),
+                        BinOp::Eq => return Ok(Value::Bool(a == b)),
+                        BinOp::Ne => return Ok(Value::Bool(a != b)),
+                        _ => {}
+                    }
+                }
                 eval_binop(*op, l, r)
             }
             Expr::Call { callee, args } => {
@@ -2181,7 +2286,7 @@ impl Interp {
             Expr::Match { scrutinee, arms } => {
                 let val = self.eval(scrutinee, scope)?;
                 for arm in arms {
-                    let mut bindings: Scope = HashMap::new();
+                    let mut bindings: Scope = Scope::new();
                     if self.match_pattern(&arm.pattern, &val, &mut bindings)? {
                         // evaluate in a scope extended with the pattern bindings
                         let mut arm_scope = scope.clone();
@@ -2662,6 +2767,24 @@ pub(crate) fn eval_unop(op: UnOp, v: Value) -> Result<Value, String> {
 
 pub(crate) fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, String> {
     use Value::*;
+    // Fast path for Int-op-Int — the dominant case in loops and arithmetic. This
+    // is also reached from the bytecode VM's `Op::Bin`, so the VM benefits too.
+    // On overflow we fall through to the general arms (BigInt promotion).
+    if let (Int(a), Int(b)) = (&l, &r) {
+        let (a, b) = (*a, *b);
+        match op {
+            BinOp::Add => if let Some(v) = a.checked_add(b) { return Ok(Int(v)); },
+            BinOp::Sub => if let Some(v) = a.checked_sub(b) { return Ok(Int(v)); },
+            BinOp::Mul => if let Some(v) = a.checked_mul(b) { return Ok(Int(v)); },
+            BinOp::Lt => return Ok(Bool(a < b)),
+            BinOp::Le => return Ok(Bool(a <= b)),
+            BinOp::Gt => return Ok(Bool(a > b)),
+            BinOp::Ge => return Ok(Bool(a >= b)),
+            BinOp::Eq => return Ok(Bool(a == b)),
+            BinOp::Ne => return Ok(Bool(a != b)),
+            _ => {}
+        }
+    }
     // BigInt path: if either side is a BigInt (or an Int that must promote),
     // do exact integer math. Floats still win when present (handled below).
     if matches!((&l, &r), (BigInt(_), _) | (_, BigInt(_)))

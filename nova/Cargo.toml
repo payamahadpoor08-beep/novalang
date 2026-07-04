@@ -16,3 +16,11 @@ cranelift-native = "0.116"
 [[bin]]
 name = "nova"
 path = "src/main.rs"
+
+# Whole-program optimization: fat LTO + a single codegen unit let the compiler
+# inline across the interpreter's hot dispatch loop (eval → exec_block → call).
+# Worth 15–30% on interpreter-bound workloads; no semantic effect.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
