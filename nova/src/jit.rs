@@ -1792,7 +1792,11 @@ impl<'p> TieredJit<'p> {
         let mut roots: Vec<String> = Vec::new();
         for item in &self.prog.items {
             if let Item::Func(f) = item {
-                if self.is_eligible(&f.name) && body_has_loop(&f.body) {
+                let hinted_hot = f.attrs.iter().any(|a| a.name == "hot");
+                let hinted_cold = f.attrs.iter().any(|a| a.name == "cold");
+                // #[hot] compiles up-front unconditionally; #[cold] never warms;
+                // otherwise loop-bearing kernels warm as before.
+                if self.is_eligible(&f.name) && !hinted_cold && (hinted_hot || body_has_loop(&f.body)) {
                     roots.push(f.name.clone());
                 }
             }

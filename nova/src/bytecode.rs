@@ -159,12 +159,15 @@ pub fn compile_program_opt(prog: &Program, optimize_flag: bool) -> Result<Compil
         })
         .collect();
     // functions whose statements are all VM-native; the rest run on the interpreter.
-    // Functions carrying behavioural attributes (`#[self_healing]`, `#[hot_swap]`, …)
-    // are kept interp-only so their attribute semantics — applied at the
-    // interpreter's `call` boundary — take effect on every tier (the VM reaches
-    // them through `CallDyn` -> `call_named` -> `call`).
+    // Functions carrying BEHAVIOURAL attributes (`#[self_healing]`, `#[memo]`,
+    // contracts, `#[trace]`, …) are kept interp-only so their semantics — applied
+    // at the interpreter's `call` boundary — take effect on every tier (the VM
+    // reaches them through `CallDyn` -> `call_named` -> `call`). Pure optimisation
+    // hints / metadata (`#[hot]`, `#[cold]`, `#[version]`, …) don't change
+    // behaviour, so such functions may still be compiled.
     let mut compiled_names: Vec<String> = funcs.values()
-        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined) && f.attrs.is_empty())
+        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined)
+            && !f.attrs.iter().any(|a| is_behavioural_attr(&a.name)))
         .map(|f| f.name.clone())
         .collect();
     compiled_names.sort();
@@ -235,6 +238,17 @@ struct Ctx<'i> {
 // function interp-only now: generators replay their body through the tree-walker.
 fn func_compilable(f: &Func) -> bool {
     f.body.iter().all(stmt_compilable)
+}
+
+// Attributes that change a function's runtime behaviour (so the function must run
+// through the interpreter on every tier). Pure hints/metadata are not listed and
+// don't block VM/JIT compilation.
+pub(crate) fn is_behavioural_attr(name: &str) -> bool {
+    matches!(name,
+        "self_healing" | "retry" | "hot_swap" | "memo" | "memoize"
+        | "requires" | "ensures" | "assumes" | "trace" | "log" | "audit"
+        | "profile" | "deprecate" | "deprecated" | "time_travel"
+        | "anti_debug" | "anti_tamper" | "integrity")
 }
 
 // Does any (nested) `let` in this body carry a refinement-type annotation?

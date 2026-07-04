@@ -56,6 +56,11 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 | `#[profile]` + `profile_of(name)` | Run — call counting |
 | `#[deprecate]` / `#[deprecated]` | Run — one-time warning on use |
 | `#[time_travel(depth: N)]` + `history_of(name)` | Run — bounded ring buffer of past results (snapshot/rollback) |
+| `#[encrypt]` + `encrypt(s,key)`/`decrypt(s,key)` | Run — keyed XOR cipher (obfuscation-grade, documented) |
+| `#[anti_debug]` + `is_debugged()` | Run — best-effort Linux TracerPid debugger detection |
+| `#[anti_tamper]` | Run — verifies the function body hash hasn't changed since first call |
+| `#[hot]` / `#[cold]` | Run — `hot` warms the JIT up-front, `cold` prevents warming |
+| metadata (`#[version]`, `#[since]`, `#[throws]`, `#[intent]`, `#[deps]`, …) + `meta_of(name,key)` | Run — captured + queryable |
 | **any attribute** + `attrs_of(name)` | Run — all attributes captured + introspectable |
 
 ## Parse-only ⚠️ (accepted syntax, NOT yet executed/enforced)

@@ -42,6 +42,7 @@ fn main() {
   print(h1 != integrity_of("connect"))
   phase2()
   phase3()
+  phase4()
 }
 
 // --- Phase 2 attributes ---
@@ -73,4 +74,18 @@ fn track(n) { n + 100 }
 fn phase3() {
   track(1); track(2); track(3); track(4)
   print(history_of("track"))   // [102, 103, 104]
+}
+
+// --- Phase 4: advanced attributes ---
+#[version(v: "1.0")]
+#[anti_tamper]
+fn stable() { 7 * 6 }
+fn phase4() {
+  c = encrypt("classified", "pass")
+  print(c != "classified")
+  print(decrypt(c, "pass"))
+  print(meta_of("stable", "version"))
+  print(is_debugged())
+  print(stable())
+  print(stable())
 }

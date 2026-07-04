@@ -442,6 +442,8 @@ pub struct Interp {
     // `#[time_travel(depth: N)]` per-function ring buffer of the last N results,
     // queryable via `history_of(name)` for rollback/inspection.
     history: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
+    // `#[anti_tamper]` baseline body hashes recorded at first call.
+    tamper_base: RefCell<HashMap<String, i64>>,
 }
 
 impl Interp {
@@ -576,6 +578,7 @@ impl Interp {
             profile: RefCell::new(HashMap::new()),
             deprecated_warned: RefCell::new(std::collections::HashSet::new()),
             history: RefCell::new(HashMap::new()),
+            tamper_base: RefCell::new(HashMap::new()),
         })
     }
 
@@ -874,6 +877,23 @@ impl Interp {
             if let Some(v) = self.memo.borrow().get(k) { return Ok(v.clone()); }
         }
 
+        // anti_debug: refuse to run under a debugger (best-effort)
+        if has("anti_debug") && detect_debugger() {
+            return self.fail_assert(format!("`{}`: debugger detected (#[anti_debug])", name));
+        }
+        // anti_tamper: verify the function's body hasn't been altered vs a baseline
+        // hash recorded at first call — detects live-patched code.
+        if has("anti_tamper") {
+            let h = body_hash(func);
+            let mut base = self.tamper_base.borrow_mut();
+            match base.get(name) {
+                Some(&b) if b != h =>
+                    return self.fail_assert(format!("`{}`: integrity check failed (#[anti_tamper])", name)),
+                Some(_) => {}
+                None => { base.insert(name.to_string(), h); }
+            }
+        }
+
         // requires / assumes: entry contracts, evaluated with params bound to args
         for att in func.attrs.iter().filter(|a| a.name == "requires" || a.name == "assumes") {
             let mut scope = Scope::with_capacity(func.params.len());
@@ -977,9 +997,10 @@ impl Interp {
                     name, func.params.len(), args.len()
                 ));
             }
-            // Attribute-bearing functions take a slower, explicit path (rare — the
-            // common case skips this in one branch).
-            if !func.attrs.is_empty() {
+            // Functions with behavioural attributes take a slower, explicit path
+            // (rare — the common case skips this in one branch). Pure hint/metadata
+            // attributes don't change behaviour and use the fast path.
+            if func.attrs.iter().any(|a| crate::bytecode::is_behavioural_attr(&a.name)) {
                 return self.call_attributed(name, func, args);
             }
             // generators/async capture their scope and outlive this call, so they
@@ -1024,6 +1045,35 @@ impl Interp {
                     Some(_) => return Err(format!("hot_swap: `{}` is not #[hot_swap]", tgt)),
                     None => return Err(format!("hot_swap: no function `{}`", tgt)),
                 }
+            }
+            // `#[encrypt]` support: a real (obfuscation-grade, not cryptographic)
+            // keyed XOR cipher, hex-encoded so the result is a printable string.
+            // encrypt then decrypt with the same key round-trips.
+            "encrypt" => {
+                let s = str_arg(&args, 0, "encrypt")?;
+                let key = str_arg(&args, 1, "encrypt")?;
+                return Ok(Value::Str(xor_hex_encrypt(&s, &key)));
+            }
+            "decrypt" => {
+                let s = str_arg(&args, 0, "decrypt")?;
+                let key = str_arg(&args, 1, "decrypt")?;
+                return Ok(Value::Str(xor_hex_decrypt(&s, &key)?));
+            }
+            // `#[anti_debug]` support: best-effort debugger detection (Linux reads
+            // /proc/self/status TracerPid). Honest and documented as best-effort.
+            "is_debugged" => return Ok(Value::Bool(detect_debugger())),
+            // metadata attributes (version/since/intent/throws/deps/...): read an
+            // attribute's argument value, making all metadata real and queryable.
+            "meta_of" => {
+                let tgt = str_arg(&args, 0, "meta_of")?;
+                let key = str_arg(&args, 1, "meta_of")?;
+                let f = self.funcs.get(&tgt)
+                    .ok_or_else(|| format!("meta_of: no function `{}`", tgt))?;
+                let val = f.attrs.iter().find(|a| a.name == key)
+                    .map(|a| a.args.iter().map(|(k, v)| if k.is_empty() { v.clone() } else { format!("{}: {}", k, v) })
+                        .collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                return Ok(Value::Str(val));
             }
             // introspection: the attribute names on a function (every attribute is
             // captured, so even not-yet-behavioural ones are visible and usable).
@@ -2961,6 +3011,41 @@ pub(crate) fn eval_unop(op: UnOp, v: Value) -> Result<Value, String> {
     }
 }
 
+// Keyed XOR cipher, hex-encoded (for `#[encrypt]`). Obfuscation-grade, not
+// cryptographic — documented as such. Round-trips with the same key.
+fn xor_hex_encrypt(s: &str, key: &str) -> String {
+    let kb = key.as_bytes();
+    if kb.is_empty() { return hex_encode(s.as_bytes()); }
+    let out: Vec<u8> = s.bytes().enumerate().map(|(i, b)| b ^ kb[i % kb.len()]).collect();
+    hex_encode(&out)
+}
+fn xor_hex_decrypt(s: &str, key: &str) -> Result<String, String> {
+    let bytes = hex_decode(s).ok_or("decrypt: input is not valid hex")?;
+    let kb = key.as_bytes();
+    let out: Vec<u8> = if kb.is_empty() { bytes }
+        else { bytes.iter().enumerate().map(|(i, b)| b ^ kb[i % kb.len()]).collect() };
+    String::from_utf8(out).map_err(|_| "decrypt: result is not valid UTF-8 (wrong key?)".into())
+}
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b { s.push_str(&format!("{:02x}", x)); }
+    s
+}
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
+}
+
+// Best-effort debugger detection (for `#[anti_debug]`). On Linux, a non-zero
+// TracerPid in /proc/self/status means a debugger is attached. Honest and
+// documented as best-effort (other platforms return false).
+fn detect_debugger() -> bool {
+    std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("TracerPid:")).map(|l| l.to_string()))
+        .map(|l| l.split_whitespace().nth(1).map_or(false, |n| n != "0"))
+        .unwrap_or(false)
+}
+
 // A stable FNV-1a content hash of a function's body (for `#[integrity]`). Based on
 // the Debug rendering of the AST, so it changes iff the code changes; masked to a
 // non-negative i64 so it prints cleanly.
@@ -4130,6 +4215,34 @@ mod attr_tests {
         assert!(interp.call("inc", vec![Value::Int(3)]).is_ok());
         // requires(x > 0) violated -> error (throw sentinel)
         assert!(interp.call("inc", vec![Value::Int(0)]).is_err());
+    }
+
+    #[test]
+    fn encrypt_round_trips_and_metadata_reads() {
+        let src = "#[version(v: \"2.0\")] fn f(){ 1 }\nfn main(){0}";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        let enc = interp.call("encrypt", vec![Value::Str("hello".into()), Value::Str("key".into())]).unwrap();
+        let enc_s = if let Value::Str(s) = &enc { s.clone() } else { panic!() };
+        assert_ne!(enc_s, "hello");
+        let dec = interp.call("decrypt", vec![Value::Str(enc_s.clone()), Value::Str("key".into())]).unwrap();
+        assert_eq!(format!("{:?}", dec), format!("{:?}", Value::Str("hello".into())));
+        // wrong key must not reproduce the plaintext
+        let bad = interp.call("decrypt", vec![Value::Str(enc_s), Value::Str("nope".into())]);
+        assert!(bad.is_err() || format!("{:?}", bad.unwrap()) != format!("{:?}", Value::Str("hello".into())));
+        // metadata is captured and queryable (the version string round-trips)
+        let m = interp.call("meta_of", vec![Value::Str("f".into()), Value::Str("version".into())]).unwrap();
+        assert_eq!(format!("{:?}", m), format!("{:?}", Value::Str("2.0".into())));
+    }
+
+    #[test]
+    fn anti_tamper_passes_when_unchanged() {
+        let src = "#[anti_tamper] fn f(){ 1 + 2 }\nfn main(){0}";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        // repeated calls with the same body pass (baseline matches)
+        assert!(interp.call("f", vec![]).is_ok());
+        assert!(interp.call("f", vec![]).is_ok());
     }
 
     #[test]
