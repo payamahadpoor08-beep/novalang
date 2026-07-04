@@ -1792,10 +1792,15 @@ impl<'p> TieredJit<'p> {
         let mut roots: Vec<String> = Vec::new();
         for item in &self.prog.items {
             if let Item::Func(f) = item {
-                let hinted_hot = f.attrs.iter().any(|a| a.name == "hot");
+                // `#[simd]` is a JIT hint: it forces eager native compilation of
+                // the function's numeric/array kernel, exactly like `#[hot]`. (True
+                // Cranelift SIMD-type auto-vectorization is a documented future
+                // deepening — this attribute honestly means "compile this kernel
+                // up-front", not "it is vectorized".)
+                let hinted_hot = f.attrs.iter().any(|a| a.name == "hot" || a.name == "simd");
                 let hinted_cold = f.attrs.iter().any(|a| a.name == "cold");
-                // #[hot] compiles up-front unconditionally; #[cold] never warms;
-                // otherwise loop-bearing kernels warm as before.
+                // #[hot]/#[simd] compile up-front unconditionally; #[cold] never
+                // warms; otherwise loop-bearing kernels warm as before.
                 if self.is_eligible(&f.name) && !hinted_cold && (hinted_hot || body_has_loop(&f.body)) {
                     roots.push(f.name.clone());
                 }
@@ -2602,6 +2607,21 @@ mod jit_tests {
             "fn hot(x){ x * 1.0001 + 0.5 }\n\
              fn main(){ let t = 0.0; let i = 0.0; while i < 500.0 { t = hot(t); i = i + 1.0 } t }", 50);
         assert!(names.contains(&"hot".to_string()), "hot float fn must compile");
+    }
+    #[test] fn simd_hint_eagerly_compiles_without_loop() {
+        // `#[simd]` is an eager-compile JIT hint (like `#[hot]`): a loop-free
+        // numeric function marked #[simd] is compiled up-front by warm_loops even
+        // when the count threshold would never be reached; a plain loop-free
+        // function is not. (Vectorization proper is a documented future step.)
+        let mut prog = parse_program(
+            "#[simd] fn v(a,b){ a*b + a - b }\nfn plain(a,b){ a + b }\n\
+             fn main(){ v(2,3) + plain(1,1) }").expect("parse");
+        fold_program(&mut prog);
+        let t = TieredJit::new(&prog, 1_000_000); // counting will never compile
+        t.warm_loops();
+        let names = t.compiled_functions();
+        assert!(names.contains(&"v".to_string()), "#[simd] fn must be eagerly compiled: {:?}", names);
+        assert!(!names.contains(&"plain".to_string()), "plain no-loop fn must stay uncompiled: {:?}", names);
     }
     // --- Phase 6: int **, f64 % and **, mixed int/float, local arrays ---
     #[test] fn pow_small_ints() {

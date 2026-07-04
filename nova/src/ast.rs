@@ -167,6 +167,13 @@ pub struct Attr {
     pub name: String,
     pub args: Vec<(String, String)>,
     pub exprs: Vec<Expr>,
+    // the attribute's raw source text (without the surrounding `#[ ]`), e.g.
+    // `self_healing(attempts: 5)`. Kept so the formatter can re-emit the exact
+    // syntax — the `compiler_attr` grammar has fixed keyword forms that the
+    // parsed `args` don't fully capture. Contract attrs (requires/ensures/
+    // assumes) are re-serialized from `exprs` instead, so their predicates
+    // track identifier renames (e.g. under `nova obfuscate`).
+    pub raw: String,
 }
 
 impl Attr {

@@ -93,16 +93,38 @@ is computed at init, a `#[comptime]` function must be self-contained — it runs
 before global constants exist, so referencing runtime-only state is an error.
 Interp-only (uniform across tiers). See `tests/corpus/comptime_eval.nova`.
 
+### `#[simd]`
+A JIT hint: the function's numeric/array kernel is compiled to native code
+up-front (exactly like `#[hot]`), even if it is only called once and would never
+cross the tiering count threshold. **Honest scope:** this forces eager native
+compilation of the kernel — it does *not* claim true auto-vectorization. Real
+Cranelift SIMD-type vectorization of eligible loops is a documented future
+deepening. Output stays byte-identical across all tiers.
+See `tests/corpus/simd_kernel.nova` and the `simd_hint_eagerly_compiles_without_loop` test.
+
+### `#[obfuscate]` + `nova obfuscate <file>`
+Marks a function for source obfuscation. `nova obfuscate <file>` (or `-w` to
+rewrite in place) emits a semantically-identical program in which each selected
+function's **local identifiers** — parameters and every body binding (`let`s,
+loop/comprehension/lambda binders, `catch`/`select` bindings, match-pattern
+bindings) — are alpha-renamed to opaque names (`_v0`, `_v1`, …). Public names
+(functions, structs/enums, fields, methods) and any local that would collide with
+a top-level item are left untouched, so behaviour is **byte-identical**
+(`tests/obfuscate_smoke.sh` proves it over the whole corpus). If no function is
+marked `#[obfuscate]`, every user function is obfuscated. This is identifier
+stripping — real, defensible source obfuscation — **not** encryption.
+
 ### Introspection — `attrs_of("name")`
 Returns the array of every attribute name on a function. Because **all** attributes
 are captured (not just the behavioural ones), even attributes whose full behaviour
 is still on the roadmap are visible and usable via this builtin.
 
 ## Roadmap (parse-only today — being implemented in later phases)
-`#[encrypt]`, `#[time_travel]`, `#[obfuscate]`, `#[simd]`, `#[anti_debug]`,
-`#[anti_tamper]`, `#[polymorph]`, plus optimisation hints (`#[inline_cache]`,
-`#[tail_call]`, `#[cold]`/`#[hot]`) and metadata tags (`#[version]`, `#[since]`,
-`#[intent]`, `#[example]`, `#[throws]`, `#[budget]`, …). All are **captured and
+`#[polymorph]` remains a no-op: in a tree-walker, random dispatch among
+semantically-identical clones changes nothing observable, so shipping it as "done"
+would be dishonest — it belongs in the AOT-codegen phase (emit N equivalent
+variants). Plus remaining optimisation hints (`#[inline_cache]`, `#[tail_call]`)
+and metadata tags (`#[since]`, `#[example]`, `#[budget]`, …): all are **captured and
 introspectable via `attrs_of`** today; each gains full behaviour in later phases and
 is marked done in FEATURES.md only when a corpus test proves it.
 

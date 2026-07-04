@@ -9,6 +9,7 @@ mod config;
 mod build;
 mod aot;
 mod diag;
+mod obfuscate;
 
 use std::io::{self, Write, BufRead};
 use std::process::exit;
@@ -273,11 +274,46 @@ fn main() {
                 Err(e) => { eprintln!("{}", e); exit(1); }
             }
         }
+        "obfuscate" => {
+            // `nova obfuscate <file>` prints an obfuscated copy to stdout;
+            // `-w` rewrites in place. Local identifiers (params + body bindings)
+            // are alpha-renamed to opaque names; behaviour is byte-identical.
+            // `#[obfuscate]` on functions selects which to transform; if no
+            // function is marked, every user function is obfuscated.
+            let write = args.get(2).map(|s| s == "-w").unwrap_or(false);
+            let path = if write { args.get(3) } else { args.get(2) };
+            let path = match path {
+                Some(p) => p.clone(),
+                None => { eprintln!("error: missing file path"); exit(2); }
+            };
+            let src = read(&path);
+            match parser::parse_program(&src) {
+                Ok(mut p) => {
+                    let marked: std::collections::HashSet<String> = p.items.iter().filter_map(|it| match it {
+                        ast::Item::Func(f) if f.attrs.iter().any(|a| a.name == "obfuscate") => Some(f.name.clone()),
+                        _ => None,
+                    }).collect();
+                    let targets = if marked.is_empty() { None } else { Some(marked) };
+                    obfuscate::obfuscate_program(&mut p, &targets);
+                    let out = fmt::format_program(&p);
+                    if write {
+                        if let Err(e) = std::fs::write(&path, &out) {
+                            eprintln!("error: cannot write {}: {}", path, e);
+                            exit(1);
+                        }
+                        println!("obfuscated {}", path);
+                    } else {
+                        print!("{}", out);
+                    }
+                }
+                Err(e) => { eprintln!("{}", e); exit(1); }
+            }
+        }
         "daemon" => run_daemon(),
         "version" | "--version" | "-v" => println!("Nova {}", VERSION),
         other => {
             eprintln!("unknown command: {}", other);
-            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | repl | daemon | version]");
+            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | repl | daemon | version]");
             exit(2);
         }
     }

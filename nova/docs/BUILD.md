@@ -1,5 +1,21 @@
 # Nova build pipeline — `nova build` and the AOT tiers
 
+## Prerequisites
+
+Building Nova needs a working Rust toolchain (stable). If `cargo build --release`
+fails with:
+
+```
+error: rustup could not choose a version of cargo to run, because one wasn't
+specified explicitly, and no default is configured.
+```
+
+your rustup has no default toolchain — run **`rustup default stable`** once, then
+build again. Build from inside the crate directory
+(`cd novalang/nova && cargo build --release`). To update an existing clone use
+`git pull` inside it rather than re-running `git clone` (which errors that the
+destination already exists).
+
 ## The one rule
 
 Every shipped binary must print **byte-identical** output to `nova run` (the

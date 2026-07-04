@@ -60,6 +60,8 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 | `#[anti_debug]` + `is_debugged()` | Run — best-effort Linux TracerPid debugger detection |
 | `#[anti_tamper]` | Run — verifies the function body hash hasn't changed since first call |
 | `#[hot]` / `#[cold]` | Run — `hot` warms the JIT up-front, `cold` prevents warming |
+| `#[simd]` | Run — JIT hint: eagerly compiles the numeric/array kernel up-front (like `#[hot]`). True Cranelift SIMD-type vectorization is a documented future deepening — the attribute honestly means "compile this kernel now", not "it is vectorized". |
+| `#[obfuscate]` + `nova obfuscate <file>` | Run — alpha-renames a function's local identifiers to opaque names; behaviour byte-identical (`tests/obfuscate_smoke.sh`). Source obfuscation, not encryption. |
 | `#[comptime]` (no-arg fn) | Run — const-evaluated once before `main`; every call returns the cached value |
 | metadata (`#[version]`, `#[since]`, `#[throws]`, `#[intent]`, `#[deps]`, …) + `meta_of(name,key)` | Run — captured + queryable |
 | **any attribute** + `attrs_of(name)` | Run — all attributes captured + introspectable |
@@ -73,7 +75,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | associated types (`type Item;` in traits) | Parse only |
 | effect polymorphism `![E]` | Parse only (monomorphic effects only) |
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
-| remaining meta attributes — `#[simd]`, `#[encrypt]`, `#[obfuscate]`, `#[time_travel]`, `#[anti_debug]`, `#[anti_tamper]`, `#[polymorph]` | **Parse only — no-ops.** Being implemented in ROADMAP Phase 2. |
+| `#[polymorph]` | **Parse only — no-op.** In a tree-walker, random dispatch among semantically-identical clones is a no-op by construction; it is properly an AOT-codegen concern (emit N equivalent C variants) and is deferred to that phase — deliberately not faked. |
 
 ## Absent ❌ (not in grammar, despite the table)
 `union` types are not in the grammar and not implemented.

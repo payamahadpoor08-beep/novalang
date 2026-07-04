@@ -137,7 +137,29 @@ impl Fmt {
         }
     }
 
+    // Render one `#[name(...)]` attribute line. Faithfully reproduces the parsed
+    // form so the output re-parses to the same attribute (name + args/predicates).
+    // Without this, `nova fmt`/`nova obfuscate` would silently drop attributes and
+    // change behaviour (e.g. a `#[self_healing]` function would stop retrying).
+    fn attr_line(&self, a: &Attr) -> String {
+        // Contract attributes carry predicate expressions that may reference
+        // parameters (which a rename pass rewrites), so re-serialize them from
+        // the (possibly renamed) AST rather than the stale raw text.
+        if matches!(a.name.as_str(), "requires" | "ensures" | "assumes") {
+            let ps: Vec<String> = a.exprs.iter().map(|e| self.expr_s(e)).collect();
+            return format!("#[{}({})]", a.name, ps.join(", "));
+        }
+        // Everything else re-emits its exact original syntax verbatim — the
+        // `compiler_attr` grammar has fixed keyword forms (`attempts:`, `depth:`,
+        // …) the flattened `args` don't preserve.
+        format!("#[{}]", a.raw)
+    }
+
     fn func(&mut self, f: &Func, _top: bool) {
+        for a in &f.attrs {
+            let l = self.attr_line(a);
+            self.line(&l);
+        }
         let mut sig = String::new();
         if f.is_async { sig.push_str("async "); }
         sig.push_str("fn ");

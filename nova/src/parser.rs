@@ -171,7 +171,7 @@ fn parse_attr(a: Pair<Rule>) -> Attr {
     } else {
         collect_attr_values(a, &mut args);
     }
-    Attr { name, args, exprs }
+    Attr { name, args, exprs, raw: text.to_string() }
 }
 
 fn collect_attr_values(p: Pair<Rule>, args: &mut Vec<(String, String)>) {
