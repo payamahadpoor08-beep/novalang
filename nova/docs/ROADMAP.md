@@ -94,14 +94,21 @@ every collection boundary.
 
 ---
 
-## 3. "JIT only for numbers" → arrays and simple structs
+## 3. "JIT only for numbers" → arrays, mixed int/float kernels, structs
 
-**Fixed in v3.26 (major):**
-- **Local integer arrays on the i64 track**: arrays built from literals that never
-  escape a pure function (indexing, `a[i]=v`, `len`, `push`, `pop`, aliasing with
-  shared storage) now compile to native code against a thread-local arena
-  (`src/jit.rs::nova_arr_*`). Out-of-bounds and empty-pop set the deopt flag, so the
-  VM re-run raises the interpreter's exact error. A hot sieve dropped 465ms → 170ms.
+**Fixed in v3.27 (major — the mandelbrot-class win):**
+- **Unified numeric track** (`src/jit.rs::NumGen` / `numeric_eligible_set`): functions
+  that mix integer loop counters/accumulators with float math and return an int **or**
+  a float now compile to native code. Per-variable I64/F64 kinds, `as_f` promotion,
+  `to_float`/`to_int`, mixed comparisons, overflow/div0 deopt, all on the i64 ABI
+  (f64 results carried as bits). **mandelbrot 600²×200: `nova vm` 4934ms → 65ms (76×)**,
+  now on par with C and ahead of Java/Node/Lua/Python.
+- **Eager loop-kernel warming** (`TieredJit::warm_loops`): a compute kernel called once
+  from `main` is compiled up-front instead of never crossing the call threshold.
+  **sieve <2M on `nova vm`: 858ms → 49ms (10×)**.
+- **Local integer arrays on the i64 track** (v3.26): arrays built from literals that
+  never escape a pure function (indexing, `a[i]=v`, `len`/`push`/`pop`, aliasing) compile
+  against a thread-local arena (`src/jit.rs::nova_arr_*`), with OOB/empty-pop deopt.
 - **Native integer `**`** (transcription of `i64::checked_pow` with per-multiply
   overflow deopts; negative/huge exponents deopt to the interpreter's Float path).
 - **f64 track**: `%` and `**` (bit-identical via Rust libcalls), integer `for`
