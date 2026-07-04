@@ -41,6 +41,7 @@ fn main() {
   print(h1 == integrity_of("important"))   // true — stable
   print(h1 != integrity_of("connect"))
   phase2()
+  phase3()
 }
 
 // --- Phase 2 attributes ---
@@ -65,4 +66,11 @@ fn phase2() {
   print(profile_of("ping"))    // 3
   print(len(attrs_of("double_up")))  // 2
   try { double_up(0-1) } catch e { print("bad: " + e) }
+}
+
+#[time_travel(depth: 3)]
+fn track(n) { n + 100 }
+fn phase3() {
+  track(1); track(2); track(3); track(4)
+  print(history_of("track"))   // [102, 103, 104]
 }

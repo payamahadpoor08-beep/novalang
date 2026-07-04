@@ -55,6 +55,7 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 | `#[trace]` / `#[log]` / `#[audit]` | Run — prints `name(args) -> result` per call |
 | `#[profile]` + `profile_of(name)` | Run — call counting |
 | `#[deprecate]` / `#[deprecated]` | Run — one-time warning on use |
+| `#[time_travel(depth: N)]` + `history_of(name)` | Run — bounded ring buffer of past results (snapshot/rollback) |
 | **any attribute** + `attrs_of(name)` | Run — all attributes captured + introspectable |
 
 ## Parse-only ⚠️ (accepted syntax, NOT yet executed/enforced)

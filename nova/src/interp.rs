@@ -439,6 +439,9 @@ pub struct Interp {
     memo: RefCell<HashMap<String, Value>>,
     profile: RefCell<HashMap<String, i64>>,
     deprecated_warned: RefCell<std::collections::HashSet<String>>,
+    // `#[time_travel(depth: N)]` per-function ring buffer of the last N results,
+    // queryable via `history_of(name)` for rollback/inspection.
+    history: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
 }
 
 impl Interp {
@@ -572,6 +575,7 @@ impl Interp {
             memo: RefCell::new(HashMap::new()),
             profile: RefCell::new(HashMap::new()),
             deprecated_warned: RefCell::new(std::collections::HashSet::new()),
+            history: RefCell::new(HashMap::new()),
         })
     }
 
@@ -919,6 +923,17 @@ impl Interp {
             *self.profile.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
         }
 
+        // time_travel: record the last N results in a ring buffer (history_of)
+        if let Some(att) = func.attrs.iter().find(|a| a.name == "time_travel") {
+            if let Ok(v) = &result {
+                let depth = att.int_arg("depth").unwrap_or(8).max(1) as usize;
+                let mut hist = self.history.borrow_mut();
+                let ring = hist.entry(name.to_string()).or_default();
+                ring.push_back(v.clone());
+                while ring.len() > depth { ring.pop_front(); }
+            }
+        }
+
         // memo: store a successful result
         if let (Some(k), Ok(v)) = (&memo_key, &result) {
             self.memo.borrow_mut().insert(k.clone(), v.clone());
@@ -1019,6 +1034,15 @@ impl Interp {
                     .ok_or_else(|| format!("attrs_of: no function `{}`", tgt))?;
                 let names: Vec<Value> = f.attrs.iter().map(|a| Value::Str(a.name.clone())).collect();
                 return Ok(Value::Array(Rc::new(RefCell::new(names))));
+            }
+            // `#[time_travel]` support: the recorded past results (oldest first),
+            // for rollback / inspection.
+            "history_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("history_of expects a function name".into()) };
+                let hist = self.history.borrow();
+                let vals: Vec<Value> = hist.get(&tgt).map(|r| r.iter().cloned().collect()).unwrap_or_default();
+                return Ok(Value::Array(Rc::new(RefCell::new(vals))));
             }
             // `#[profile]` support: how many times a profiled function was called.
             "profile_of" => {
@@ -4106,6 +4130,19 @@ mod attr_tests {
         assert!(interp.call("inc", vec![Value::Int(3)]).is_ok());
         // requires(x > 0) violated -> error (throw sentinel)
         assert!(interp.call("inc", vec![Value::Int(0)]).is_err());
+    }
+
+    #[test]
+    fn time_travel_records_bounded_history() {
+        let src = "#[time_travel(depth: 3)] fn s(n){ n*n }\nfn main(){0}";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        for n in 1..=5 { let _ = interp.call("s", vec![Value::Int(n)]); }
+        let h = interp.call("history_of", vec![Value::Str("s".into())]).unwrap();
+        if let Value::Array(a) = h {
+            let got: Vec<String> = a.borrow().iter().map(|v| v.to_string()).collect();
+            assert_eq!(got, vec!["9", "16", "25"], "only the last 3 results kept");
+        } else { panic!("expected array"); }
     }
 
     #[test]
