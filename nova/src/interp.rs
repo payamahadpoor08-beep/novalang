@@ -427,9 +427,23 @@ pub struct Interp {
     // free-list of scope backing buffers, so ordinary (non-escaping) calls reuse
     // an allocation instead of heap-allocating a fresh frame every time
     scope_pool: RefCell<Vec<Vec<(Rc<str>, Value)>>>,
+    // free-list of argument vectors, so evaluating a call's arguments doesn't
+    // heap-allocate a fresh Vec on every single call
+    arg_pool: RefCell<Vec<Vec<Value>>>,
 }
 
 impl Interp {
+    #[inline]
+    fn take_args(&self) -> Vec<Value> {
+        self.arg_pool.borrow_mut().pop().map(|mut v| { v.clear(); v }).unwrap_or_default()
+    }
+    #[inline]
+    fn give_args(&self, mut v: Vec<Value>) {
+        v.clear();
+        let mut pool = self.arg_pool.borrow_mut();
+        if pool.len() < 64 { pool.push(v); }
+    }
+
     pub fn new(program: &Program) -> Result<Self, String> {
         let mut funcs: FastMap<String, Func> = FastMap::default();
         let mut structs = HashMap::new();
@@ -544,6 +558,7 @@ impl Interp {
             task_bodies: RefCell::new(HashMap::new()),
             next_task_id: std::cell::Cell::new(1),
             scope_pool: RefCell::new(Vec::new()),
+            arg_pool: RefCell::new(Vec::new()),
         })
     }
 
@@ -808,7 +823,7 @@ impl Interp {
         }))))
     }
 
-    pub(crate) fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    pub(crate) fn call(&self, name: &str, mut args: Vec<Value>) -> Result<Value, String> {
         // A user-defined function shadows any same-named builtin or stdlib
         // function (so projects can define their own map/reduce/contains/...).
         // The VM behaves identically: compiled user chunks resolve first there.
@@ -841,7 +856,8 @@ impl Interp {
             }
             let backing = self.scope_pool.borrow_mut().pop().unwrap_or_default();
             let mut scope = Scope::from_backing(backing);
-            for (p, v) in func.params.iter().zip(args.into_iter()) { scope.insert(p.clone(), v); }
+            for (p, v) in func.params.iter().zip(args.drain(..)) { scope.insert(p.clone(), v); }
+            self.give_args(args); // recycle the argument buffer
             let result = self.exec_block(&func.body, &mut scope);
             // recycle the frame (a closure created inside cloned it, so this is safe)
             let mut backing = scope.into_backing();
@@ -2263,7 +2279,7 @@ impl Interp {
                 eval_binop(*op, l, r)
             }
             Expr::Call { callee, args } => {
-                let mut vals = Vec::with_capacity(args.len());
+                let mut vals = self.take_args();
                 for a in args {
                     vals.push(self.eval(a, scope)?);
                 }
