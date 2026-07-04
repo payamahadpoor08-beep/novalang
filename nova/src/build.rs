@@ -38,9 +38,15 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
     }
+    // WASM takes a separate compile+verify path (clang freestanding wasm32, run
+    // and byte-diff via node). Only the typed tier reaches here for wasm.
+    if matches!(backend, crate::aot::Backend::Wasm) {
+        return build_wasm(entry, out, &code, tier);
+    }
     let (ext, cc) = match backend {
         crate::aot::Backend::C => ("c", "cc"),
         crate::aot::Backend::Llvm => ("ll", "clang"),
+        crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
     };
     let tmp = out.with_extension(ext);
     std::fs::write(&tmp, &code).map_err(|e| e.to_string())?;
@@ -81,6 +87,76 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         let _ = std::fs::remove_file(out);
         Ok(None)
     }
+}
+
+// Node harness: instantiate the freestanding wasm, supply the two host imports
+// (integer + string printing) formatting exactly like `nova run`, drive `main`,
+// and print the collected output. Verified against the oracle by the caller.
+const WASM_HARNESS: &str = r#"import { readFileSync } from 'node:fs';
+const bytes = readFileSync(process.argv[2]);
+const out = [];
+const dec = new TextDecoder();
+let mem;
+const env = {
+  print_i64: (v) => out.push(v.toString()),
+  print_str: (ptr, len) => out.push(dec.decode(new Uint8Array(mem.buffer, Number(ptr), Number(len)))),
+};
+const { instance } = await WebAssembly.instantiate(bytes, { env });
+mem = instance.exports.memory;
+instance.exports.main();
+process.stdout.write(out.length ? out.join("\n") + "\n" : "");
+"#;
+
+// Compile the typed C to freestanding wasm32 with clang, run it under node, and
+// ship the `.wasm` only if its output is byte-identical to `nova run`. Requires
+// `clang` (wasm target) and `node`; absent either, returns Ok(None) (no wasm,
+// honest fallback — never wrong output). No wasi-sysroot needed: `print` routes
+// to JS imports, so nothing links libc.
+fn build_wasm(entry: &str, out: &Path, code: &str, tier: crate::aot::Tier)
+    -> Result<Option<crate::aot::Tier>, String>
+{
+    let node = which("node");
+    let clang = which("clang");
+    if node.is_none() || clang.is_none() { return Ok(None); }
+    let cdir = out.parent().unwrap_or(Path::new("."));
+    let tmp_c = out.with_extension("wasm.c");
+    let wasm = out.with_extension("wasm");
+    let harness = cdir.join(".nova_wasm_harness.mjs");
+    std::fs::write(&tmp_c, code).map_err(|e| e.to_string())?;
+    std::fs::write(&harness, WASM_HARNESS).map_err(|e| e.to_string())?;
+    let cleanup = |extra: bool| {
+        let _ = std::fs::remove_file(&tmp_c);
+        let _ = std::fs::remove_file(&harness);
+        if extra { let _ = std::fs::remove_file(&wasm); }
+    };
+    let status = Command::new(clang.unwrap())
+        .args(["--target=wasm32", "-O2", "-nostdlib",
+               "-Wl,--no-entry", "-Wl,--export-dynamic", "-Wl,--allow-undefined"])
+        .arg("-o").arg(&wasm).arg(&tmp_c)
+        .status().map_err(|e| format!("cannot run clang: {}", e))?;
+    if !status.success() { cleanup(true); return Ok(None); }
+    // oracle gate: node-run wasm output must equal `nova run` byte-for-byte
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let expect = Command::new(&exe).arg("run").arg(entry).output().map_err(|e| e.to_string())?;
+    let got = Command::new(node.unwrap()).arg(&harness).arg(&wasm).output()
+        .map_err(|e| format!("cannot run node: {}", e))?;
+    cleanup(false);
+    if expect.stdout == got.stdout && got.status.success() {
+        Ok(Some(tier))
+    } else {
+        let _ = std::fs::remove_file(&wasm);
+        Ok(None)
+    }
+}
+
+// first matching executable on PATH, if any
+fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(bin);
+        if p.is_file() { return Some(p); }
+    }
+    None
 }
 
 const MAGIC: &[u8; 13] = b"NOVA_EMBED_v1";

@@ -39,11 +39,27 @@ Two native backends produce identical results and are both gated by the oracle:
   ABI (`{i8 tag, i64 payload}` by value, `{i8,i64}` returns), compiled together
   with `nova_rt.c` (`-Dstatic=`).
 
+## WASM target (`--aot=wasm`)
+
+`nova build --aot=wasm program.nova` compiles the **typed tier** (pure int/float
+plus string-literal output) to a freestanding `program.wasm` with `clang
+--target=wasm32` — **no wasi-sysroot required**: `print` is routed to two host
+imports (`env.print_i64`, `env.print_str`), so nothing links libc. The module
+exports `main` and its linear `memory`. As with native AOT, it ships only if it
+passes the oracle gate: the `.wasm` is run under `node` and its output must be
+byte-identical to `nova run`, else no artifact is emitted (honest fallback).
+
+Run the result in any WASM host that supplies the two imports (see
+`tests/wasm_smoke.sh` for a ~10-line node harness). Boxed/embed programs
+(strings, arrays, maps) are **not** WASM-able yet — that needs a wasi-sysroot for
+the refcounted runtime.
+
 ## Commands
 
 ```bash
 nova build program.nova            # embed build (always succeeds)
 nova build --aot program.nova      # typed→boxed→embed via the C backend
+nova build --aot=wasm program.nova # freestanding wasm32 (typed tier), node-verified
 nova build --aot=llvm program.nova # same tiers via the LLVM backend
 ```
 

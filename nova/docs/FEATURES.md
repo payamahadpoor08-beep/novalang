@@ -91,7 +91,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | LSP, package manager | Not implemented (design only) |
-| WASM / ARM / 32-bit / mobile targets | Not implemented — needs a `wasi-sysroot` (WASM) and `qemu`/cross-libc (ARM) to build+byte-verify, absent from the current env; deferred until a target can be *proven* byte-identical, per the honesty rule (design in ROADMAP §4) |
+| **WASM target** (`nova build --aot=wasm`) — typed tier | Run ✅ — freestanding wasm32 via clang (no wasi-sysroot; `print` routes to JS host imports), shipped only if byte-identical to `nova run` under node (`tests/wasm_smoke.sh`). Boxed/embed (strings/arrays) await a wasi-sysroot. |
+| ARM / 32-bit / mobile targets | Not implemented — needs `qemu`/cross-libc to build+byte-verify (absent here); deferred until provably byte-identical (ROADMAP §4) |
 
 ## The three real gaps that matter for "AOT/speed"
 1. **AOT native for mixed/array kernels.** `nova build --aot` compiles pure-int

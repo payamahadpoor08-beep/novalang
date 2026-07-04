@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use crate::ast::*;
 use crate::jit::{eligible_set, float_eligible_set};
 
-pub enum Backend { C, Llvm }
+pub enum Backend { C, Llvm, Wasm }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tier { Typed, Boxed }
@@ -192,6 +192,10 @@ pub fn emit(prog: &Program, backend: &Backend) -> Option<(String, Tier)> {
         Backend::Llvm => {
             if let Some(code) = emit_boxed_llvm(prog) { return Some((code, Tier::Boxed)); }
         }
+        // WASM has no boxed tier: the refcounted runtime needs libc/malloc, which
+        // means a wasi-sysroot. The typed (pure int/float + string-literal) subset
+        // compiles freestanding and is the honest, verifiable WASM surface today.
+        Backend::Wasm => {}
     }
     None
 }
@@ -211,6 +215,7 @@ fn emit_typed(prog: &Program, backend: &Backend) -> Option<String> {
     }
     Some(match backend {
         Backend::C => CEmit::new(&a).emit(),
+        Backend::Wasm => CEmit::new_wasm(&a).emit(),
         Backend::Llvm => LlEmit::new(&a).emit(),
     })
 }
@@ -253,15 +258,31 @@ fn float_body_no_shadow(body: &[Stmt], scopes: &mut Vec<HashSet<String>>) -> boo
 struct CEmit<'p> {
     a: &'p AotProgram<'p>,
     out: String,
+    // true when targeting freestanding wasm32: no <stdio.h>, `print` routes to
+    // JS-imported functions, and `main` is exported as `main` (no libc entry).
+    wasm: bool,
 }
 
 fn mangle(n: &str) -> String { format!("nv_{}", n) }
 
 impl<'p> CEmit<'p> {
-    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new() } }
+    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new(), wasm: false } }
+    fn new_wasm(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new(), wasm: true } }
 
     fn emit(mut self) -> String {
-        self.out.push_str("#include <stdio.h>\n#include <stdint.h>\ntypedef int64_t i64;\n\n");
+        if self.wasm {
+            // Freestanding wasm: declare the two host imports (integer + string
+            // printing) and pull in stdint for i64. The JS host formats values to
+            // match `nova run` exactly; the byte-diff gate rejects any mismatch.
+            self.out.push_str(
+                "#include <stdint.h>\ntypedef int64_t i64;\n\
+                 __attribute__((import_module(\"env\"),import_name(\"print_i64\")))\n\
+                 void nova_print_i64(long long);\n\
+                 __attribute__((import_module(\"env\"),import_name(\"print_str\")))\n\
+                 void nova_print_str(const char*, int);\n\n");
+        } else {
+            self.out.push_str("#include <stdio.h>\n#include <stdint.h>\ntypedef int64_t i64;\n\n");
+        }
         for f in &self.a.int_fns { self.proto(f, "i64"); }
         for f in &self.a.float_fns { self.proto(f, "double"); }
         self.out.push('\n');
@@ -292,12 +313,16 @@ impl<'p> CEmit<'p> {
     }
 
     fn main(&mut self) {
-        self.out.push_str("int main(void) {\n");
+        if self.wasm {
+            self.out.push_str("__attribute__((export_name(\"main\"))) void nova_main(void) {\n");
+        } else {
+            self.out.push_str("int main(void) {\n");
+        }
         let mut vars: Vec<String> = Vec::new();
         collect_vars(&self.a.main_body, &mut vars);
         for v in &vars { let _ = writeln!(self.out, "  i64 {} = 0;", mangle(v)); }
         for s in &self.a.main_body.clone() { self.stmt(s, 1, false); }
-        self.out.push_str("  return 0;\n}\n");
+        if self.wasm { self.out.push_str("}\n"); } else { self.out.push_str("  return 0;\n}\n"); }
     }
 
     fn stmt(&mut self, s: &Stmt, d: usize, fl: bool) {
@@ -311,10 +336,18 @@ impl<'p> CEmit<'p> {
                         let mut a = &args[0];
                         while let Expr::At { expr, .. } = a { a = expr; }
                         if let Expr::Str(s) = a {
-                            let _ = writeln!(self.out, "{}printf(\"%s\\n\", \"{}\");", ind, c_escape(s));
+                            if self.wasm {
+                                let _ = writeln!(self.out, "{}nova_print_str(\"{}\", {});", ind, c_escape(s), s.len());
+                            } else {
+                                let _ = writeln!(self.out, "{}printf(\"%s\\n\", \"{}\");", ind, c_escape(s));
+                            }
                         } else {
                             let v = self.expr(a, fl);
-                            let _ = writeln!(self.out, "{}printf(\"%lld\\n\", (long long)({}));", ind, v);
+                            if self.wasm {
+                                let _ = writeln!(self.out, "{}nova_print_i64((long long)({}));", ind, v);
+                            } else {
+                                let _ = writeln!(self.out, "{}printf(\"%lld\\n\", (long long)({}));", ind, v);
+                            }
                         }
                         return;
                     }

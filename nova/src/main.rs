@@ -44,6 +44,7 @@ fn main() {
             let aot_backend = args.iter().skip(2).find_map(|a| match a.as_str() {
                 "--aot" | "--aot=c" => Some(aot::Backend::C),
                 "--aot=llvm" => Some(aot::Backend::Llvm),
+                "--aot=wasm" => Some(aot::Backend::Wasm),
                 _ => None,
             });
             if let Some(bk) = aot_backend {
@@ -53,9 +54,20 @@ fn main() {
                     .unwrap_or_default();
                 match build::build_aot(&entry, &out, &bk, &extra) {
                     Ok(Some(tier)) => {
-                        let which = if matches!(bk, aot::Backend::C) { "c" } else { "llvm" };
-                        println!("built {} (aot-{}, {} tier, native)", out.display(), which, tier.name());
+                        let (which, kind) = match bk {
+                            aot::Backend::C => ("c", "native"),
+                            aot::Backend::Llvm => ("llvm", "native"),
+                            aot::Backend::Wasm => ("wasm", "wasm32"),
+                        };
+                        let art = if matches!(bk, aot::Backend::Wasm) {
+                            out.with_extension("wasm").display().to_string()
+                        } else { out.display().to_string() };
+                        println!("built {} (aot-{}, {} tier, {})", art, which, tier.name(), kind);
                         return;
+                    }
+                    Ok(None) if matches!(bk, aot::Backend::Wasm) => {
+                        eprintln!("note: program not WASM-able (typed tier only; needs clang+node, verified vs `nova run`); no .wasm emitted");
+                        exit(1);
                     }
                     Ok(None) => eprintln!(
                         "note: program not fully AOT-able (or diverged in verify); using the embedded runtime build"),
@@ -510,6 +522,7 @@ VM FLAGS:
 BUILD FLAGS:
   --aot | --aot=c      pure native binary via the C backend (cc -O2)
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
+  --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
                        (AOT output is verified byte-identical to `nova run`
                         at build time; non-AOT-able programs fall back to the
                         embedded-runtime build automatically)
