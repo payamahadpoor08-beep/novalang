@@ -83,14 +83,15 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 ## Tooling status
 | tool | status |
 |---|---|
-| REPL, `nova run/vm/check/test/doc/fmt`, disasm | Run ✅ |
+| REPL, `nova run/vm/check/test/doc/fmt/obfuscate`, disasm | Run ✅ |
+| **memory safety** — AOT binaries valgrind-clean (0 definite leaks / 0 errors) across boxed + embed tiers | Verified ✅ — `tests/valgrind_smoke.sh` |
 | **daemon mode** (`nova daemon`) — persistent service, `load`/`reload`/`run`/`funcs`/`stats` | Run ✅ |
 | **incremental compilation** — `reload` re-parses and reuses unchanged functions, reporting exactly what changed | Run ✅ |
 | **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | LSP, package manager | Not implemented (design only) |
-| WASM / ARM / 32-bit / mobile targets | Not implemented (design in ROADMAP §4) |
+| WASM / ARM / 32-bit / mobile targets | Not implemented — needs a `wasi-sysroot` (WASM) and `qemu`/cross-libc (ARM) to build+byte-verify, absent from the current env; deferred until a target can be *proven* byte-identical, per the honesty rule (design in ROADMAP §4) |
 
 ## The three real gaps that matter for "AOT/speed"
 1. **AOT native for mixed/array kernels.** `nova build --aot` compiles pure-int
