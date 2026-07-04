@@ -1034,14 +1034,19 @@ guessed. Programs using BigInt promotion, maps, structs, closures, match,
 generators, or async stay on the embed build (still standalone, still
 byte-identical).
 
-Execution tiers on `fib(35)` (same source, same output):
+Execution tiers on `fib(35)` (same source, same output; interpreter is the oracle):
 
 | tier | time | vs interpreter |
 |---|---|---|
-| `nova run` (interpreter) | 9.6 s | 1× |
-| `nova vm --no-jit` (bytecode VM) | 3.9 s | 2.5× |
-| `nova vm` (tiered Cranelift JIT) | 0.068 s | ~140× |
-| `nova build --aot` (C / LLVM native) | **0.030 s** | **~320×** |
+| `nova run` (interpreter) | ~7 s | 1× |
+| `nova vm --no-jit` (bytecode VM) | ~3 s | ~2.5× |
+| `nova vm` (tiered Cranelift JIT) | 0.081 s | ~89× |
+| `nova build --aot` (C / LLVM native) | ~0.03 s | ~230× |
+
+For a neutral cross-language comparison (Nova vs C, C++, Java, Node, TypeScript,
+Lua, Python on fib / sieve / mandelbrot), see `bench/` and run `bash bench/run.sh`.
+On the float-heavy mandelbrot kernel `nova vm` and `nova build --aot` land at
+~65 ms — ahead of Java, Node, Lua and Python, within ~1.3× of C.
 
 ## Standard library, written in Nova (`std/`)
 
