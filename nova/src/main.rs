@@ -146,6 +146,7 @@ fn main() {
                 }
             } else {
                 let t = jit::TieredJit::new(&program, threshold);
+                t.warm_loops(); // compile loop kernels up-front, even if called once
                 let r = bytecode::run_tiered(&compiled, &interp, &t);
                 if flag_present(&args, "--jit-stats") {
                     let names = t.compiled_functions();
@@ -403,6 +404,7 @@ fn run_embedded(src: &str) {
     let result = match bytecode::compile_program(&program) {
         Ok(c) => {
             let t = jit::TieredJit::new(&program, 100);
+            t.warm_loops();
             bytecode::run_tiered(&c, &interp, &t)
         }
         Err(_) => interp.run().map(|_| ()),

@@ -465,6 +465,16 @@ fn binop_pure(op: BinOp) -> bool {
         | BitOr | BitXor | BitAnd | Shl | Shr)
 }
 
+// does this body contain a loop at any nesting depth?
+fn body_has_loop(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::While { .. } | Stmt::ForRange { .. } | Stmt::ForEach { .. } => true,
+        Stmt::If { then, els, .. } =>
+            body_has_loop(then) || els.as_ref().map_or(false, |e| body_has_loop(e)),
+        _ => false,
+    })
+}
+
 // every function name called anywhere in a body
 fn collect_calls(body: &[Stmt]) -> Vec<String> {
     let mut out = Vec::new();
@@ -1168,6 +1178,25 @@ impl<'p> TieredJit<'p> {
 
     pub fn is_eligible(&self, name: &str) -> bool {
         self.eligible.contains(name) || self.feligible.contains(name)
+    }
+
+    // Eagerly compile every eligible function whose body contains a loop, before
+    // execution starts. A loop means the function does real work per call, so a
+    // function called only once from `main` (a compute kernel — a sieve, a
+    // mandelbrot counter) would otherwise never cross the call-count threshold
+    // and would crawl on the interpreter tier. The one-time compile cost is
+    // negligible next to the loop it accelerates; correctness is unchanged
+    // (deopt still guards every path).
+    pub fn warm_loops(&self) {
+        let mut roots: Vec<String> = Vec::new();
+        for item in &self.prog.items {
+            if let Item::Func(f) = item {
+                if self.is_eligible(&f.name) && body_has_loop(&f.body) {
+                    roots.push(f.name.clone());
+                }
+            }
+        }
+        for r in roots { self.compile_closure(&r); }
     }
     pub fn is_compiled(&self, name: &str) -> bool {
         match self.location.borrow().get(name) {
