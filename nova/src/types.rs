@@ -16,7 +16,9 @@ pub enum Ty {
     Str,
     Bool,
     Null,
-    Array,
+    // `Array(elem)` — parametric element type; `elem` is `Unknown` when the
+    // element type isn't statically known (a bare `Array`/`[]`).
+    Array(Box<Ty>),
     Map,
     Struct(String),
     Func,
@@ -24,6 +26,10 @@ pub enum Ty {
 }
 
 impl Ty {
+    // a bare array whose element type is unknown
+    fn arr_unknown() -> Ty { Ty::Array(Box::new(Ty::Unknown)) }
+    fn arr(elem: Ty) -> Ty { Ty::Array(Box::new(elem)) }
+
     fn name(&self) -> String {
         match self {
             Ty::Int => "Int".into(),
@@ -31,7 +37,7 @@ impl Ty {
             Ty::Str => "Str".into(),
             Ty::Bool => "Bool".into(),
             Ty::Null => "Null".into(),
-            Ty::Array => "Array".into(),
+            Ty::Array(e) => if matches!(**e, Ty::Unknown) { "Array".into() } else { format!("[{}]", e.name()) },
             Ty::Map => "Map".into(),
             Ty::Struct(n) => n.clone(),
             Ty::Func => "Func".into(),
@@ -41,12 +47,14 @@ impl Ty {
     fn is_num(&self) -> bool {
         matches!(self, Ty::Int | Ty::Float | Ty::Unknown)
     }
-    // gradual compatibility: Unknown unifies with anything
+    // gradual compatibility: Unknown unifies with anything; arrays are compatible
+    // when their element types are (an unknown element makes it match any array).
     fn compatible(&self, other: &Ty) -> bool {
-        matches!(self, Ty::Unknown)
-            || matches!(other, Ty::Unknown)
-            || self == other
-            || (self.is_num() && other.is_num())
+        match (self, other) {
+            (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+            (Ty::Array(a), Ty::Array(b)) => a.compatible(b),
+            _ => self == other || (self.is_num() && other.is_num()),
+        }
     }
 }
 
@@ -426,8 +434,14 @@ impl Checker {
                 Ty::Str
             }
             Expr::Array(items) => {
-                for it in items { self.infer(it, scope); }
-                Ty::Array
+                let mut elem = Ty::Unknown;
+                let mut seen = false;
+                for it in items {
+                    let t = self.infer(it, scope);
+                    elem = if seen { unify(elem, t) } else { t };
+                    seen = true;
+                }
+                Ty::arr(elem)
             }
             Expr::MapLit(entries) => {
                 for (k, v) in entries { self.infer(k, scope); self.infer(v, scope); }
@@ -442,8 +456,8 @@ impl Checker {
                 let mut s = scope.clone();
                 s.insert(var.clone(), Ty::Unknown);
                 if let Some(c) = cond { self.infer(c, &mut s); }
-                self.infer(body, &mut s);
-                Ty::Array
+                let bt = self.infer(body, &mut s);
+                Ty::arr(bt)
             }
             Expr::Ident(name) => {
                 self.used.insert(name.clone());
@@ -471,15 +485,21 @@ impl Checker {
                 if let Expr::RangeLit { lo, hi, .. } = &**index {
                     if let Some(e) = lo { self.infer(e, scope); }
                     if let Some(e) = hi { self.infer(e, scope); }
-                    return match bt { Ty::Array => Ty::Array, Ty::Str => Ty::Str, _ => Ty::Unknown };
+                    // slicing preserves the collection type (element type kept)
+                    return match bt { Ty::Array(_) => bt, Ty::Str => Ty::Str, _ => Ty::Unknown };
                 }
                 self.infer(index, scope);
-                Ty::Unknown
+                // element access: `xs[i]` on `[T]` yields `T`; on a string yields Str
+                match bt {
+                    Ty::Array(e) => *e,
+                    Ty::Str => Ty::Str,
+                    _ => Ty::Unknown,
+                }
             }
             Expr::RangeLit { lo, hi, .. } => {
                 if let Some(e) = lo { self.infer(e, scope); }
                 if let Some(e) = hi { self.infer(e, scope); }
-                Ty::Array
+                Ty::arr(Ty::Int)
             }
             Expr::StructLit { name, fields } => {
                 if let Some(decl_fields) = self.structs.get(name).cloned() {
@@ -700,7 +720,9 @@ impl Checker {
                     return if *lt == Ty::Float || *rt == Ty::Float { Ty::Float } else { Ty::Int };
                 }
                 if matches!(lt, Ty::Unknown) || matches!(rt, Ty::Unknown) { return Ty::Unknown; }
-                if matches!(lt, Ty::Array) && matches!(rt, Ty::Array) { return Ty::Array; }
+                if let (Ty::Array(a), Ty::Array(b)) = (lt, rt) {
+                    return Ty::arr(unify((**a).clone(), (**b).clone()));
+                }
                 self.err(format!("cannot apply `+` to {} and {}", lt.name(), rt.name()));
                 Ty::Unknown
             }
@@ -1087,13 +1109,19 @@ fn builtin_effect(name: &str) -> Option<&'static str> {
 }
 
 fn ty_from_name(name: &str) -> Option<Ty> {
-    Some(match name {
+    let n = name.trim();
+    // `[Elem]` array type: resolve the element head (Unknown if unrecognised),
+    // so `[Int]` -> Array(Int), `[T]` -> Array(Unknown).
+    if let Some(inner) = n.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return Some(Ty::arr(ty_from_name(inner).unwrap_or(Ty::Unknown)));
+    }
+    Some(match n {
         "Int" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => Ty::Int,
         "Float" | "f32" | "f64" => Ty::Float,
         "Str" | "String" => Ty::Str,
         "Bool" => Ty::Bool,
         "Null" => Ty::Null,
-        "Array" | "List" | "Vec" => Ty::Array,
+        "Array" | "List" | "Vec" => Ty::arr_unknown(),
         "Map" | "Dict" => Ty::Map,
         _ => return None,
     })
@@ -1102,8 +1130,9 @@ fn ty_from_name(name: &str) -> Option<Ty> {
 fn unify(a: Ty, b: Ty) -> Ty {
     if a == b { return a; }
     match (&a, &b) {
-        (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+        (Ty::Array(x), Ty::Array(y)) => Ty::arr(unify((**x).clone(), (**y).clone())),
+        (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
         _ => Ty::Unknown,
     }
 }
@@ -1133,7 +1162,7 @@ fn bind_pattern(p: &Pattern, scope: &mut HashMap<String, Ty>) {
         Pattern::Slice { prefix, rest, suffix } => {
             for x in prefix { bind_pattern(x, scope); }
             for x in suffix { bind_pattern(x, scope); }
-            if let Some(Some(name)) = rest { scope.insert(name.clone(), Ty::Array); }
+            if let Some(Some(name)) = rest { scope.insert(name.clone(), Ty::arr_unknown()); }
         }
         _ => {}
     }
@@ -1221,4 +1250,38 @@ fn builtin_names() -> Vec<&'static str> {
         "to_float", "chr", "ord",
         "exec", "list_dir", "mkdir", "cwd", "chdir", "now_ms", "sleep_ms", "setenv",
     ]
+}
+
+#[cfg(test)]
+mod generics_tests {
+    use super::*;
+    use crate::parser::parse_program;
+
+    fn errors(src: &str) -> Vec<String> {
+        let prog = parse_program(src).expect("parse");
+        Checker::new(&prog).check(&prog).0
+    }
+
+    #[test]
+    fn array_element_param_not_false_flagged() {
+        // `[Int]` param used to resolve to head `Int`, wrongly rejecting an array
+        // argument. Now `[Int]` -> Array(Int), so this is clean.
+        let errs = errors("fn first(xs: [Int]) -> Int { xs[0] }\nfn main(){ print(first([1,2,3])) }");
+        assert!(errs.is_empty(), "no false positive expected, got: {:?}", errs);
+    }
+
+    #[test]
+    fn element_type_flows_through_index() {
+        // element type of `[Str]` is Str; `names[0] * 2` must be a type error.
+        let errs = errors("fn main(){ let names = [\"a\",\"b\"]; let x = names[0] * 2; print(x) }");
+        assert!(errs.iter().any(|e| e.contains("requires numbers") && e.contains("Str")),
+            "element-typed error expected, got: {:?}", errs);
+    }
+
+    #[test]
+    fn homogeneous_array_keeps_element_gradual() {
+        // a mixed/empty array degrades to Unknown element (no false errors).
+        assert!(errors("fn main(){ let xs = []; let y = xs[0] + 1; print(y) }").is_empty());
+        assert!(errors("fn main(){ let xs = [1, 2.0]; print(xs[0]) }").is_empty());
+    }
 }

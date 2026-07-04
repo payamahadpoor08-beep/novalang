@@ -1161,8 +1161,15 @@ fn bound_trait_names(bounds: Pair<Rule>) -> Vec<String> {
 // Reduce a type annotation to its leading identifier ("Int", "Array[Int]" -> "Array",
 // "-> Str" -> "Str"). Good enough for the gradual checker.
 fn type_head(s: &str) -> String {
-    s.trim_start_matches("->").trim()
-        .chars().skip_while(|c| !c.is_alphanumeric() && *c != '_')
+    let t = s.trim_start_matches("->").trim();
+    // array type `[Elem]` — keep the bracketed form (normalised element head) so
+    // the type checker can recover the element type (`[Int]` -> Array(Int)).
+    if let Some(rest) = t.strip_prefix('[') {
+        if let Some(inner) = rest.strip_suffix(']') {
+            return format!("[{}]", type_head(inner));
+        }
+    }
+    t.chars().skip_while(|c| !c.is_alphanumeric() && *c != '_')
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect()
 }
