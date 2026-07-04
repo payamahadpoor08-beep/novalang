@@ -145,3 +145,37 @@ test "digits combinatorics" {
   assert_eq(nCr(5, 2), 10)
   assert_eq(nCr(10, 0), 1)
 }
+
+// --- statistics + extras ---
+
+fn is_even(n) { n % 2 == 0 }
+fn is_odd(n) { n % 2 != 0 }
+
+// integer mean (floor) of a non-empty array
+fn mean_int(xs) {
+  let s = 0
+  for x in xs { s = s + x }
+  s / len(xs)
+}
+
+// (a ** e) mod m, via fast exponentiation (m > 0)
+fn pow_mod(a, e, m) {
+  let r = 1
+  let b = a % m
+  let x = e
+  while x > 0 {
+    if x % 2 == 1 { r = (r * b) % m }
+    b = (b * b) % m
+    x = x / 2
+  }
+  r
+}
+
+test "stats and extras" {
+  assert(is_even(4))
+  assert(is_odd(7))
+  assert_eq(mean_int([1, 2, 3, 4]), 2)
+  assert_eq(mean_int([10, 20, 30]), 20)
+  assert_eq(pow_mod(2, 10, 1000), 24)
+  assert_eq(pow_mod(3, 5, 7), 5)
+}

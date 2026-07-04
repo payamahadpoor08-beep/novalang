@@ -167,3 +167,50 @@ test "levenshtein" {
   assert_eq(levenshtein("", "abc"), 3)
   assert_eq(levenshtein("same", "same"), 0)
 }
+
+// --- extended string ops ---
+
+// number of non-overlapping occurrences of `sub` in `s`
+fn count_str(s, sub) {
+  if len(sub) == 0 { return 0 }
+  let n = 0
+  let i = 0
+  while i <= len(s) - len(sub) {
+    if s[i..i + len(sub)] == sub { n = n + 1 ; i = i + len(sub) }
+    else { i = i + 1 }
+  }
+  n
+}
+
+// remove `prefix` from the front of `s` if present
+fn strip_prefix(s, prefix) {
+  if starts_with(s, prefix) { s[len(prefix)..len(s)] } else { s }
+}
+
+// remove `suffix` from the end of `s` if present
+fn strip_suffix(s, suffix) {
+  if ends_with(s, suffix) { s[0..len(s) - len(suffix)] } else { s }
+}
+
+// uppercase the first character, lowercase the rest
+fn capitalize(s) {
+  if len(s) == 0 { return s }
+  upper(s[0..1]) + lower(s[1..len(s)])
+}
+
+// capitalize each space-separated word
+fn title_case(s) {
+  let out = []
+  for w in split(s, " ") { push(out, capitalize(w)) }
+  join_str(out, " ")
+}
+
+test "extended string ops" {
+  assert_eq(count_str("banana", "an"), 2)
+  assert_eq(count_str("aaaa", "aa"), 2)
+  assert_eq(strip_prefix("unhappy", "un"), "happy")
+  assert_eq(strip_prefix("happy", "un"), "happy")
+  assert_eq(strip_suffix("filename.txt", ".txt"), "filename")
+  assert_eq(capitalize("hELLO"), "Hello")
+  assert_eq(title_case("hello nova world"), "Hello Nova World")
+}
