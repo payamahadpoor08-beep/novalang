@@ -194,6 +194,25 @@ fn collect_attr_values(p: Pair<Rule>, args: &mut Vec<(String, String)>) {
     }
 }
 
+// migrate_decl = { kw_migrate ~ kw_from ~ type_path ~ kw_to ~ type_path ~ block }
+fn lower_migrate(p: Pair<Rule>) -> Result<Item, String> {
+    let mut types: Vec<String> = Vec::new();
+    let mut body: Vec<Stmt> = Vec::new();
+    for part in p.into_inner() {
+        match part.as_rule() {
+            Rule::type_path => types.push(part.as_str().trim().to_string()),
+            Rule::block => {
+                body = lower_block_stmts(part)?;
+                // a trailing bare expression is the produced value (like a fn body)
+                make_trailing_implicit_return(&mut body);
+            }
+            _ => {}
+        }
+    }
+    if types.len() != 2 { return Err("migrate: expected `from <Type> to <Type>`".into()); }
+    Ok(Item::Migration { from: types[0].clone(), to: types[1].clone(), body })
+}
+
 fn lower_item(p: Pair<Rule>) -> Result<Option<Item>, String> {
     let inner = p.into_inner().next().ok_or("empty item")?;
     match inner.as_rule() {
@@ -210,6 +229,7 @@ fn lower_item(p: Pair<Rule>) -> Result<Option<Item>, String> {
         Rule::macro_decl => Ok(Some(Item::Macro(lower_macro_decl(inner)?))),
         Rule::type_decl => lower_type_alias(inner).map(Some),
         Rule::extern_block => lower_extern(inner).map(Some),
+        Rule::migrate_decl => Ok(Some(lower_migrate(inner)?)),
         other => Err(format!("Unsupported top-level item (not yet in Nova Core): {:?}", other)),
     }
 }

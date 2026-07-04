@@ -444,6 +444,10 @@ pub struct Interp {
     history: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
     // `#[anti_tamper]` baseline body hashes recorded at first call.
     tamper_base: RefCell<HashMap<String, i64>>,
+    // state migrations keyed by the source ("from") type name: (to, body).
+    migrations: HashMap<String, (String, Vec<Stmt>)>,
+    // results of `#[comptime]` functions, evaluated once before main.
+    comptime: RefCell<HashMap<String, Value>>,
 }
 
 impl Interp {
@@ -471,6 +475,7 @@ impl Interp {
         let mut extern_funcs: FastSet<String> = FastSet::default();
         let mut generators: FastSet<String> = FastSet::default();
         let mut refinements: HashMap<String, Expr> = HashMap::new();
+        let mut migrations: HashMap<String, (String, Vec<Stmt>)> = HashMap::new();
         // PASS 0: collect trait definitions first, so `impl Trait for Type` can
         // pull in default methods regardless of declaration order.
         for item in &program.items {
@@ -559,6 +564,9 @@ impl Interp {
                     for f in fns { extern_funcs.insert(f.name.clone()); }
                 }
                 Item::Import { .. } => { /* resolved by the module loader pre-execution */ }
+                Item::Migration { from, to, body } => {
+                    migrations.insert(from.clone(), (to.clone(), body.clone()));
+                }
             }
         }
         Ok(Interp {
@@ -579,11 +587,14 @@ impl Interp {
             deprecated_warned: RefCell::new(std::collections::HashSet::new()),
             history: RefCell::new(HashMap::new()),
             tamper_base: RefCell::new(HashMap::new()),
+            migrations,
+            comptime: RefCell::new(HashMap::new()),
         })
     }
 
     // Evaluate all global constants into the consts map (idempotent).
     pub(crate) fn init_consts(&self) -> Result<(), String> {
+        self.init_comptime();
         if !self.consts.borrow().is_empty() || self.const_exprs.is_empty() { return Ok(()); }
         let empty: Scope = Scope::new();
         for (name, expr) in &self.const_exprs {
@@ -591,6 +602,21 @@ impl Interp {
             self.consts.borrow_mut().insert(name.clone(), v);
         }
         Ok(())
+    }
+
+    // Evaluate every no-argument `#[comptime]` function exactly once, before main,
+    // caching its result. Calls then return the precomputed constant — real
+    // compile-time evaluation (e.g. a lookup table built once at startup).
+    fn init_comptime(&self) {
+        if !self.comptime.borrow().is_empty() { return; }
+        for (name, f) in self.funcs.iter() {
+            if f.params.is_empty() && f.attrs.iter().any(|a| a.name == "comptime") {
+                let mut scope = Scope::new();
+                if let Ok(Flow::Return(v)) | Ok(Flow::Break(v)) = self.exec_block(&f.body, &mut scope) {
+                    self.comptime.borrow_mut().insert(name.clone(), v);
+                }
+            }
+        }
     }
 
     // Run all `test "..." { ... }` blocks and report pass/fail. Returns the
@@ -748,6 +774,9 @@ impl Interp {
                     for f in fns { self.extern_funcs.insert(f.name.clone()); }
                 }
                 Item::Import { .. } => { /* resolved by the module loader pre-execution */ }
+                Item::Migration { from, to, body } => {
+                    self.migrations.insert(from.clone(), (to.clone(), body.clone()));
+                }
             }
         }
         Ok(())
@@ -997,6 +1026,13 @@ impl Interp {
                     name, func.params.len(), args.len()
                 ));
             }
+            // `#[comptime]` no-arg functions are const-evaluated once before main;
+            // every call returns the precomputed constant instead of re-running.
+            if args.is_empty() {
+                if let Some(v) = self.comptime.borrow().get(name) {
+                    return Ok(v.clone());
+                }
+            }
             // Functions with behavioural attributes take a slower, explicit path
             // (rare — the common case skips this in one branch). Pure hint/metadata
             // attributes don't change behaviour and use the fast path.
@@ -1062,6 +1098,29 @@ impl Interp {
             // `#[anti_debug]` support: best-effort debugger detection (Linux reads
             // /proc/self/status TracerPid). Honest and documented as best-effort.
             "is_debugged" => return Ok(Value::Bool(detect_debugger())),
+            // State Migration: transform a value of the old struct shape into the
+            // new one using the matching `migrate from Old to New { ... }` block.
+            // The block runs with `old` bound to the value and the old struct's
+            // fields also in scope, and returns the new value.
+            "migrate" => {
+                let val = args.get(0).cloned().ok_or("migrate expects a value")?;
+                let from = match &val {
+                    Value::Struct(s) => s.borrow().type_name.clone(),
+                    other => return Err(format!("migrate expects a struct value, got {}", other.type_name())),
+                };
+                let (_, body) = self.migrations.get(&from)
+                    .ok_or_else(|| format!("no migration defined from `{}`", from))?;
+                let mut scope = Scope::new();
+                if let Value::Struct(s) = &val {
+                    for (k, v) in s.borrow().fields.iter() { scope.insert(k.clone(), v.clone()); }
+                }
+                scope.insert("old".to_string(), val);
+                return match self.exec_block(body, &mut scope)? {
+                    Flow::Return(v) | Flow::Break(v) => Ok(v),
+                    Flow::Normal | Flow::Continue => Ok(Value::Null),
+                    Flow::Throw(e) => { *self.pending_throw.borrow_mut() = Some(e); Err(THROW_SENTINEL.to_string()) }
+                };
+            }
             // metadata attributes (version/since/intent/throws/deps/...): read an
             // attribute's argument value, making all metadata real and queryable.
             "meta_of" => {
@@ -4005,6 +4064,7 @@ pub fn fold_program(p: &mut Program) {
             Item::Trait(t) => { for d in &mut t.defaults { fold_block(&mut d.body); } }
             Item::Test(t) => fold_block(&mut t.body),
             Item::Const { value, .. } => fold_expr(value),
+            Item::Migration { body, .. } => fold_block(body),
             Item::Struct(_) | Item::Enum(_) | Item::Use(_) | Item::Machine(_)
             | Item::Macro(_) | Item::TypeAlias { .. } | Item::Extern(_)
             | Item::Import { .. } => {}
@@ -4287,6 +4347,36 @@ mod attr_tests {
         interp.call("hot_swap", vec![Value::Str("g".into()), clo]).unwrap();
         assert_eq!(format!("{:?}", interp.call("g", vec![Value::Int(10)])),
                    format!("{:?}", Ok::<_,String>(Value::Int(1000))));
+    }
+
+    #[test]
+    fn comptime_evaluates_once_and_caches() {
+        // The body sums 1..=10 into a global-free accumulator; the result (55)
+        // is precomputed at init and returned by every call. `init_consts`
+        // triggers the const-eval; calls then hit the cache.
+        let src = "#[comptime] fn total(){ let mut s = 0; let mut i = 1; while i <= 10 { s = s + i; i = i + 1 } s }\n\
+                   fn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        interp.init_consts().expect("init");
+        assert_eq!(format!("{:?}", interp.call("total", vec![])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(55))));
+        assert_eq!(format!("{:?}", interp.call("total", vec![])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(55))));
+    }
+
+    #[test]
+    fn migrate_transforms_old_struct_to_new() {
+        // migrate binds `old` and the old struct's fields; the body produces the
+        // new-shape value (age bumped, `active` field added and defaulted).
+        let src = "struct A { name: Str, age: Int }\n\
+                   struct B { name: Str, age: Int, active: Bool }\n\
+                   migrate from A to B { B { name: name, age: age + 1, active: true } }\n\
+                   fn main(){ let o = A { name: \"x\", age: 4 }; let n = migrate(o); n.age }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        assert_eq!(format!("{:?}", interp.call("main", vec![])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(5))));
     }
 }
 

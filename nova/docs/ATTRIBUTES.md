@@ -84,6 +84,15 @@ Counts calls; `profile_of("name")` returns the count.
 ### `#[deprecate(...)]` / `#[deprecated]`
 Prints a one-time warning to stderr on first call (with the optional note).
 
+### `#[comptime]`
+Marks a **no-argument** function for compile-time evaluation. Its body is
+evaluated exactly once, before `main` runs, and the result is cached; every call
+to the function returns that precomputed constant instead of re-running the body
+(e.g. build a lookup table or fold a constant once at startup). Because the value
+is computed at init, a `#[comptime]` function must be self-contained — it runs
+before global constants exist, so referencing runtime-only state is an error.
+Interp-only (uniform across tiers). See `tests/corpus/comptime_eval.nova`.
+
 ### Introspection — `attrs_of("name")`
 Returns the array of every attribute name on a function. Because **all** attributes
 are captured (not just the behavioural ones), even attributes whose full behaviour

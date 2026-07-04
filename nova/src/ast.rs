@@ -32,6 +32,11 @@ pub enum Item {
     // `use "path.nova";` — import every item from another Nova file. Resolved and
     // inlined by the module loader before type-checking/execution.
     Import { path: String },
+    // `migrate from Old to New { <body producing a New value> }` — state migration:
+    // transforms a value of the old struct shape into the new one (for preserving
+    // state across a code/schema update). The body runs with `old` bound to the
+    // incoming value; the `migrate(value)` builtin applies the matching migration.
+    Migration { from: String, to: String, body: Vec<Stmt> },
 }
 
 #[derive(Debug, Clone)]

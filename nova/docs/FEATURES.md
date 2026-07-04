@@ -1,4 +1,4 @@
-# Nova — feature reality audit (v3.27)
+# Nova — feature reality audit (v3.28)
 
 An honest, source-verified answer to "which grammar features are actually
 implemented, and which only parse?" Status is derived from the code, not the
@@ -60,6 +60,7 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 | `#[anti_debug]` + `is_debugged()` | Run — best-effort Linux TracerPid debugger detection |
 | `#[anti_tamper]` | Run — verifies the function body hash hasn't changed since first call |
 | `#[hot]` / `#[cold]` | Run — `hot` warms the JIT up-front, `cold` prevents warming |
+| `#[comptime]` (no-arg fn) | Run — const-evaluated once before `main`; every call returns the cached value |
 | metadata (`#[version]`, `#[since]`, `#[throws]`, `#[intent]`, `#[deps]`, …) + `meta_of(name,key)` | Run — captured + queryable |
 | **any attribute** + `attrs_of(name)` | Run — all attributes captured + introspectable |
 
@@ -70,7 +71,6 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | `stream[T]` | Parse only (no streaming runtime) |
 | Higher-Kinded Types `[T[_]]` | Parse only (checker erases to Unknown) |
 | associated types (`type Item;` in traits) | Parse only |
-| `comptime` | Parse only (no compile-time evaluation) |
 | effect polymorphism `![E]` | Parse only (monomorphic effects only) |
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
 | remaining meta attributes — `#[simd]`, `#[encrypt]`, `#[obfuscate]`, `#[time_travel]`, `#[anti_debug]`, `#[anti_tamper]`, `#[polymorph]` | **Parse only — no-ops.** Being implemented in ROADMAP Phase 2. |
@@ -86,7 +86,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **incremental compilation** — `reload` re-parses and reuses unchanged functions, reporting exactly what changed | Run ✅ |
 | **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
-| state migration (`migrate from Old to New`), LSP, package manager | Not implemented (design only) |
+| **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
+| LSP, package manager | Not implemented (design only) |
 | WASM / ARM / 32-bit / mobile targets | Not implemented (design in ROADMAP §4) |
 
 ## The three real gaps that matter for "AOT/speed"
@@ -109,7 +110,9 @@ parse می‌شوند. هسته‌ی زبان (struct/enum/match/closure/async/c
 refinement/effect-check/move-check/macro/generic-با-bound/JIT/AOT) واقعاً پیاده و
 اجرا می‌شود. اما تمام attrهای «امنیتی/پیشرفته» (`#[simd]`، `#[encrypt]`،
 `#[self_healing]` و...) فقط parse می‌شوند و **هیچ کاری نمی‌کنند** — no-op. همچنین
-HKT، union، associated types، comptime، stream، daemon/LSP/package-manager و
+اکنون `#[comptime]` (ارزیابی زمان‌کامپایل، یک‌بار پیش از main) و state migration
+(`migrate from Old to New`) هم واقعاً کار می‌کنند و byte-identical در همه‌ی tierها هستند.
+اما HKT، union، associated types، stream، LSP/package-manager و
 WASM/ARM هنوز پیاده نشده‌اند. AOT برای کرنل‌های mixed/array فعلاً native نمی‌سازد و
 به embed برمی‌گردد (با سرعت JIT اجرا می‌شود ولی باینری مستقل native نیست) — این
 گام بعدی واقعی است.

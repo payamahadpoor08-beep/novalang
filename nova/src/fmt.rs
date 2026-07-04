@@ -127,6 +127,13 @@ impl Fmt {
                 self.line("}");
             }
             Item::Macro(_) => { /* macros are expanded at parse time; nothing to print */ }
+            Item::Migration { from, to, body } => {
+                self.line(&format!("migrate from {} to {} {{", from, to));
+                self.depth += 1;
+                for s in body { self.stmt(s); }
+                self.depth -= 1;
+                self.line("}");
+            }
         }
     }
 
