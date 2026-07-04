@@ -353,7 +353,7 @@ pub fn float_eligible_set(prog: &Program, int_set: &HashSet<String>) -> HashSet<
 // exact i64->f64 convert — but Int∘Int arithmetic must stay off this track
 // (integer division/remainder truncate; overflow promotes to BigInt).
 #[derive(Clone, Copy, PartialEq)]
-enum FKind { F, I }
+pub enum FKind { F, I }
 
 struct FloatCheck { kinds: HashMap<String, FKind> }
 
@@ -453,6 +453,157 @@ impl FloatCheck {
                     _ => false,
                 }
             }
+            _ => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified numeric track (Phase 11). Handles functions that mix i64 and f64 —
+// the shape the two scalar tracks each reject: integer loop counters and
+// accumulators driving float math, with an int OR float result (e.g. a
+// mandelbrot escape-counter). All parameters are integers (the defining trait:
+// these are kernels driven by integer dimensions/counts), so the VM dispatches
+// them exactly like the i64 track — all-Int args, deopt-guarded — and reads the
+// result back as Int or Float per the function's return kind. Everything the
+// pure i64/f64 tracks already claim is left to them; this only adds coverage.
+// ---------------------------------------------------------------------------
+
+// A function is numeric-eligible iff it is neither i64- nor f64-eligible, all
+// its params behave as integers, every statement/expression type-checks under
+// NumCheck (int∘int allowed — it deopts on overflow like the i64 track — plus
+// float and mixed math, to_float/to_int, and calls to other numeric functions),
+// and it always returns a definite kind. The returned map also records each
+// function's result kind (I or F).
+pub fn numeric_eligible_set(prog: &Program, int_set: &HashSet<String>, float_set: &HashSet<String>)
+    -> (HashSet<String>, HashMap<String, FKind>)
+{
+    let mut funcs: HashMap<&str, &Func> = HashMap::new();
+    for item in &prog.items {
+        if let Item::Func(f) = item { funcs.insert(&f.name, f); }
+    }
+    let mut rets: HashMap<String, FKind> = HashMap::new();
+    let mut set: HashSet<String> = funcs.values()
+        .filter(|f| f.params.len() <= MAX_ARITY
+            && !int_set.contains(&f.name) && !float_set.contains(&f.name))
+        .filter_map(|f| NumCheck::check_fn(f).map(|rk| { rets.insert(f.name.clone(), rk); f.name.clone() }))
+        .collect();
+    // fixpoint: drop any function calling a name outside the numeric set (calls
+    // to i64/f64 functions are not allowed here — the ABI/kinds differ)
+    loop {
+        let mut remove = None;
+        for name in &set {
+            let f = funcs[name.as_str()];
+            if collect_calls(&f.body).iter().any(|c| !set.contains(c) && !is_num_intrinsic(c)) {
+                remove = Some(name.clone());
+                break;
+            }
+        }
+        match remove { Some(n) => { set.remove(&n); rets.remove(&n); } None => break }
+    }
+    (set, rets)
+}
+
+fn is_num_intrinsic(name: &str) -> bool { matches!(name, "to_float" | "to_int") }
+
+// Type-checker for the numeric track: like FloatCheck but int∘int is allowed
+// (kind I, deopts on overflow) and the return may be I or F.
+struct NumCheck { kinds: HashMap<String, FKind> }
+
+impl NumCheck {
+    // returns the function's result kind if it is numeric-eligible
+    fn check_fn(f: &Func) -> Option<FKind> {
+        let mut c = NumCheck { kinds: HashMap::new() };
+        for p in &f.params { c.kinds.insert(p.clone(), FKind::I); } // all params are ints
+        if f.body.is_empty() || !always_returns(&f.body) { return None; }
+        let mut ret: Option<FKind> = None;
+        if !c.stmts(&f.body, &mut ret) { return None; }
+        ret
+    }
+
+    fn stmts(&mut self, body: &[Stmt], ret: &mut Option<FKind>) -> bool {
+        body.iter().all(|s| self.stmt(s, ret))
+    }
+
+    fn bind(&mut self, name: &str, k: FKind) -> bool {
+        match self.kinds.get(name) {
+            Some(prev) => *prev == k,
+            None => { self.kinds.insert(name.to_string(), k); true }
+        }
+    }
+
+    fn set_ret(ret: &mut Option<FKind>, k: FKind) -> bool {
+        match ret { Some(prev) => *prev == k, None => { *ret = Some(k); true } }
+    }
+
+    fn stmt(&mut self, s: &Stmt, ret: &mut Option<FKind>) -> bool {
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } =>
+                match self.expr(value) { Some(k) => self.bind(name, k), None => false },
+            Stmt::Expr(e) => self.expr(e).is_some(),
+            Stmt::Return(Some(e)) => match self.expr(e) { Some(k) => Self::set_ret(ret, k), None => false },
+            Stmt::If { cond, then, els } =>
+                self.cond(cond) && self.stmts(then, ret)
+                && els.as_ref().map_or(true, |e| self.stmts(e, ret)),
+            Stmt::While { cond, body } => self.cond(cond) && self.stmts(body, ret),
+            Stmt::ForRange { var, start, end, body, .. } =>
+                self.expr(start) == Some(FKind::I) && self.expr(end) == Some(FKind::I)
+                && self.bind(var, FKind::I) && self.stmts(body, ret),
+            Stmt::Break(None) | Stmt::Continue => true,
+            _ => false,
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) -> Option<FKind> {
+        match e {
+            Expr::At { expr, .. } => self.expr(expr),
+            Expr::Float(_) => Some(FKind::F),
+            Expr::Int(_) => Some(FKind::I),
+            Expr::Ident(n) => self.kinds.get(n).copied(),
+            Expr::Unary { op: UnOp::Neg, expr } => self.expr(expr), // I or F
+            Expr::Binary { op, lhs, rhs }
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                                | BinOp::Rem | BinOp::Pow) =>
+            {
+                let l = self.expr(lhs)?;
+                let r = self.expr(rhs)?;
+                // int∘int stays I (deopts on overflow); any float ⇒ F
+                if l == FKind::I && r == FKind::I { Some(FKind::I) } else { Some(FKind::F) }
+            }
+            Expr::If { cond, then, els } => {
+                if !self.cond(cond) { return None; }
+                let t = self.expr(then)?;
+                let e2 = self.expr(els)?;
+                if t == e2 { Some(t) } else { None }
+            }
+            Expr::Block { stmts, tail } => {
+                let mut dummy = None;
+                if !self.stmts(stmts, &mut dummy) { return None; }
+                self.expr(tail.as_ref()?)
+            }
+            Expr::Call { callee, args } => {
+                if callee == "to_float" && args.len() == 1 {
+                    return if self.expr(&args[0]).is_some() { Some(FKind::F) } else { None };
+                }
+                if callee == "to_int" && args.len() == 1 {
+                    // to_int only accepts a Float here (int→int is a no-op we skip)
+                    return if self.expr(&args[0]) == Some(FKind::F) { Some(FKind::I) } else { None };
+                }
+                None // user numeric-fn calls handled by the fixpoint; kinds unknown here → reject for now
+            }
+            _ => None,
+        }
+    }
+
+    fn cond(&mut self, e: &Expr) -> bool {
+        match e {
+            Expr::At { expr, .. } => self.cond(expr),
+            Expr::Unary { op: UnOp::Not, expr } => self.cond(expr),
+            Expr::Binary { op: BinOp::And | BinOp::Or, lhs, rhs } => self.cond(lhs) && self.cond(rhs),
+            Expr::Binary { op, lhs, rhs }
+                if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                                | BinOp::Eq | BinOp::Ne) =>
+                self.expr(lhs).is_some() && self.expr(rhs).is_some(),
             _ => false,
         }
     }
@@ -589,6 +740,10 @@ pub struct Jit {
     code: HashMap<String, (*const u8, usize)>,
     // name -> (entry pointer, arity); f64 track (disjoint names)
     fcode: HashMap<String, (*const u8, usize)>,
+    // name -> (entry pointer, arity); numeric mixed-int/float track (i64 ABI)
+    ncode: HashMap<String, (*const u8, usize)>,
+    // numeric functions' result kind (F ⇒ the i64 result is f64 bits)
+    nret: HashMap<String, FKind>,
     // human-readable Cranelift IR per function, for `nova jit --dump`
     ir: HashMap<String, String>,
 }
@@ -603,12 +758,15 @@ impl Jit {
     // target is available). `None` compiles the whole eligible set.
     pub fn compile_filtered(prog: &Program, only: Option<&HashSet<String>>) -> Option<Jit> {
         let mut eligible = eligible_set(prog);
-        let mut feligible = float_eligible_set(prog, &eligible_set(prog));
+        let mut feligible = float_eligible_set(prog, &eligible);
+        let (mut numeric, mut nret) = numeric_eligible_set(prog, &eligible, &feligible);
         if let Some(filter) = only {
             eligible.retain(|n| filter.contains(n));
             feligible.retain(|n| filter.contains(n));
+            numeric.retain(|n| filter.contains(n));
+            nret.retain(|n, _| filter.contains(n));
         }
-        if eligible.is_empty() && feligible.is_empty() { return None; }
+        if eligible.is_empty() && feligible.is_empty() && numeric.is_empty() { return None; }
         let mut funcs: HashMap<&str, &Func> = HashMap::new();
         for item in &prog.items {
             if let Item::Func(f) = item { funcs.insert(&f.name, f); }
@@ -722,6 +880,38 @@ impl Jit {
             module.clear_context(&mut ctx);
         }
 
+        // 4) the numeric (mixed int/float) track: same all-i64 ABI as track 1
+        //    (deopt_ptr + i64 args → i64 bits), defined via NumGen.
+        let mut nnames: Vec<&str> = numeric.iter().map(|s| s.as_str()).collect();
+        nnames.sort();
+        let mut nids: HashMap<String, (FuncId, usize)> = HashMap::new();
+        for name in &nnames {
+            let f = funcs[*name];
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64)); // deopt flag pointer
+            for _ in 0..f.params.len() { sig.params.push(AbiParam::new(I64)); }
+            sig.returns.push(AbiParam::new(I64));
+            let id = module.declare_function(name, Linkage::Export, &sig).ok()?;
+            nids.insert(name.to_string(), (id, f.params.len()));
+        }
+        for name in &nnames {
+            let f = funcs[*name];
+            let (id, _) = nids[*name];
+            let rk = nret[*name];
+            ctx.func.signature.params.push(AbiParam::new(I64));
+            for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
+            ctx.func.signature.returns.push(AbiParam::new(I64));
+            {
+                let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let mut g = NumGen::new(&mut b, &mut module, &libm, &f.params, rk);
+                g.lower(&f.body)?;
+                b.finalize();
+            }
+            ir.insert(name.to_string(), format!("{}", ctx.func));
+            module.define_function(id, &mut ctx).ok()?;
+            module.clear_context(&mut ctx);
+        }
+
         module.finalize_definitions().ok()?;
         let mut code = HashMap::new();
         for (name, (id, arity)) in &ids {
@@ -731,14 +921,21 @@ impl Jit {
         for (name, (id, arity)) in &fids {
             fcode.insert(name.clone(), (module.get_finalized_function(*id), *arity));
         }
-        Some(Jit { _module: module, code, fcode, ir })
+        let mut ncode = HashMap::new();
+        for (name, (id, arity)) in &nids {
+            ncode.insert(name.clone(), (module.get_finalized_function(*id), *arity));
+        }
+        Some(Jit { _module: module, code, fcode, ncode, nret, ir })
     }
 
     pub fn is_compiled(&self, name: &str) -> bool { self.code.contains_key(name) }
     pub fn is_compiled_f64(&self, name: &str) -> bool { self.fcode.contains_key(name) }
+    pub fn is_compiled_num(&self, name: &str) -> bool { self.ncode.contains_key(name) }
+    // is the numeric function's result a float (returned as raw bits)?
+    pub fn num_ret_is_float(&self, name: &str) -> bool { self.nret.get(name) == Some(&FKind::F) }
     // any track — used by tiering to record what a batch produced
     pub fn has(&self, name: &str) -> bool {
-        self.code.contains_key(name) || self.fcode.contains_key(name)
+        self.code.contains_key(name) || self.fcode.contains_key(name) || self.ncode.contains_key(name)
     }
 
     pub fn dump(&self) -> String {
@@ -756,6 +953,17 @@ impl Jit {
     // the call on the VM.
     pub fn raw_call(&self, name: &str, args: &[i64]) -> (i64, bool) {
         let (ptr, arity) = self.code[name];
+        Self::call_i64_abi(ptr, arity, args)
+    }
+
+    // The numeric track shares the i64 ABI; the raw i64 result is either an
+    // integer or f64 bits (the caller reinterprets via `num_ret_is_float`).
+    pub fn raw_call_num(&self, name: &str, args: &[i64]) -> (i64, bool) {
+        let (ptr, arity) = self.ncode[name];
+        Self::call_i64_abi(ptr, arity, args)
+    }
+
+    fn call_i64_abi(ptr: *const u8, arity: usize, args: &[i64]) -> (i64, bool) {
         let mut d: i64 = 0;
         let dp = &mut d as *mut i64;
         // ABI: extern "C" fn(deopt_ptr, a0, a1, ...) -> i64
@@ -1132,6 +1340,396 @@ impl<'a, 'b> FloatGen<'a, 'b> {
 }
 
 // ---------------------------------------------------------------------------
+// Numeric (mixed int/float) code generation. Same all-i64 ABI as the i64 track
+// (deopt_ptr + i64 args → i64), so it reuses `raw_call`. All params are ints;
+// f64 results are returned as raw bits (the VM reinterprets by the function's
+// recorded return kind). Int ops deopt on overflow exactly like the i64 track;
+// float and mixed ops mirror the interpreter's `as_f` promotion bit-for-bit.
+// ---------------------------------------------------------------------------
+
+struct NumGen<'a, 'b> {
+    b: &'a mut FunctionBuilder<'b>,
+    module: &'a mut JITModule,
+    libm: &'a HashMap<&'static str, FuncId>,
+    vars: HashMap<String, (Variable, FKind)>,
+    n_vars: usize,
+    deopt_ptr: Value,
+    deopt_block: Block,
+    loops: Vec<LoopCtx>,
+    returned: bool,
+    ret_kind: FKind,
+}
+
+impl<'a, 'b> NumGen<'a, 'b> {
+    fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut JITModule,
+           libm: &'a HashMap<&'static str, FuncId>, params: &[String], ret_kind: FKind) -> Self {
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let deopt_ptr = b.block_params(entry)[0];
+        let param_vals: Vec<Value> = b.block_params(entry)[1..].to_vec();
+        let deopt_block = b.create_block();
+        let mut g = NumGen {
+            b, module, libm, vars: HashMap::new(), n_vars: 0,
+            deopt_ptr, deopt_block, loops: Vec::new(), returned: false, ret_kind,
+        };
+        for (i, p) in params.iter().enumerate() {
+            let v = g.declare(p, FKind::I); // all params are ints
+            g.b.def_var(v, param_vals[i]);
+        }
+        g
+    }
+
+    fn declare(&mut self, name: &str, kind: FKind) -> Variable {
+        if let Some((v, _)) = self.vars.get(name) { return *v; }
+        let v = Variable::new(self.n_vars);
+        self.n_vars += 1;
+        self.b.declare_var(v, if kind == FKind::F { types::F64 } else { I64 });
+        self.vars.insert(name.to_string(), (v, kind));
+        v
+    }
+    fn fresh(&mut self) -> Variable {
+        let v = Variable::new(self.n_vars); self.n_vars += 1;
+        self.b.declare_var(v, I64); v
+    }
+    fn to_f(&mut self, v: Value, k: FKind) -> Value {
+        match k { FKind::F => v, FKind::I => self.b.ins().fcvt_from_sint(types::F64, v) }
+    }
+    fn guard_deopt(&mut self, cond: Value) {
+        let cont = self.b.create_block();
+        self.b.ins().brif(cond, self.deopt_block, &[], cont, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+
+    fn lower(&mut self, body: &[Stmt]) -> Option<()> {
+        for s in body { self.stmt(s)?; }
+        if !self.returned {
+            let z = self.b.ins().iconst(I64, 0);
+            self.b.ins().return_(&[z]);
+        }
+        self.b.switch_to_block(self.deopt_block);
+        self.b.seal_block(self.deopt_block);
+        let one = self.b.ins().iconst(I64, 1);
+        self.b.ins().store(MemFlags::trusted(), one, self.deopt_ptr, 0);
+        let z = self.b.ins().iconst(I64, 0);
+        self.b.ins().return_(&[z]);
+        Some(())
+    }
+
+    // convert a produced value to the raw i64 the ABI returns
+    fn to_ret_bits(&mut self, v: Value, k: FKind) -> Value {
+        match self.ret_kind {
+            FKind::I => v, // NumCheck guarantees k == I here
+            FKind::F => { let f = self.to_f(v, k); self.b.ins().bitcast(I64, MemFlags::new(), f) }
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        if self.returned { return Some(()); }
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                let (v, k) = self.expr(value)?;
+                let var = self.declare(name, k);
+                self.b.def_var(var, v);
+            }
+            Stmt::Expr(e) => { self.expr(e)?; }
+            Stmt::Return(Some(e)) => {
+                let (v, k) = self.expr(e)?;
+                let bits = self.to_ret_bits(v, k);
+                self.b.ins().return_(&[bits]);
+                self.returned = true;
+            }
+            Stmt::If { cond, then, els } => {
+                let c = self.cond(cond)?;
+                let (tb, eb, mb) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().brif(c, tb, &[], eb, &[]);
+                self.b.switch_to_block(tb); self.b.seal_block(tb); self.returned = false;
+                for s in then { self.stmt(s)?; }
+                if !self.returned { self.b.ins().jump(mb, &[]); }
+                self.b.switch_to_block(eb); self.b.seal_block(eb); self.returned = false;
+                if let Some(els) = els { for s in els { self.stmt(s)?; } }
+                if !self.returned { self.b.ins().jump(mb, &[]); }
+                self.b.switch_to_block(mb); self.b.seal_block(mb); self.returned = false;
+            }
+            Stmt::While { cond, body } => {
+                let (h, bb, ex) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().jump(h, &[]);
+                self.b.switch_to_block(h);
+                let c = self.cond(cond)?;
+                self.b.ins().brif(c, bb, &[], ex, &[]);
+                self.b.switch_to_block(bb); self.b.seal_block(bb);
+                self.loops.push(LoopCtx { header: h, exit: ex }); self.returned = false;
+                for s in body { self.stmt(s)?; }
+                if !self.returned { self.b.ins().jump(h, &[]); }
+                self.loops.pop();
+                self.b.seal_block(h);
+                self.b.switch_to_block(ex); self.b.seal_block(ex); self.returned = false;
+            }
+            Stmt::ForRange { var, start, end, inclusive, body } => {
+                let (s0, sk) = self.expr(start)?; if sk != FKind::I { return None; }
+                let (e0, ek) = self.expr(end)?; if ek != FKind::I { return None; }
+                let iv = self.declare(var, FKind::I); self.b.def_var(iv, s0);
+                let lim = self.fresh(); self.b.def_var(lim, e0);
+                let (h, bb, ex) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().jump(h, &[]);
+                self.b.switch_to_block(h);
+                let i = self.b.use_var(iv); let l = self.b.use_var(lim);
+                let cc = if *inclusive { IntCC::SignedLessThanOrEqual } else { IntCC::SignedLessThan };
+                let c = self.b.ins().icmp(cc, i, l);
+                self.b.ins().brif(c, bb, &[], ex, &[]);
+                self.b.switch_to_block(bb); self.b.seal_block(bb);
+                self.loops.push(LoopCtx { header: h, exit: ex }); self.returned = false;
+                for s in body { self.stmt(s)?; }
+                if !self.returned {
+                    let i = self.b.use_var(iv);
+                    let n = self.b.ins().iadd_imm(i, 1);
+                    self.b.def_var(iv, n);
+                    self.b.ins().jump(h, &[]);
+                }
+                self.loops.pop();
+                self.b.seal_block(h);
+                self.b.switch_to_block(ex); self.b.seal_block(ex); self.returned = false;
+            }
+            Stmt::Break(None) => { let ex = self.loops.last()?.exit; self.b.ins().jump(ex, &[]); self.returned = true; }
+            Stmt::Continue => { let h = self.loops.last()?.header; self.b.ins().jump(h, &[]); self.returned = true; }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    // condition → i64 0/1. Both-int comparisons are exact (icmp), matching the
+    // interpreter's Int fast path; any float operand compares via as_f (fcmp).
+    fn cond(&mut self, e: &Expr) -> Option<Value> {
+        match e {
+            Expr::At { expr, .. } => self.cond(expr),
+            Expr::Unary { op: UnOp::Not, expr } => {
+                let v = self.cond(expr)?;
+                let one = self.b.ins().iconst(I64, 1);
+                Some(self.b.ins().bxor(v, one))
+            }
+            Expr::Binary { op: op @ (BinOp::And | BinOp::Or), lhs, rhs } => {
+                let a = self.cond(lhs)?;
+                let (tb, eb, mb) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.append_block_param(mb, I64);
+                self.b.ins().brif(a, tb, &[], eb, &[]);
+                self.b.switch_to_block(tb); self.b.seal_block(tb);
+                if matches!(op, BinOp::And) { let v = self.cond(rhs)?; self.b.ins().jump(mb, &[v]); }
+                else { let o = self.b.ins().iconst(I64, 1); self.b.ins().jump(mb, &[o]); }
+                self.b.switch_to_block(eb); self.b.seal_block(eb);
+                if matches!(op, BinOp::And) { let z = self.b.ins().iconst(I64, 0); self.b.ins().jump(mb, &[z]); }
+                else { let v = self.cond(rhs)?; self.b.ins().jump(mb, &[v]); }
+                self.b.switch_to_block(mb); self.b.seal_block(mb);
+                Some(self.b.block_params(mb)[0])
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let (a, ak) = self.expr(lhs)?;
+                let (bv, bk) = self.expr(rhs)?;
+                let c = if ak == FKind::I && bk == FKind::I {
+                    let cc = match op {
+                        BinOp::Eq => IntCC::Equal, BinOp::Ne => IntCC::NotEqual,
+                        BinOp::Lt => IntCC::SignedLessThan, BinOp::Le => IntCC::SignedLessThanOrEqual,
+                        BinOp::Gt => IntCC::SignedGreaterThan, BinOp::Ge => IntCC::SignedGreaterThanOrEqual,
+                        _ => return None,
+                    };
+                    self.b.ins().icmp(cc, a, bv)
+                } else {
+                    let a = self.to_f(a, ak); let bv = self.to_f(bv, bk);
+                    let cc = match op {
+                        BinOp::Eq => FloatCC::Equal, BinOp::Ne => FloatCC::NotEqual,
+                        BinOp::Lt => FloatCC::LessThan, BinOp::Le => FloatCC::LessThanOrEqual,
+                        BinOp::Gt => FloatCC::GreaterThan, BinOp::Ge => FloatCC::GreaterThanOrEqual,
+                        _ => return None,
+                    };
+                    self.b.ins().fcmp(cc, a, bv)
+                };
+                Some(self.b.ins().uextend(I64, c))
+            }
+            _ => None,
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) -> Option<(Value, FKind)> {
+        match e {
+            Expr::At { expr, .. } => self.expr(expr),
+            Expr::Float(x) => Some((self.b.ins().f64const(*x), FKind::F)),
+            Expr::Int(n) => Some((self.b.ins().iconst(I64, *n), FKind::I)),
+            Expr::Ident(name) => { let (v, k) = *self.vars.get(name)?; Some((self.b.use_var(v), k)) }
+            Expr::Unary { op: UnOp::Neg, expr } => {
+                let (v, k) = self.expr(expr)?;
+                match k {
+                    FKind::F => Some((self.b.ins().fneg(v), FKind::F)),
+                    FKind::I => {
+                        let min = self.b.ins().iconst(I64, i64::MIN);
+                        let bad = self.b.ins().icmp(IntCC::Equal, v, min);
+                        let bad = self.b.ins().uextend(I64, bad);
+                        self.guard_deopt(bad);
+                        Some((self.b.ins().ineg(v), FKind::I))
+                    }
+                }
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let (a, ak) = self.expr(lhs)?;
+                let (bv, bk) = self.expr(rhs)?;
+                if ak == FKind::I && bk == FKind::I {
+                    Some((self.int_binop(*op, a, bv)?, FKind::I))
+                } else {
+                    let a = self.to_f(a, ak); let bv = self.to_f(bv, bk);
+                    let v = match op {
+                        BinOp::Add => self.b.ins().fadd(a, bv),
+                        BinOp::Sub => self.b.ins().fsub(a, bv),
+                        BinOp::Mul => self.b.ins().fmul(a, bv),
+                        BinOp::Div => self.b.ins().fdiv(a, bv),
+                        BinOp::Rem => self.libcall("fmod", a, bv)?,
+                        BinOp::Pow => self.libcall("fpow", a, bv)?,
+                        _ => return None,
+                    };
+                    Some((v, FKind::F))
+                }
+            }
+            Expr::Call { callee, args } => {
+                if callee == "to_float" && args.len() == 1 {
+                    let (v, k) = self.expr(&args[0])?;
+                    return Some((self.to_f(v, k), FKind::F));
+                }
+                if callee == "to_int" && args.len() == 1 {
+                    let (v, k) = self.expr(&args[0])?;
+                    if k != FKind::F { return None; }
+                    // truncation toward zero, saturating — matches Rust `f64 as i64`
+                    return Some((self.b.ins().fcvt_to_sint_sat(I64, v), FKind::I));
+                }
+                None
+            }
+            Expr::If { cond, then, els } => {
+                let c = self.cond(cond)?;
+                let (tb, eb, mb) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                // evaluate a probe of the then-branch kind by structure is hard; both
+                // arms must share a kind (NumCheck guarantees it) — assume via then
+                let (tv, tk);
+                self.b.append_block_param(mb, I64); // carry as bits; reinterpret after
+                self.b.ins().brif(c, tb, &[], eb, &[]);
+                self.b.switch_to_block(tb); self.b.seal_block(tb);
+                let (v, k) = self.expr(then)?; tk = k;
+                let tvb = match k { FKind::I => v, FKind::F => self.b.ins().bitcast(I64, MemFlags::new(), v) };
+                tv = tvb; let _ = tv;
+                self.b.ins().jump(mb, &[tvb]);
+                self.b.switch_to_block(eb); self.b.seal_block(eb);
+                let (ev, ek) = self.expr(els)?;
+                if ek != tk { return None; }
+                let evb = match ek { FKind::I => ev, FKind::F => self.b.ins().bitcast(I64, MemFlags::new(), ev) };
+                self.b.ins().jump(mb, &[evb]);
+                self.b.switch_to_block(mb); self.b.seal_block(mb);
+                let raw = self.b.block_params(mb)[0];
+                let out = match tk { FKind::I => raw, FKind::F => self.b.ins().bitcast(types::F64, MemFlags::new(), raw) };
+                Some((out, tk))
+            }
+            Expr::Block { stmts, tail } => {
+                for s in stmts { self.stmt(s)?; }
+                self.expr(tail.as_ref()?)
+            }
+            _ => None,
+        }
+    }
+
+    // integer binary op with overflow/zero deopt guards — identical to the i64
+    // track, so a deopt re-run on the VM is observationally the same.
+    fn int_binop(&mut self, op: BinOp, a: Value, b: Value) -> Option<Value> {
+        use BinOp::*;
+        Some(match op {
+            Add => self.add_ovf(a, b),
+            Sub => self.sub_ovf(a, b),
+            Mul => self.mul_ovf(a, b),
+            Div | Rem => {
+                let z = self.b.ins().iconst(I64, 0);
+                let iz = self.b.ins().icmp(IntCC::Equal, b, z);
+                let iz = self.b.ins().uextend(I64, iz);
+                self.guard_deopt(iz);
+                let min = self.b.ins().iconst(I64, i64::MIN);
+                let n1 = self.b.ins().iconst(I64, -1);
+                let am = self.b.ins().icmp(IntCC::Equal, a, min);
+                let bn = self.b.ins().icmp(IntCC::Equal, b, n1);
+                let both = self.b.ins().band(am, bn);
+                let both = self.b.ins().uextend(I64, both);
+                self.guard_deopt(both);
+                if matches!(op, Div) { self.b.ins().sdiv(a, b) } else { self.b.ins().srem(a, b) }
+            }
+            Pow => return self.pow_ovf(a, b),
+            _ => return None,
+        })
+    }
+    fn add_ovf(&mut self, a: Value, b: Value) -> Value {
+        let r = self.b.ins().iadd(a, b);
+        let t1 = self.b.ins().bxor(a, r); let t2 = self.b.ins().bxor(b, r);
+        let t3 = self.b.ins().band(t1, t2);
+        let z = self.b.ins().iconst(I64, 0);
+        let o = self.b.ins().icmp(IntCC::SignedLessThan, t3, z);
+        let o = self.b.ins().uextend(I64, o); self.guard_deopt(o); r
+    }
+    fn sub_ovf(&mut self, a: Value, b: Value) -> Value {
+        let r = self.b.ins().isub(a, b);
+        let t1 = self.b.ins().bxor(a, b); let t2 = self.b.ins().bxor(a, r);
+        let t3 = self.b.ins().band(t1, t2);
+        let z = self.b.ins().iconst(I64, 0);
+        let o = self.b.ins().icmp(IntCC::SignedLessThan, t3, z);
+        let o = self.b.ins().uextend(I64, o); self.guard_deopt(o); r
+    }
+    fn mul_ovf(&mut self, a: Value, b: Value) -> Value {
+        let a128 = self.b.ins().sextend(I128, a); let b128 = self.b.ins().sextend(I128, b);
+        let m = self.b.ins().imul(a128, b128);
+        let m64 = self.b.ins().ireduce(I64, m);
+        let back = self.b.ins().sextend(I128, m64);
+        let ok = self.b.ins().icmp(IntCC::Equal, m, back);
+        let bad = self.b.ins().bnot(ok);
+        let one = self.b.ins().iconst(I64, 1);
+        let bad = self.b.ins().uextend(I64, bad);
+        let bad = self.b.ins().band(bad, one);
+        self.guard_deopt(bad); m64
+    }
+    fn pow_ovf(&mut self, base0: Value, exp0: Value) -> Option<Value> {
+        let z = self.b.ins().iconst(I64, 0);
+        let neg = self.b.ins().icmp(IntCC::SignedLessThan, exp0, z);
+        let neg = self.b.ins().uextend(I64, neg); self.guard_deopt(neg);
+        let umax = self.b.ins().iconst(I64, u32::MAX as i64);
+        let big = self.b.ins().icmp(IntCC::SignedGreaterThan, exp0, umax);
+        let big = self.b.ins().uextend(I64, big); self.guard_deopt(big);
+        let acc = self.fresh(); let base = self.fresh(); let exp = self.fresh();
+        let one = self.b.ins().iconst(I64, 1);
+        self.b.def_var(acc, one); self.b.def_var(base, base0); self.b.def_var(exp, exp0);
+        let (h, odd, sh, mb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.append_block_param(mb, I64);
+        let isz = self.b.ins().icmp(IntCC::Equal, exp0, z);
+        let one2 = self.b.ins().iconst(I64, 1);
+        self.b.ins().brif(isz, mb, &[one2], h, &[]);
+        self.b.switch_to_block(h);
+        let e = self.b.use_var(exp);
+        let bit = self.b.ins().band_imm(e, 1);
+        self.b.ins().brif(bit, odd, &[], sh, &[]);
+        self.b.switch_to_block(odd); self.b.seal_block(odd);
+        let av = self.b.use_var(acc); let bvv = self.b.use_var(base);
+        let a2 = self.mul_ovf(av, bvv); self.b.def_var(acc, a2);
+        let e = self.b.use_var(exp);
+        let is1 = self.b.ins().icmp_imm(IntCC::Equal, e, 1);
+        self.b.ins().brif(is1, mb, &[a2], sh, &[]);
+        self.b.switch_to_block(sh); self.b.seal_block(sh);
+        let e = self.b.use_var(exp);
+        let e2 = self.b.ins().ushr_imm(e, 1); self.b.def_var(exp, e2);
+        let bvv = self.b.use_var(base);
+        let sq = self.mul_ovf(bvv, bvv); self.b.def_var(base, sq);
+        self.b.ins().jump(h, &[]);
+        self.b.seal_block(h);
+        self.b.switch_to_block(mb); self.b.seal_block(mb);
+        Some(self.b.block_params(mb)[0])
+    }
+
+    fn libcall(&mut self, which: &str, a: Value, bv: Value) -> Option<Value> {
+        let id = *self.libm.get(which)?;
+        let fref = self.module.declare_func_in_func(id, self.b.func);
+        let inst = self.b.ins().call(fref, &[a, bv]);
+        Some(self.b.inst_results(inst)[0])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tiering (Phase 5C): compile a function only after it has been called
 // `threshold` times. When a function turns hot, its whole callee closure
 // (within the eligible set) is compiled in one batch so JIT->JIT direct calls
@@ -1142,6 +1740,7 @@ pub struct TieredJit<'p> {
     prog: &'p Program,
     eligible: HashSet<String>,   // i64 track
     feligible: HashSet<String>,  // f64 track (disjoint)
+    numeric: HashSet<String>,    // mixed int/float track (disjoint)
     // call edges within the eligible sets, for closure computation
     callees: HashMap<String, Vec<String>>,
     pub threshold: u64,
@@ -1156,18 +1755,20 @@ impl<'p> TieredJit<'p> {
     pub fn new(prog: &'p Program, threshold: u64) -> TieredJit<'p> {
         let eligible = eligible_set(prog);
         let feligible = float_eligible_set(prog, &eligible);
+        let (numeric, _nret) = numeric_eligible_set(prog, &eligible, &feligible);
         let mut callees: HashMap<String, Vec<String>> = HashMap::new();
+        let claimed = |n: &String| eligible.contains(n) || feligible.contains(n) || numeric.contains(n);
         for item in &prog.items {
             if let Item::Func(f) = item {
-                if eligible.contains(&f.name) || feligible.contains(&f.name) {
+                if claimed(&f.name) {
                     let cs: Vec<String> = collect_calls(&f.body).into_iter()
-                        .filter(|c| eligible.contains(c) || feligible.contains(c)).collect();
+                        .filter(|c| claimed(c)).collect();
                     callees.insert(f.name.clone(), cs);
                 }
             }
         }
         TieredJit {
-            prog, eligible, feligible, callees,
+            prog, eligible, feligible, numeric, callees,
             threshold: threshold.max(1),
             jits: std::cell::RefCell::new(Vec::new()),
             location: std::cell::RefCell::new(HashMap::new()),
@@ -1177,7 +1778,7 @@ impl<'p> TieredJit<'p> {
     }
 
     pub fn is_eligible(&self, name: &str) -> bool {
-        self.eligible.contains(name) || self.feligible.contains(name)
+        self.eligible.contains(name) || self.feligible.contains(name) || self.numeric.contains(name)
     }
 
     // Eagerly compile every eligible function whose body contains a loop, before
@@ -1207,6 +1808,18 @@ impl<'p> TieredJit<'p> {
     pub fn is_compiled_f64(&self, name: &str) -> bool {
         match self.location.borrow().get(name) {
             Some(idx) => self.jits.borrow()[*idx].is_compiled_f64(name),
+            None => false,
+        }
+    }
+    pub fn is_compiled_num(&self, name: &str) -> bool {
+        match self.location.borrow().get(name) {
+            Some(idx) => self.jits.borrow()[*idx].is_compiled_num(name),
+            None => false,
+        }
+    }
+    pub fn num_ret_is_float(&self, name: &str) -> bool {
+        match self.location.borrow().get(name) {
+            Some(idx) => self.jits.borrow()[*idx].num_ret_is_float(name),
             None => false,
         }
     }
@@ -1261,6 +1874,12 @@ impl<'p> TieredJit<'p> {
     pub fn raw_call_f64(&self, name: &str, args: &[f64]) -> f64 {
         let idx = self.location.borrow()[name];
         self.jits.borrow()[idx].raw_call_f64(name, args)
+    }
+
+    // caller must check `is_compiled_num` first
+    pub fn raw_call_num(&self, name: &str, args: &[i64]) -> (i64, bool) {
+        let idx = self.location.borrow()[name];
+        self.jits.borrow()[idx].raw_call_num(name, args)
     }
 }
 
@@ -2048,5 +2667,38 @@ mod jit_tests {
             "fn s(n){ a=[]; for i in 0..n { push(a, i) }; t=0; for i in 0..len(a) { t=t+a[i] }; t }\n\
              fn main(){ t=0; for k in 0..300 { t = t + s(20) }; t }", 50);
         assert!(names.contains(&"s".to_string()), "hot array fn must compile");
+    }
+
+    // --- Phase 11: unified numeric (mixed int/float) track ---
+    #[test] fn numeric_mandel_kernel() {
+        // int loop counters + float math + int accumulator + int return — the
+        // shape neither scalar track accepts; result must match the VM exactly
+        same_jit("fn count(w,h,m){ total=0; for py in 0..h { for px in 0..w {\n\
+            x0 = to_float(px)/to_float(w)*3.5 - 2.5; y0 = to_float(py)/to_float(h)*2.0 - 1.0;\n\
+            x=0.0; y=0.0; it=0;\n\
+            while x*x+y*y <= 4.0 && it < m { xt=x*x-y*y+x0; y=2.0*x*y+y0; x=xt; it=it+1 }\n\
+            if it==m { total=total+1 } } } total }\n\
+            fn main(){ count(60,60,50) }");
+    }
+    #[test] fn numeric_float_return() {
+        // mixed body returning a float — result carried back as f64 bits
+        same_jit("fn area(n){ s=0.0; for i in 1..n { s = s + 1.0/to_float(i) }; s }\n\
+            fn main(){ area(1000) }");
+    }
+    #[test] fn numeric_int_overflow_deopts() {
+        // an int accumulator that overflows must deopt and match BigInt promotion
+        same_jit("fn f(n){ p=1; for i in 1..n { p = p * i }; total=0; x=0.0;\n\
+            while x < 2.0 { x = x + 0.5; total = total + 1 }; p + total }\n\
+            fn main(){ f(25) }");
+    }
+    #[test] fn numeric_to_int_trunc() {
+        same_jit("fn f(n){ acc=0; for i in 0..n { acc = acc + to_int(to_float(i)*1.5) }; acc }\n\
+            fn main(){ f(100) }");
+    }
+    #[test] fn numeric_tiered_hot() {
+        let names = same_tiered(
+            "fn kern(n){ s=0.0; c=0; for i in 0..n { s = s + to_float(i)*0.5; c = c + 1 }; c }\n\
+             fn main(){ t=0; for k in 0..300 { t = t + kern(10) }; t }", 50);
+        assert!(names.contains(&"kern".to_string()), "hot numeric fn must compile");
     }
 }

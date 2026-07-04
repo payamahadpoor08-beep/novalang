@@ -1694,6 +1694,30 @@ impl<'a> Vm<'a> {
                                 continue;
                             }
                         }
+                        // Numeric (mixed int/float) track: all-Int args like the i64
+                        // track, but the raw i64 result is an integer OR f64 bits.
+                        if t.is_compiled_num(&callee.name) {
+                            let base = stack.len() - n;
+                            if stack[base..].iter().all(|v| matches!(v, Value::Int(_))) {
+                                let ia: Vec<i64> = stack[base..].iter()
+                                    .map(|v| if let Value::Int(k) = v { *k } else { 0 }).collect();
+                                stack.truncate(base);
+                                let (raw, deopt) = t.raw_call_num(&callee.name, &ia);
+                                if deopt {
+                                    let mut fl = self.locals_pool.borrow_mut().pop().unwrap_or_default();
+                                    fl.clear();
+                                    fl.extend(ia.into_iter().map(Value::Int));
+                                    fl.resize(callee.n_locals, Value::Null);
+                                    stack.push(self.exec(callee, fl)?);
+                                } else if t.num_ret_is_float(&callee.name) {
+                                    stack.push(Value::Float(f64::from_bits(raw as u64)));
+                                } else {
+                                    stack.push(Value::Int(raw));
+                                }
+                                ip += 1;
+                                continue;
+                            }
+                        }
                     }
                     // Eager JIT (--jit): a compiled integer-pure function called with
                     // all-integer args runs as native code; a deopt re-runs it on
