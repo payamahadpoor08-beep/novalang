@@ -1,0 +1,21 @@
+fn count(w, h, maxi) {
+  total = 0
+  for py in 0..h {
+    for px in 0..w {
+      x0 = to_float(px) / to_float(w) * 3.5 - 2.5
+      y0 = to_float(py) / to_float(h) * 2.0 - 1.0
+      x = 0.0
+      y = 0.0
+      it = 0
+      while x*x + y*y <= 4.0 && it < maxi {
+        xt = x*x - y*y + x0
+        y = 2.0*x*y + y0
+        x = xt
+        it = it + 1
+      }
+      if it == maxi { total = total + 1 }
+    }
+  }
+  total
+}
+fn main() { print(count(600, 600, 200)) }

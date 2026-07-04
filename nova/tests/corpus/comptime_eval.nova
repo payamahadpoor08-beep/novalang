@@ -1,0 +1,36 @@
+// #[comptime]: a no-argument function is const-evaluated exactly once before
+// main; every call returns the precomputed value. The table below is built at
+// startup, and both calls observe the same cached array (identity holds).
+
+#[comptime]
+fn squares() {
+    let mut xs = [0, 0, 0, 0, 0, 0, 0, 0]
+    let mut i = 0
+    while i < 8 {
+        xs[i] = i * i
+        i = i + 1
+    }
+    xs
+}
+
+#[comptime]
+fn magic() {
+    let mut s = 0
+    let mut i = 1
+    while i <= 100 {
+        s = s + i
+        i = i + 1
+    }
+    s
+}
+
+fn main() {
+    let a = squares()
+    let b = squares()
+    print(a[0])
+    print(a[5])
+    print(a[7])
+    print(a == b)
+    print(magic())
+    print(magic() + magic())
+}

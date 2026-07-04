@@ -73,6 +73,8 @@ enum Op {
     // --- fused superinstructions (peephole; semantics = the unfused sequence) ---
     IncLocal(u16, u32, BinOp),           // locals[s] = locals[s] <op> consts[k]
     LocalsBinJf(u16, u16, BinOp, usize), // if !(locals[a] <op> locals[b]) jump
+    BinLL(u16, u16, BinOp),              // push(locals[a] <op> locals[b])
+    BinLC(u16, u32, BinOp),              // push(locals[a] <op> consts[k])
 }
 
 // Everything `Op::Try` needs at runtime. The body/catch/finally code ranges live
@@ -156,9 +158,16 @@ pub fn compile_program_opt(prog: &Program, optimize_flag: bool) -> Result<Compil
             _ => None,
         })
         .collect();
-    // functions whose statements are all VM-native; the rest run on the interpreter
+    // functions whose statements are all VM-native; the rest run on the interpreter.
+    // Functions carrying BEHAVIOURAL attributes (`#[self_healing]`, `#[memo]`,
+    // contracts, `#[trace]`, …) are kept interp-only so their semantics — applied
+    // at the interpreter's `call` boundary — take effect on every tier (the VM
+    // reaches them through `CallDyn` -> `call_named` -> `call`). Pure optimisation
+    // hints / metadata (`#[hot]`, `#[cold]`, `#[version]`, …) don't change
+    // behaviour, so such functions may still be compiled.
     let mut compiled_names: Vec<String> = funcs.values()
-        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined))
+        .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined)
+            && !f.attrs.iter().any(|a| is_behavioural_attr(&a.name)))
         .map(|f| f.name.clone())
         .collect();
     compiled_names.sort();
@@ -229,6 +238,17 @@ struct Ctx<'i> {
 // function interp-only now: generators replay their body through the tree-walker.
 fn func_compilable(f: &Func) -> bool {
     f.body.iter().all(stmt_compilable)
+}
+
+// Attributes that change a function's runtime behaviour (so the function must run
+// through the interpreter on every tier). Pure hints/metadata are not listed and
+// don't block VM/JIT compilation.
+pub(crate) fn is_behavioural_attr(name: &str) -> bool {
+    matches!(name,
+        "self_healing" | "retry" | "hot_swap" | "memo" | "memoize"
+        | "requires" | "ensures" | "assumes" | "trace" | "log" | "audit"
+        | "profile" | "deprecate" | "deprecated" | "time_travel"
+        | "anti_debug" | "anti_tamper" | "integrity" | "comptime")
 }
 
 // Does any (nested) `let` in this body carry a refinement-type annotation?
@@ -1252,6 +1272,29 @@ fn fuse(code: Vec<Op>) -> Vec<Op> {
                 continue;
             }
         }
+        // 3-op operand fusions (tried after the 4-op patterns above, so those win
+        // when they apply). These evaluate a binary op straight from locals/consts
+        // with no intermediate stack traffic — the bulk of arithmetic in loops.
+        if i + 2 < n && !targets.contains(&(i + 1)) && !targets.contains(&(i + 2)) {
+            if let (Op::LoadLocal(a), Op::LoadLocal(b), Op::Bin(op)) =
+                (&out[i], &out[i + 1], &out[i + 2])
+            {
+                out[i] = Op::BinLL(*a, *b, *op);
+                out[i + 1] = Op::Nop;
+                out[i + 2] = Op::Nop;
+                i += 3;
+                continue;
+            }
+            if let (Op::LoadLocal(a), Op::Const(k), Op::Bin(op)) =
+                (&out[i], &out[i + 1], &out[i + 2])
+            {
+                out[i] = Op::BinLC(*a, *k, *op);
+                out[i + 1] = Op::Nop;
+                out[i + 2] = Op::Nop;
+                i += 3;
+                continue;
+            }
+        }
         i += 1;
     }
     compact(out)
@@ -1387,9 +1430,10 @@ pub fn verify(c: &Compiled) -> Result<(), String> {
                 if t > len { return Err(format!("`{}`@{}: jump target {} out of range {}", ch.name, i, t, len)); }
             }
             let slot = match op {
-                Op::LoadLocal(s) | Op::StoreLocal(s) | Op::IncLocal(s, _, _) => Some(*s as usize),
+                Op::LoadLocal(s) | Op::StoreLocal(s) | Op::IncLocal(s, _, _)
+                | Op::BinLC(s, _, _) => Some(*s as usize),
                 Op::IterStep(it, idx, var, _) => Some((*it).max(*idx).max(*var) as usize),
-                Op::LocalsBinJf(a, b, _, _) => Some((*a).max(*b) as usize),
+                Op::LocalsBinJf(a, b, _, _) | Op::BinLL(a, b, _) => Some((*a).max(*b) as usize),
                 _ => None,
             };
             if let Some(s) = slot {
@@ -1668,6 +1712,30 @@ impl<'a> Vm<'a> {
                                 continue;
                             }
                         }
+                        // Numeric (mixed int/float) track: all-Int args like the i64
+                        // track, but the raw i64 result is an integer OR f64 bits.
+                        if t.is_compiled_num(&callee.name) {
+                            let base = stack.len() - n;
+                            if stack[base..].iter().all(|v| matches!(v, Value::Int(_))) {
+                                let ia: Vec<i64> = stack[base..].iter()
+                                    .map(|v| if let Value::Int(k) = v { *k } else { 0 }).collect();
+                                stack.truncate(base);
+                                let (raw, deopt) = t.raw_call_num(&callee.name, &ia);
+                                if deopt {
+                                    let mut fl = self.locals_pool.borrow_mut().pop().unwrap_or_default();
+                                    fl.clear();
+                                    fl.extend(ia.into_iter().map(Value::Int));
+                                    fl.resize(callee.n_locals, Value::Null);
+                                    stack.push(self.exec(callee, fl)?);
+                                } else if t.num_ret_is_float(&callee.name) {
+                                    stack.push(Value::Float(f64::from_bits(raw as u64)));
+                                } else {
+                                    stack.push(Value::Int(raw));
+                                }
+                                ip += 1;
+                                continue;
+                            }
+                        }
                     }
                     // Eager JIT (--jit): a compiled integer-pure function called with
                     // all-integer args runs as native code; a deopt re-runs it on
@@ -1799,6 +1867,14 @@ impl<'a> Vm<'a> {
                 Op::LocalsBinJf(a, b, op, t) => {
                     let v = eval_binop(*op, locals[*a as usize].clone(), locals[*b as usize].clone())?;
                     if !v.is_truthy() { ip = *t; continue; }
+                }
+                Op::BinLL(a, b, op) => {
+                    let v = eval_binop(*op, locals[*a as usize].clone(), locals[*b as usize].clone())?;
+                    stack.push(v);
+                }
+                Op::BinLC(a, k, op) => {
+                    let v = eval_binop(*op, locals[*a as usize].clone(), chunk.consts[*k as usize].clone())?;
+                    stack.push(v);
                 }
                 Op::Try(mi) => {
                     // A statement-level transcription of the interpreter's

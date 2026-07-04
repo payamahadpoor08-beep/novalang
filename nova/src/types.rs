@@ -182,7 +182,7 @@ impl Checker {
         // PASS 2: type-check every function/method/test body for real.
         for item in &program.items {
             match item {
-                Item::Func(f) => { self.check_func(f); self.check_effects(f); self.check_moves(f); }
+                Item::Func(f) => { self.check_func(f); self.check_effects(f); self.check_moves(f); self.check_zero_alloc(f); }
                 Item::Impl(imp) => {
                     for m in &imp.methods {
                         self.check_func(m);
@@ -887,6 +887,19 @@ impl Checker {
     // value must be consumed exactly once; an affine value at most once. Using a
     // value after it is moved — or inside a loop, where it could run more than
     // once — is a located error. Only functions with such params are checked.
+    // `#[zero_alloc]`: a static guarantee that the function performs no heap
+    // allocation. Any array/map/set/struct literal, comprehension, f-string,
+    // closure, or string concatenation is a violation, reported by `nova check`.
+    fn check_zero_alloc(&mut self, f: &Func) {
+        if !f.attrs.iter().any(|a| a.name == "zero_alloc") { return; }
+        let mut bad: Vec<&'static str> = Vec::new();
+        for s in &f.body { zero_alloc_stmt(s, &mut bad); }
+        for what in bad {
+            self.errors.push(format!(
+                "#[zero_alloc] function `{}` allocates: {}", f.name, what));
+        }
+    }
+
     fn check_moves(&mut self, f: &Func) {
         use std::collections::HashSet;
         let mut linear: HashSet<String> = HashSet::new();
@@ -1121,6 +1134,76 @@ fn bind_pattern(p: &Pattern, scope: &mut HashMap<String, Ty>) {
             for x in prefix { bind_pattern(x, scope); }
             for x in suffix { bind_pattern(x, scope); }
             if let Some(Some(name)) = rest { scope.insert(name.clone(), Ty::Array); }
+        }
+        _ => {}
+    }
+}
+
+// Walk a statement/expression looking for heap-allocating constructs, for the
+// `#[zero_alloc]` guarantee. Reports each distinct kind found.
+fn zero_alloc_stmt(s: &Stmt, bad: &mut Vec<&'static str>) {
+    match s {
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value)
+        | Stmt::Return(Some(value)) | Stmt::Throw(value) => zero_alloc_expr(value, bad),
+        Stmt::IndexAssign { base, index, value } => {
+            zero_alloc_expr(base, bad); zero_alloc_expr(index, bad); zero_alloc_expr(value, bad);
+        }
+        Stmt::FieldAssign { base, value, .. } => { zero_alloc_expr(base, bad); zero_alloc_expr(value, bad); }
+        Stmt::If { cond, then, els } => {
+            zero_alloc_expr(cond, bad);
+            for s in then { zero_alloc_stmt(s, bad); }
+            if let Some(e) = els { for s in e { zero_alloc_stmt(s, bad); } }
+        }
+        Stmt::While { cond, body } => { zero_alloc_expr(cond, bad); for s in body { zero_alloc_stmt(s, bad); } }
+        Stmt::ForRange { start, end, body, .. } => {
+            zero_alloc_expr(start, bad); zero_alloc_expr(end, bad);
+            for s in body { zero_alloc_stmt(s, bad); }
+        }
+        Stmt::ForEach { iter, body, .. } => { zero_alloc_expr(iter, bad); for s in body { zero_alloc_stmt(s, bad); } }
+        Stmt::TryCatch { body, catch_body, finally_body, .. } => {
+            for s in body { zero_alloc_stmt(s, bad); }
+            if let Some(b) = catch_body { for s in b { zero_alloc_stmt(s, bad); } }
+            if let Some(b) = finally_body { for s in b { zero_alloc_stmt(s, bad); } }
+        }
+        Stmt::Defer(b) => for s in b { zero_alloc_stmt(s, bad); },
+        _ => {}
+    }
+}
+
+fn note(bad: &mut Vec<&'static str>, what: &'static str) {
+    if !bad.contains(&what) { bad.push(what); }
+}
+
+fn zero_alloc_expr(e: &Expr, bad: &mut Vec<&'static str>) {
+    match e {
+        Expr::At { expr, .. } => zero_alloc_expr(expr, bad),
+        Expr::Array(xs) | Expr::SetLit(xs) => { note(bad, "array/set literal"); for x in xs { zero_alloc_expr(x, bad); } }
+        Expr::MapLit(kv) => { note(bad, "map literal"); for (k, v) in kv { zero_alloc_expr(k, bad); zero_alloc_expr(v, bad); } }
+        Expr::StructLit { fields, .. } => { note(bad, "struct literal"); for (_, v) in fields { zero_alloc_expr(v, bad); } }
+        Expr::Comprehension { .. } => note(bad, "comprehension"),
+        Expr::FmtStr(_) => note(bad, "f-string"),
+        Expr::Lambda { .. } => note(bad, "closure"),
+        Expr::Binary { op: BinOp::Add, lhs, rhs } => {
+            // string concatenation allocates; flag it only when an operand is
+            // statically a string (literal / f-string) to avoid false positives
+            // on integer addition (the gradual checker can't always know).
+            let is_str = |x: &Expr| {
+                let mut x = x;
+                while let Expr::At { expr, .. } = x { x = expr; }
+                matches!(x, Expr::Str(_) | Expr::FmtStr(_))
+            };
+            if is_str(lhs) || is_str(rhs) { note(bad, "string concat"); }
+            zero_alloc_expr(lhs, bad); zero_alloc_expr(rhs, bad);
+        }
+        Expr::Binary { lhs, rhs, .. } => { zero_alloc_expr(lhs, bad); zero_alloc_expr(rhs, bad); }
+        Expr::Unary { expr, .. } => zero_alloc_expr(expr, bad),
+        Expr::If { cond, then, els } => { zero_alloc_expr(cond, bad); zero_alloc_expr(then, bad); zero_alloc_expr(els, bad); }
+        Expr::Call { args, .. } | Expr::CallValue { args, .. } => for a in args { zero_alloc_expr(a, bad); },
+        Expr::Index { base, index } => { zero_alloc_expr(base, bad); zero_alloc_expr(index, bad); }
+        Expr::Field { base, .. } | Expr::SafeField { base, .. } => zero_alloc_expr(base, bad),
+        Expr::Block { stmts, tail } => {
+            for s in stmts { zero_alloc_stmt(s, bad); }
+            if let Some(t) = tail { zero_alloc_expr(t, bad); }
         }
         _ => {}
     }

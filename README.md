@@ -39,12 +39,26 @@ fn main() {
   interpreter, valgrind-clean, with float printing proven identical to Rust's
   `Display` by a 2-million-value differential fuzz.
 
-| tier — `fib(35)` | time | speedup |
-|---|---|---|
-| `nova run` (interpreter) | 9.6 s | 1× |
-| `nova vm --no-jit` (bytecode VM) | 3.9 s | 2.5× |
-| `nova vm` (tiered Cranelift JIT) | 0.068 s | ~140× |
-| `nova build --aot` (native, C or LLVM) | **0.030 s** | **~320×** |
+## Benchmarks — Nova vs C, C++, Java, JS, TypeScript, Lua, Python
+
+Same algorithm in every language, each verified to print the **same result**
+before timing (correctness gate). Best-of-3 wall-clock ms on the CI machine —
+reproduce with `bash nova/bench/run.sh`. Nova's default fast path is
+**`nova vm`** (bytecode VM + tiered Cranelift JIT); `nova build --aot` produces a
+native binary; `nova run` is the tree-walking interpreter kept as the semantic
+*oracle* (every other tier is proven byte-identical to it), not a speed tier.
+
+| workload | C -O2 | **Nova aot** | **Nova vm** | Java | Node JS | Lua 5.4 | Python 3 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| **fib(32)** recursive | 6 | **7** | 19 | 46 | 54 | 129 | 250 |
+| **sieve** (primes <2M) | 7 | 54 | **52** | 71 | 45 | 124 | 34 |
+| **mandelbrot** 600²×200 | 50 | **65** | **65** | 94 | 89 | 538 | 3816 |
+
+(ms; lower is better.) On numeric kernels Nova compiles to native code through
+its JIT/AOT and **matches C on recursion (fib) and beats Java, Node, Lua and
+Python on the float-heavy mandelbrot** — while staying a dynamically-typed
+Python-like language. The interpreter (`nova run`) is intentionally the slow,
+authoritative oracle; run real work with `nova vm` or `nova build --aot`.
 
 ## Installation
 

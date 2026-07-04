@@ -1,0 +1,31 @@
+// #[simd]: a JIT hint that eagerly compiles the numeric kernel up-front (like
+// #[hot]). Output must stay byte-identical across interp/VM/JIT — the hint only
+// affects *when* native code is produced, never *what* it computes. (True
+// Cranelift SIMD-type vectorization is a documented future deepening.)
+
+#[simd]
+fn saxpy(n) {
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + (2.0 * to_float(i) + 1.0)
+        i = i + 1
+    }
+    acc
+}
+
+#[simd]
+fn dot(n) {
+    let mut s = 0
+    let mut i = 1
+    while i <= n {
+        s = s + i * i
+        i = i + 1
+    }
+    s
+}
+
+fn main() {
+    print(saxpy(1000))
+    print(dot(100))
+}

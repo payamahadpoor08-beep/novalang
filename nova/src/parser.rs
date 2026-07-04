@@ -107,9 +107,20 @@ pub fn parse_repl(src: &str) -> Result<(Program, Vec<Stmt>), String> {
 
 fn lower_top_level(p: Pair<Rule>) -> Result<Option<Item>, String> {
     // top_level = { attribute* ~ visibility? ~ (use_decl | item) }
+    // Attributes precede the item; collect them and attach to a function item so
+    // they carry real semantics (zero_alloc, self_healing, hot_swap, integrity, …)
+    // instead of being discarded.
+    let mut attrs: Vec<Attr> = Vec::new();
     for inner in p.into_inner() {
         match inner.as_rule() {
-            Rule::item => return lower_item(inner),
+            Rule::item => {
+                let item = lower_item(inner)?;
+                if let Some(Item::Func(mut f)) = item {
+                    f.attrs = attrs;
+                    return Ok(Some(Item::Func(f)));
+                }
+                return Ok(item);
+            }
             Rule::use_decl => {
                 // `use "file.nova"` imports a file; `use math.*` imports a stdlib module
                 if let Some(s) = inner.clone().into_inner().find(|x| x.as_rule() == Rule::string_lit) {
@@ -119,11 +130,87 @@ fn lower_top_level(p: Pair<Rule>) -> Result<Option<Item>, String> {
                 }
                 return Ok(Some(Item::Use(lower_use(inner)?)));
             }
-            Rule::attribute | Rule::visibility => {}
+            Rule::attribute => collect_attrs(inner, &mut attrs),
+            Rule::visibility => {}
             _ => {}
         }
     }
     Ok(None)
+}
+
+// Flatten an `#[a, b(x: 1)]` attribute group into individual `Attr`s. Handles both
+// the generic `attr_item` form (`#[zero_alloc]`, `#[integrity]`) and the structured
+// `compiler_attr` form (`#[self_healing(attempts: 3)]`) uniformly: the name is the
+// leading identifier of the matched text and int/string literals become positional
+// args (so `int_arg("attempts")` finds the first number).
+fn collect_attrs(attribute: Pair<Rule>, out: &mut Vec<Attr>) {
+    for entry in attribute.into_inner() {
+        // attr_list -> (compiler_attr | attr_item) items
+        for a in entry.into_inner() {
+            match a.as_rule() {
+                Rule::compiler_attr | Rule::attr_item => out.push(parse_attr(a)),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn parse_attr(a: Pair<Rule>) -> Attr {
+    let text = a.as_str();
+    let name: String = text.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    let mut args: Vec<(String, String)> = Vec::new();
+    let mut exprs: Vec<Expr> = Vec::new();
+    // contract attributes carry real predicate expressions (`requires`/`ensures`/
+    // `assumes` take `expr` args); capture those as AST, everything else as strings
+    if matches!(name.as_str(), "requires" | "ensures" | "assumes") {
+        for inner in a.into_inner() {
+            if inner.as_rule() == Rule::expr {
+                if let Ok(e) = lower_expr(inner) { exprs.push(e); }
+            }
+        }
+    } else {
+        collect_attr_values(a, &mut args);
+    }
+    Attr { name, args, exprs, raw: text.to_string() }
+}
+
+fn collect_attr_values(p: Pair<Rule>, args: &mut Vec<(String, String)>) {
+    for inner in p.into_inner() {
+        match inner.as_rule() {
+            Rule::int_lit | Rule::string_lit | Rule::bool_lit =>
+                args.push((String::new(), inner.as_str().trim_matches('"').to_string())),
+            Rule::attr_arg => {
+                let mut parts = inner.clone().into_inner();
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    if k.as_rule() == Rule::ident {
+                        args.push((k.as_str().to_string(), v.as_str().trim_matches('"').to_string()));
+                        continue;
+                    }
+                }
+                collect_attr_values(inner, args);
+            }
+            _ => collect_attr_values(inner, args),
+        }
+    }
+}
+
+// migrate_decl = { kw_migrate ~ kw_from ~ type_path ~ kw_to ~ type_path ~ block }
+fn lower_migrate(p: Pair<Rule>) -> Result<Item, String> {
+    let mut types: Vec<String> = Vec::new();
+    let mut body: Vec<Stmt> = Vec::new();
+    for part in p.into_inner() {
+        match part.as_rule() {
+            Rule::type_path => types.push(part.as_str().trim().to_string()),
+            Rule::block => {
+                body = lower_block_stmts(part)?;
+                // a trailing bare expression is the produced value (like a fn body)
+                make_trailing_implicit_return(&mut body);
+            }
+            _ => {}
+        }
+    }
+    if types.len() != 2 { return Err("migrate: expected `from <Type> to <Type>`".into()); }
+    Ok(Item::Migration { from: types[0].clone(), to: types[1].clone(), body })
 }
 
 fn lower_item(p: Pair<Rule>) -> Result<Option<Item>, String> {
@@ -142,6 +229,7 @@ fn lower_item(p: Pair<Rule>) -> Result<Option<Item>, String> {
         Rule::macro_decl => Ok(Some(Item::Macro(lower_macro_decl(inner)?))),
         Rule::type_decl => lower_type_alias(inner).map(Some),
         Rule::extern_block => lower_extern(inner).map(Some),
+        Rule::migrate_decl => Ok(Some(lower_migrate(inner)?)),
         other => Err(format!("Unsupported top-level item (not yet in Nova Core): {:?}", other)),
     }
 }
@@ -847,7 +935,7 @@ fn lower_trait(p: Pair<Rule>) -> Result<TraitDef, String> {
                             name: method_name, params,
                             param_types: Vec::new(), param_modes: Vec::new(),
                             ret_type: None, type_params: Vec::new(),
-                            where_bounds: Vec::new(), effects: None, body: b, is_async: false,
+                            where_bounds: Vec::new(), effects: None, body: b, is_async: false, attrs: Vec::new(),
                         });
                     }
                     None => required.push(method_name),
@@ -993,7 +1081,7 @@ fn lower_func(p: Pair<Rule>) -> Result<Func, String> {
     } else {
         make_trailing_implicit_return(&mut body);
     }
-    Ok(Func { name, params, param_types, param_modes, ret_type, type_params, where_bounds, effects, body, is_async })
+    Ok(Func { name, params, param_types, param_modes, ret_type, type_params, where_bounds, effects, body, is_async, attrs: Vec::new() })
 }
 
 // Collect the effect head names from an effects clause: `![IO, Net]` -> ["IO","Net"].

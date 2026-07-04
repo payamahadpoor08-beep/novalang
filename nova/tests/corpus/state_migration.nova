@@ -1,0 +1,20 @@
+// State migration: `migrate from Old to New { ... }` transforms a value of an
+// old struct shape into the new shape when the schema changes. The body runs
+// with `old` bound to the incoming value and the old struct's fields also in
+// scope for convenience. The `migrate(value)` builtin applies the matching one.
+
+struct UserV1 { name: Str, age: Int }
+
+struct UserV2 { name: Str, age: Int, active: Bool }
+
+migrate from UserV1 to UserV2 {
+    UserV2 { name: name, age: age + 1, active: true }
+}
+
+fn main() {
+    let old = UserV1 { name: "Payam", age: 29 }
+    let new = migrate(old)
+    print(new.name)
+    print(new.age)
+    print(new.active)
+}

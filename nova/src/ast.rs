@@ -32,6 +32,11 @@ pub enum Item {
     // `use "path.nova";` — import every item from another Nova file. Resolved and
     // inlined by the module loader before type-checking/execution.
     Import { path: String },
+    // `migrate from Old to New { <body producing a New value> }` — state migration:
+    // transforms a value of the old struct shape into the new one (for preserving
+    // state across a code/schema update). The body runs with `old` bound to the
+    // incoming value; the `migrate(value)` builtin applies the matching migration.
+    Migration { from: String, to: String, body: Vec<Stmt> },
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +152,37 @@ pub struct Func {
     // true when declared `async fn`: calling it yields a Future instead of
     // running the body eagerly. Defaults to false for every existing path.
     pub is_async: bool,
+    // `#[...]` attributes attached to this function (empty for most). These carry
+    // real semantics — zero_alloc (a static allocation ban), self_healing (retry
+    // on error), hot_swap (runtime body replacement), integrity (tamper hash), …
+    pub attrs: Vec<Attr>,
+}
+
+// A parsed `#[name(k: v, ...)]` attribute. `args` holds the `(key, value)` pairs
+// (positional args use the value with an empty key), values kept as raw strings.
+// `exprs` holds expression arguments for contract attributes (`requires`,
+// `ensures`, `assumes`) which take real predicates rather than literals.
+#[derive(Debug, Clone)]
+pub struct Attr {
+    pub name: String,
+    pub args: Vec<(String, String)>,
+    pub exprs: Vec<Expr>,
+    // the attribute's raw source text (without the surrounding `#[ ]`), e.g.
+    // `self_healing(attempts: 5)`. Kept so the formatter can re-emit the exact
+    // syntax — the `compiler_attr` grammar has fixed keyword forms that the
+    // parsed `args` don't fully capture. Contract attrs (requires/ensures/
+    // assumes) are re-serialized from `exprs` instead, so their predicates
+    // track identifier renames (e.g. under `nova obfuscate`).
+    pub raw: String,
+}
+
+impl Attr {
+    // integer-valued argument by key (or the first positional), if present
+    pub fn int_arg(&self, key: &str) -> Option<i64> {
+        self.args.iter()
+            .find(|(k, _)| k == key || k.is_empty())
+            .and_then(|(_, v)| v.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone)]
