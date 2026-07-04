@@ -22,12 +22,28 @@ are shared correctly with the VM) — it is the environment model:
 - Closures capture the **entire scope** (`:2100`), not their free variables.
 - `Map` is an association list `Rc<RefCell<Vec<(Value,Value)>>>` (`:71`) — O(n) lookup.
 
-**Fixed in v3.26:** not the interpreter itself, but the escape route: the bytecode
-VM (which already uses slot-indexed frames with pooled buffers — the design the
-interpreter should adopt) now covers try/catch/throw/defer/break-value natively, so
-far fewer programs are stuck on the slow tree-walker.
+**Improved in v3.26.1 (measured, byte-identical):**
+- `Scope` is now an insertion-ordered `Vec<(Rc<str>, Value)>` instead of a
+  `HashMap<String, Value>`: cloning a scope (per call/block/match-arm/closure) is a
+  `Vec` copy with cheap `Rc` key bumps instead of rehashing and re-allocating every
+  key string, and small scopes resolve variables by a short scan instead of hashing.
+- Call frames and argument vectors are borrowed from free-list pools.
+- The `call` dispatcher resolves a user function in a single map lookup, skipping the
+  ~150-arm builtin match; `eval_binop` and the `Binary` arm gained an Int-op-Int fast
+  path (which the VM's `Op::Bin` also benefits from); name tables use an FNV hasher;
+  release builds use fat LTO + one codegen unit.
+- Result: **fib(32) 2898→1707ms (≈1.7× on call-heavy code)**, loop-sum 704→566ms,
+  closures 377→297ms; VM loop-sum 512→432ms.
 
-**Design (next):**
+**Honest ceiling:** a tree-walker's cost per node (recursive `eval` dispatch, `Value`
+enum moves, `Result` propagation, `Rc` refcount traffic) is irreducible without
+compiling to slots — which is precisely what the bytecode VM does. The 10×+ path is
+therefore `nova vm`, not `nova run`: on fib(35) the interpreter is ~7.2s while the
+tiered JIT is ~81ms (~89×). Squeezing the tree-walker further has diminishing returns;
+the real next lever below (slot resolution) essentially rebuilds the VM's frame model
+inside the interpreter.
+
+**Design (next, for a larger jump):**
 1. Compile-time slot resolution for the interpreter too: a resolver pass that maps
    every `Ident` to (depth, slot), turning `Scope` into `Vec<Value>` frames — this
    is exactly what `bytecode.rs`'s `FnCompiler::define/resolve` already does; reuse
