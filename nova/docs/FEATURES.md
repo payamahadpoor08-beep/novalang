@@ -90,7 +90,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
-| **LSP** (`nova lsp`) — stdio JSON-RPC: initialize, didOpen/didChange → live diagnostics (parse + type errors), hover | Run ✅ — `tests/lsp_smoke.sh` |
+| **LSP** (`nova lsp`) — full IDE server: diagnostics, hover, completion, signatureHelp, goto-definition, references, documentHighlight, document/workspace symbols, rename, formatting, semanticTokens, foldingRange | Run ✅ — 11-capability suite in `tests/lsp_smoke.sh` |
 | **package manager** (`nova add <src> [name]`, `nova deps`) — vendors deps into `nova_modules/`, resolved by `use "name"` | Run ✅ — local/path deps; `tests/pkg_smoke.sh` |
 | **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
