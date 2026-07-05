@@ -46,6 +46,7 @@ fn main() {
                 "--aot=llvm" => Some(aot::Backend::Llvm),
                 "--aot=wasm" => Some(aot::Backend::Wasm),
                 "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(aot::Backend::Arm),
+                "--aot=arm32" | "--aot=armv7" | "--aot=armhf" => Some(aot::Backend::Arm32),
                 _ => None,
             });
             if let Some(bk) = aot_backend {
@@ -60,6 +61,7 @@ fn main() {
                             aot::Backend::Llvm => ("llvm", "native"),
                             aot::Backend::Wasm => ("wasm", "wasm32"),
                             aot::Backend::Arm => ("arm", "aarch64"),
+                            aot::Backend::Arm32 => ("arm32", "armv7"),
                         };
                         let art = if matches!(bk, aot::Backend::Wasm) {
                             out.with_extension("wasm").display().to_string()
@@ -73,6 +75,10 @@ fn main() {
                     }
                     Ok(None) if matches!(bk, aot::Backend::Arm) => {
                         eprintln!("note: program not ARM-AOT-able or diverged in verify (needs aarch64-linux-gnu-gcc + qemu-aarch64); no arm binary emitted");
+                        exit(1);
+                    }
+                    Ok(None) if matches!(bk, aot::Backend::Arm32) => {
+                        eprintln!("note: program not ARMv7-AOT-able or diverged in verify (needs arm-linux-gnueabihf-gcc + qemu-arm); no arm32 binary emitted");
                         exit(1);
                     }
                     Ok(None) => eprintln!(
@@ -530,6 +536,7 @@ BUILD FLAGS:
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
   --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
   --aot=arm            static aarch64 binary, typed+boxed (cross gcc, qemu-verified)
+  --aot=arm32          static ARMv7 (32-bit) binary — older/weaker phones (qemu-verified)
                        (AOT output is verified byte-identical to `nova run`
                         at build time; non-AOT-able programs fall back to the
                         embedded-runtime build automatically)

@@ -44,11 +44,14 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         return build_wasm(entry, out, &code, tier);
     }
     let arm = matches!(backend, crate::aot::Backend::Arm);
+    let arm32 = matches!(backend, crate::aot::Backend::Arm32);
     let (ext, cc) = match backend {
         crate::aot::Backend::C => ("c", "cc"),
         crate::aot::Backend::Llvm => ("ll", "clang"),
-        // ARM: cross-compile the portable C with the aarch64 gcc, run under qemu.
+        // ARM64: cross-compile the portable C with the aarch64 gcc, run under qemu.
         crate::aot::Backend::Arm => ("c", "aarch64-linux-gnu-gcc"),
+        // ARMv7 (32-bit hard-float): older / weaker phones.
+        crate::aot::Backend::Arm32 => ("c", "arm-linux-gnueabihf-gcc"),
         crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
     };
     let tmp = out.with_extension(ext);
@@ -65,9 +68,12 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         std::fs::write(&rt, NOVA_RT).map_err(|e| e.to_string())?;
     }
     let mut cmd = Command::new(cc);
-    // ARM cross gcc: build a static aarch64 binary (so qemu needs no sysroot libs)
-    // and skip -flto (the cross toolchain's LTO plugin isn't always present).
-    if arm { cmd.arg("-O2").arg("-static"); } else { cmd.arg("-O3").arg("-flto"); }
+    // ARM cross gcc: build a static binary (so qemu needs no sysroot libs) and
+    // skip -flto (the cross toolchain's LTO plugin isn't always present). ARMv7
+    // uses -marm (A32) for stable output.
+    if arm { cmd.arg("-O2").arg("-static"); }
+    else if arm32 { cmd.arg("-O2").arg("-static").arg("-marm"); }
+    else { cmd.arg("-O3").arg("-flto"); }
     if matches!(backend, crate::aot::Backend::Llvm) { cmd.arg("-Wno-override-module"); }
     if llvm_boxed { cmd.arg("-Dstatic="); }
     for f in extra_flags { cmd.arg(f); }
@@ -86,6 +92,8 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         .map_err(|e| e.to_string())?;
     let got = if arm {
         Command::new("qemu-aarch64").arg(out).output()
+    } else if arm32 {
+        Command::new("qemu-arm").arg(out).output()
     } else {
         Command::new(out).output()
     }.map_err(|e| e.to_string())?;
