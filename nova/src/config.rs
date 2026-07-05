@@ -29,6 +29,39 @@ pub struct HgxConfig {
     pub opt_level: String,
     pub jit_threshold: Option<u64>,
     pub target_default: String,
+    // `[dependencies]` — each `name = "^1.2"` or `name = { version, git, rev,
+    // path, registry, features }`. The package manager (registry.rs) resolves
+    // these against the index / path / git into a reproducible `nova.lock`.
+    pub dependencies: Vec<ManifestDep>,
+    // `[registry]` / `[registries]` — named registry index endpoints
+    // (`crates = "https://…"` or a local dir). "default" is the fallback.
+    pub registries: Vec<(String, String)>,
+    // `[abilities]` — the user's *two-mode* attribute design: attributes/abilities
+    // may be declared here (project-wide) instead of on the code, and are merged
+    // onto the matching functions at load. `name = "trace"`, `name = ["trace",
+    // "profile"]`, or `name = { attr = "self_healing", args = "attempts: 3",
+    // targets = ["fetch", "save"] }`. An empty `targets` applies to every fn.
+    pub abilities: Vec<ManifestAbility>,
+}
+
+// A dependency line from `[dependencies]`.
+#[derive(Debug, Clone, Default)]
+pub struct ManifestDep {
+    pub name: String,
+    pub version: Option<String>,  // semver requirement, e.g. "^1.2.3"
+    pub git: Option<String>,
+    pub rev: Option<String>,
+    pub path: Option<String>,
+    pub registry: Option<String>, // named registry from `[registry]`
+    pub features: Vec<String>,
+}
+
+// A manifest-declared attribute/ability (two-mode: manifest OR on code).
+#[derive(Debug, Clone, Default)]
+pub struct ManifestAbility {
+    pub attr: String,             // attribute name, e.g. "trace"
+    pub args: String,             // raw arg text, e.g. "attempts: 3" (may be empty)
+    pub targets: Vec<String>,     // function names; empty = apply to every fn
 }
 
 impl Default for HgxConfig {
@@ -40,6 +73,9 @@ impl Default for HgxConfig {
             opt_level: "release".into(),
             jit_threshold: None,
             target_default: "pc".into(),
+            dependencies: Vec::new(),
+            registries: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 }
@@ -66,10 +102,32 @@ pub fn parse_hgx(text: &str) -> Result<HgxConfig, String> {
             section = name.to_string();
             continue;
         }
-        let (key, value) = line.split_once('=')
+        let (key, rhs) = line.split_once('=')
             .ok_or_else(|| format!("nova.hgx line {}: expected `key = value`, got `{}`", lineno + 1, line))?;
         let key = key.trim();
-        let value = parse_value(value.trim())
+        let rhs = rhs.trim();
+        // Sections whose values are structured (inline tables / arrays) are
+        // handled specially before the scalar `parse_value` path.
+        match section.as_str() {
+            "dependencies" | "deps" => {
+                cfg.dependencies.push(parse_dep(key, rhs)
+                    .map_err(|e| format!("nova.hgx line {}: {}", lineno + 1, e))?);
+                continue;
+            }
+            "registry" | "registries" => {
+                let url = parse_value(rhs).and_then(|v| v.as_str())
+                    .map_err(|e| format!("nova.hgx line {}: {}", lineno + 1, e))?;
+                cfg.registries.push((key.to_string(), url));
+                continue;
+            }
+            "abilities" | "attributes" => {
+                cfg.abilities.extend(parse_abilities(key, rhs)
+                    .map_err(|e| format!("nova.hgx line {}: {}", lineno + 1, e))?);
+                continue;
+            }
+            _ => {}
+        }
+        let value = parse_value(rhs)
             .map_err(|e| format!("nova.hgx line {}: {}", lineno + 1, e))?;
         match (section.as_str(), key) {
             ("package", "name") => cfg.name = value.as_str()?,
@@ -103,21 +161,126 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-enum HgxValue { Str(String), Int(u64) }
+enum HgxValue { Str(String), Int(u64), Arr(Vec<String>) }
 
 impl HgxValue {
     fn as_str(self) -> Result<String, String> {
         match self {
             HgxValue::Str(s) => Ok(s),
             HgxValue::Int(n) => Err(format!("expected a quoted string, got integer {}", n)),
+            HgxValue::Arr(_) => Err("expected a quoted string, got an array".to_string()),
         }
     }
     fn as_int(self) -> Result<u64, String> {
         match self {
             HgxValue::Int(n) => Ok(n),
             HgxValue::Str(s) => Err(format!("expected an integer, got \"{}\"", s)),
+            HgxValue::Arr(_) => Err("expected an integer, got an array".to_string()),
         }
     }
+    fn as_arr(self) -> Result<Vec<String>, String> {
+        match self {
+            HgxValue::Arr(a) => Ok(a),
+            HgxValue::Str(s) => Err(format!("expected an array, got \"{}\"", s)),
+            HgxValue::Int(n) => Err(format!("expected an array, got integer {}", n)),
+        }
+    }
+}
+
+// Parse one `[dependencies]` entry: `name = "^1.2"` (version shorthand) or
+// `name = { version = "1", git = "url", rev = "sha", path = "..", registry =
+// "crates", features = ["a", "b"] }`.
+fn parse_dep(name: &str, rhs: &str) -> Result<ManifestDep, String> {
+    let mut d = ManifestDep { name: name.to_string(), ..Default::default() };
+    if rhs.starts_with('{') {
+        for (k, v) in parse_inline_table(rhs)? {
+            match k.as_str() {
+                "version" => d.version = Some(v.as_str()?),
+                "git" => d.git = Some(v.as_str()?),
+                "rev" => d.rev = Some(v.as_str()?),
+                "path" => d.path = Some(v.as_str()?),
+                "registry" => d.registry = Some(v.as_str()?),
+                "features" => d.features = v.as_arr()?,
+                other => return Err(format!("unknown dependency key `{}`", other)),
+            }
+        }
+        if d.version.is_none() && d.git.is_none() && d.path.is_none() {
+            return Err(format!("dependency `{}` needs a version, git, or path", name));
+        }
+    } else {
+        d.version = Some(parse_value(rhs)?.as_str()?);
+    }
+    Ok(d)
+}
+
+// Parse one `[abilities]` entry into one-or-more ManifestAbility. Forms:
+//   fast    = "trace"                       # attr, all fns
+//   audited = ["trace", "profile"]          # several attrs, all fns
+//   heal    = { attr = "self_healing", args = "attempts: 3", targets = ["a"] }
+fn parse_abilities(key: &str, rhs: &str) -> Result<Vec<ManifestAbility>, String> {
+    if rhs.starts_with('{') {
+        let mut a = ManifestAbility::default();
+        for (k, v) in parse_inline_table(rhs)? {
+            match k.as_str() {
+                "attr" | "attribute" => a.attr = v.as_str()?,
+                "args" => a.args = v.as_str()?,
+                "targets" => a.targets = v.as_arr()?,
+                other => return Err(format!("unknown ability key `{}`", other)),
+            }
+        }
+        if a.attr.is_empty() { return Err(format!("ability `{}` needs an `attr`", key)); }
+        Ok(vec![a])
+    } else if rhs.starts_with('[') {
+        Ok(parse_string_array(rhs)?.into_iter()
+            .map(|attr| ManifestAbility { attr, ..Default::default() }).collect())
+    } else {
+        Ok(vec![ManifestAbility { attr: parse_value(rhs)?.as_str()?, ..Default::default() }])
+    }
+}
+
+// A minimal inline-table parser: `{ k = v, k2 = [..], .. }`. Values are strings,
+// ints, or string arrays. Commas separate; splitting respects brackets+quotes.
+fn parse_inline_table(s: &str) -> Result<Vec<(String, HgxValue)>, String> {
+    let inner = s.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| format!("malformed inline table: {}", s))?.trim();
+    let mut out = Vec::new();
+    for field in split_top(inner, ',') {
+        let field = field.trim();
+        if field.is_empty() { continue; }
+        let (k, v) = field.split_once('=')
+            .ok_or_else(|| format!("inline table field needs `key = value`: {}", field))?;
+        let v = v.trim();
+        let val = if v.starts_with('[') { HgxValue::Arr(parse_string_array(v)?) }
+                  else { parse_value(v)? };
+        out.push((k.trim().to_string(), val));
+    }
+    Ok(out)
+}
+
+// `["a", "b", "c"]` -> vec of strings.
+fn parse_string_array(s: &str) -> Result<Vec<String>, String> {
+    let inner = s.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| format!("malformed array: {}", s))?.trim();
+    if inner.is_empty() { return Ok(Vec::new()); }
+    split_top(inner, ',').into_iter()
+        .map(|e| parse_value(e.trim()).and_then(|v| v.as_str()))
+        .collect()
+}
+
+// Split `s` on `sep`, but only at bracket depth 0 and outside quotes.
+fn split_top(s: &str, sep: char) -> Vec<String> {
+    let (mut out, mut buf, mut depth, mut in_str) = (Vec::new(), String::new(), 0i32, false);
+    for c in s.chars() {
+        match c {
+            '"' => { in_str = !in_str; buf.push(c); }
+            '[' | '{' if !in_str => { depth += 1; buf.push(c); }
+            ']' | '}' if !in_str => { depth -= 1; buf.push(c); }
+            _ if c == sep && depth == 0 && !in_str => { out.push(std::mem::take(&mut buf)); }
+            _ => buf.push(c),
+        }
+    }
+    if !buf.trim().is_empty() { out.push(buf); }
+    out
 }
 
 fn parse_value(v: &str) -> Result<HgxValue, String> {
@@ -170,5 +333,44 @@ mod hgx_tests {
     #[test] fn comments_and_hash_in_string() {
         let c = parse_hgx("[package]\nname = \"a#b\" # trailing\n").unwrap();
         assert_eq!(c.name, "a#b");
+    }
+    #[test] fn dependencies_shorthand_and_table() {
+        let c = parse_hgx(concat!(
+            "[package]\nname = \"x\"\n[dependencies]\n",
+            "json = \"^1.2\"\n",
+            "http = { version = \"2.0\", features = [\"tls\", \"gzip\"] }\n",
+            "local = { path = \"../local\" }\n",
+            "gitdep = { git = \"https://ex/g.git\", rev = \"abc\" }\n",
+        )).unwrap();
+        assert_eq!(c.dependencies.len(), 4);
+        let json = c.dependencies.iter().find(|d| d.name == "json").unwrap();
+        assert_eq!(json.version.as_deref(), Some("^1.2"));
+        let http = c.dependencies.iter().find(|d| d.name == "http").unwrap();
+        assert_eq!(http.version.as_deref(), Some("2.0"));
+        assert_eq!(http.features, vec!["tls", "gzip"]);
+        assert_eq!(c.dependencies.iter().find(|d| d.name == "local").unwrap().path.as_deref(), Some("../local"));
+        let g = c.dependencies.iter().find(|d| d.name == "gitdep").unwrap();
+        assert_eq!(g.git.as_deref(), Some("https://ex/g.git"));
+        assert_eq!(g.rev.as_deref(), Some("abc"));
+    }
+    #[test] fn registries_and_abilities() {
+        let c = parse_hgx(concat!(
+            "[package]\nname = \"x\"\n",
+            "[registry]\ndefault = \"https://reg.nova/index\"\ncorp = \"/srv/index\"\n",
+            "[abilities]\nfast = \"trace\"\naudited = [\"log\", \"profile\"]\n",
+            "heal = { attr = \"self_healing\", args = \"attempts: 3\", targets = [\"fetch\"] }\n",
+        )).unwrap();
+        assert_eq!(c.registries.len(), 2);
+        assert_eq!(c.registries[0], ("default".into(), "https://reg.nova/index".into()));
+        // fast(1) + audited(2) + heal(1) = 4 abilities
+        assert_eq!(c.abilities.len(), 4);
+        let heal = c.abilities.iter().find(|a| a.attr == "self_healing").unwrap();
+        assert_eq!(heal.args, "attempts: 3");
+        assert_eq!(heal.targets, vec!["fetch"]);
+        assert!(c.abilities.iter().any(|a| a.attr == "trace" && a.targets.is_empty()));
+    }
+    #[test] fn bad_dependency_is_error() {
+        assert!(parse_hgx("[dependencies]\nfoo = { features = [\"x\"] }\n").is_err()); // no ver/git/path
+        assert!(parse_hgx("[dependencies]\nfoo = { bogus = \"1\" }\n").is_err());
     }
 }
