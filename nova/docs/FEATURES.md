@@ -31,6 +31,7 @@ marketing table. Legend:
 | `??` null-coalescing, ranges, slices, comprehensions | Run | interp + bytecode |
 | f-strings, tagged strings (`json"..."`), raw strings | Run | parser/interp |
 | collections: array/map/set literals, `[0; n]` fill | Run | interp + bytecode |
+| lazy streams: generators (`yield`) + `stream[T]` return type, pulled by `for x in` | Run | interp `gen_produce`, `Value::Generator`; `tests/corpus/stream_lazy.nova` |
 | stdlib (math/strings/arrays/random/time/json + list/sort/mathx/strx/ds/func/json/setx/fmtx/datex) | Run | `std/*.nova`, builtins |
 
 ## Numeric performance (v3.27) — Run ✅
@@ -71,7 +72,6 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 These build AST nodes but currently do nothing at runtime — the honest truth:
 | feature | status |
 |---|---|
-| `stream[T]` | Parse only (no streaming runtime) |
 | Higher-Kinded Types `[T[_]]` | Parse only (checker erases to Unknown) |
 | associated types (`type Item;` in traits) | Parse only |
 | effect polymorphism `![E]` | Parse only (monomorphic effects only) |
