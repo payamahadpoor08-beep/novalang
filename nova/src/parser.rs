@@ -220,6 +220,8 @@ fn lower_item(p: Pair<Rule>) -> Result<Option<Item>, String> {
         Rule::struct_decl => Ok(Some(Item::Struct(lower_struct(inner)?))),
         Rule::impl_block => Ok(Some(Item::Impl(lower_impl(inner)?))),
         Rule::enum_decl => Ok(Some(Item::Enum(lower_enum(inner)?))),
+        // a `union` is a tagged union: lower it through the same path as an enum
+        Rule::union_decl => Ok(Some(Item::Enum(lower_enum(inner)?))),
         Rule::test_block => Ok(Some(Item::Test(lower_test(inner)?))),
         Rule::machine_decl => Ok(Some(Item::Machine(lower_machine(inner)?))),
         Rule::const_decl => lower_const(inner).map(Some),

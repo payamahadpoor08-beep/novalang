@@ -15,7 +15,7 @@ marketing table. Legend:
 |---|---|---|
 | structs + methods (`impl`) | Run | interp.rs `make_struct`, `call_method_vals` |
 | tuple structs / `data C(...)` | Run | parser + interp |
-| enums with payloads + `match`/`=>` + guards | Run (VM-native) | interp `match_pattern`, bytecode `Op::MatchTest` |
+| enums + **`union`** with payloads + `match`/`=>` + guards | Run (VM-native) | interp `match_pattern`; `union` lowered to enum runtime |
 | closures / lambdas `x => ...` (+ block body) | Run (VM-native) | interp `call_closure`, bytecode lambda chunks |
 | generics `[T]` + trait bounds `[T: Trait]` + `where` | Check | types.rs `FnSig`, bound checks, return substitution |
 | traits + `impl Trait for T` (default/required methods) | Run | interp `methods`, trait defaults |
@@ -32,6 +32,7 @@ marketing table. Legend:
 | f-strings, tagged strings (`json"..."`), raw strings | Run | parser/interp |
 | collections: array/map/set literals, `[0; n]` fill | Run | interp + bytecode |
 | lazy streams: generators (`yield`) + `stream[T]` return type, pulled by `for x in` | Run | interp `gen_produce`, `Value::Generator`; `tests/corpus/stream_lazy.nova` |
+| associated types (`type Item;` + impl `type Item = X`), effect-poly `![E]`, HKT `[F[_]]` | Run (gradual) | parse + resolve to Unknown where not concrete; `tests/corpus/type_system_advanced.nova` |
 | stdlib (math/strings/arrays/random/time/json + list/sort/mathx/strx/ds/func/json/setx/fmtx/datex) | Run | `std/*.nova`, builtins |
 
 ## Numeric performance (v3.27) — Run ✅
@@ -73,14 +74,11 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 These build AST nodes but currently do nothing at runtime — the honest truth:
 | feature | status |
 |---|---|
-| Higher-Kinded Types `[T[_]]` | Parse only (checker erases to Unknown) |
-| associated types (`type Item;` in traits) | Parse only |
-| effect polymorphism `![E]` | Parse only (monomorphic effects only) |
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
 | `#[polymorph]` | **Parse only — no-op.** In a tree-walker, random dispatch among semantically-identical clones is a no-op by construction; it is properly an AOT-codegen concern (emit N equivalent C variants) and is deferred to that phase — deliberately not faked. |
 
-## Absent ❌ (not in grammar, despite the table)
-`union` types are not in the grammar and not implemented.
+## Absent ❌
+(none outstanding from the marketing table — `union` now implemented as a tagged union, lowered to the enum runtime; see `tests/corpus/union_types.nova`.)
 
 ## Tooling status
 | tool | status |
@@ -92,7 +90,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
-| LSP, package manager | Not implemented (design only) |
+| **LSP** (`nova lsp`) — stdio JSON-RPC: initialize, didOpen/didChange → live diagnostics (parse + type errors), hover | Run ✅ — `tests/lsp_smoke.sh` |
+| **package manager** (`nova add <src> [name]`, `nova deps`) — vendors deps into `nova_modules/`, resolved by `use "name"` | Run ✅ — local/path deps; `tests/pkg_smoke.sh` |
 | **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
 | **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |

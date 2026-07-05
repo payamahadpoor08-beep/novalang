@@ -19,6 +19,7 @@ kw_continue = @{ "continue" ~ !ident_continue }
 kw_return   = @{ "return"   ~ !ident_continue }
 kw_struct   = @{ "struct"   ~ !ident_continue }
 kw_enum     = @{ "enum"     ~ !ident_continue }
+kw_union    = @{ "union"    ~ !ident_continue }
 kw_trait    = @{ "trait"    ~ !ident_continue }
 kw_impl     = @{ "impl"     ~ !ident_continue }
 kw_use      = @{ "use"      ~ !ident_continue }
@@ -134,7 +135,7 @@ top_level = {
 top_stmt = { let_stmt | defer_stmt | expr ~ ";"? }
 
 item = {
-      func_decl | data_decl | struct_decl | enum_decl
+      func_decl | data_decl | struct_decl | enum_decl | union_decl
     | trait_decl | impl_block | migrate_decl
     | type_decl | const_decl | static_decl
     | extern_block | macro_decl | proc_macro_decl
@@ -178,6 +179,9 @@ struct_field = { attribute* ~ visibility? ~ kw_mut? ~ ident ~ ":" ~ type_expr }
 tuple_field  = { attribute* ~ visibility? ~ type_expr }
 
 enum_decl    = { kw_enum ~ ident ~ generic_params? ~ where_clause? ~ "{" ~ (enum_variant ~ ("," ~ enum_variant)* ~ ","?)? ~ "}" }
+// a `union` is a tagged union — identical shape to an enum, lowered to the same
+// runtime (variants with optional payloads, matched with `match`).
+union_decl   = { kw_union ~ ident ~ generic_params? ~ where_clause? ~ "{" ~ (enum_variant ~ ("," ~ enum_variant)* ~ ","?)? ~ "}" }
 enum_variant = { attribute* ~ ident ~ variant_data? ~ (kw_if ~ expr)? }
 variant_data = {
       "(" ~ type_expr ~ ("," ~ type_expr)* ~ ","? ~ ")"
@@ -189,8 +193,13 @@ trait_decl = {
     ~ "{" ~ trait_item* ~ "}"
 }
 trait_item = {
-    attribute* ~ (method_sig ~ (block | ";") | kw_const ~ ident ~ ":" ~ type_expr ~ ("=" ~ expr)? ~ ";")
+    attribute* ~ (method_sig ~ (block | ";")
+        | kw_const ~ ident ~ ":" ~ type_expr ~ ("=" ~ expr)? ~ ";"
+        | assoc_type)
 }
+// associated type: `type Item;` (required) or `type Item = Concrete;` (default).
+// The name is resolved structurally (traits are runtime-transparent in Nova).
+assoc_type = { kw_type ~ ident ~ ("=" ~ type_expr)? ~ ";" }
 method_sig = {
     kw_async? ~ kw_fn ~ ident ~ generic_params?
     ~ "(" ~ params? ~ ")" ~ ret_type? ~ effects_clause? ~ where_clause?
@@ -200,7 +209,7 @@ impl_block = {
     kw_impl ~ generic_params? ~ type_expr ~ (kw_for ~ type_expr)? ~ where_clause?
     ~ "{" ~ impl_item* ~ "}"
 }
-impl_item = { attribute* ~ visibility? ~ (func_decl | const_decl) }
+impl_item = { attribute* ~ visibility? ~ (func_decl | const_decl | assoc_type) }
 
 migrate_decl = { kw_migrate ~ kw_from ~ type_path ~ kw_to ~ type_path ~ block }
 
