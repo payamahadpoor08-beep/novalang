@@ -1,0 +1,336 @@
+//! The Nova lexer, written in Nova — self-hosting stage 1.
+//!
+//! Produces the canonical token dump (`kind<TAB>text` per line, `eof` last),
+//! byte-identical to the Rust reference `nova tokens <file>` for every corpus,
+//! std, and example file (gated by tests/selfhost_smoke.sh).
+//!
+//! usage: nova run selfhost/lexer.nova <file.nova>
+
+// the hard-keyword set (pest `hard_keyword`, 29 entries) — everything else,
+// including contextual keywords like `union`/`type`/`machine`, lexes as ident.
+// #[comptime]: evaluated once before main, every call returns the cached map.
+#[comptime]
+fn keywords() {
+    #{
+        "fn": 1, "let": 1, "mut": 1, "if": 1, "else": 1, "for": 1, "while": 1,
+        "loop": 1, "break": 1, "continue": 1, "return": 1, "struct": 1,
+        "enum": 1, "trait": 1, "impl": 1, "use": 1, "mod": 1, "match": 1,
+        "as": 1, "pub": 1, "self": 1, "super": 1, "crate": 1, "spawn": 1,
+        "select": 1, "await": 1, "true": 1, "false": 1, "null": 1
+    }
+}
+
+#[comptime]
+fn punct3() { ["<<=", ">>=", "..=", "===", "!==", "<=>", "??="] }
+
+#[comptime]
+fn punct2() {
+    ["<<", ">>", "=>", "==", "!=", ">=", "<=", "&&", "||", "**", "??", "..",
+     "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|="]
+}
+
+#[intent("character classes over code points, mirroring the Rust reference")]
+fn is_ident_start(c) {
+    if c == "" { return false }
+    let o = ord(c)
+    return o >= 65 && o <= 90 || o >= 97 && o <= 122 || c == "_"
+}
+
+fn is_ident_cont(c) {
+    if c == "" { return false }
+    let o = ord(c)
+    return o >= 65 && o <= 90 || o >= 97 && o <= 122 || o >= 48 && o <= 57 || c == "_"
+}
+
+fn is_digit(c) {
+    if c == "" { return false }
+    let o = ord(c)
+    return o >= 48 && o <= 57
+}
+
+fn is_hex(c) {
+    if c == "" { return false }
+    let o = ord(c)
+    return o >= 48 && o <= 57 || o >= 97 && o <= 102 || o >= 65 && o <= 70
+}
+
+// escape token text for the one-line dump: backslash first, then n/t/r
+#[intent("dump-line escaping identical to tokens::escape in Rust")]
+fn esc(t) {
+    let a = replace(t, "\\", "\\\\")
+    let b = replace(a, "\n", "\\n")
+    let c = replace(b, "\t", "\\t")
+    replace(c, "\r", "\\r")
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) < 1 {
+        eprint("usage: nova run selfhost/lexer.nova <file.nova>")
+        return
+    }
+    let src = read_file(argv[0])
+    // O(n) precompute: char array for O(1) char-at (substring is O(n))
+    let mut cs = []
+    for ch in src { push(cs, ch) }
+    let n = len(cs)
+    let kws = keywords()
+    let p3s = punct3()
+    let p2s = punct2()
+    let mut out = []
+    let mut i = 0
+
+    while i < n {
+        let c = cs[i]
+        // ---- trivia: whitespace ----
+        if c == " " || c == "\t" || c == "\r" || c == "\n" { i = i + 1; continue }
+        let c1 = if i + 1 < n { cs[i + 1] } else { "" }
+        // ---- trivia: line comments (// /// //!) ----
+        if c == "/" && c1 == "/" {
+            while i < n && cs[i] != "\n" { i = i + 1 }
+            continue
+        }
+        // ---- trivia: nested block comments ----
+        if c == "/" && c1 == "*" {
+            let mut depth = 1
+            i = i + 2
+            while i < n && depth > 0 {
+                let d0 = cs[i]
+                let d1 = if i + 1 < n { cs[i + 1] } else { "" }
+                if d0 == "/" && d1 == "*" { depth = depth + 1; i = i + 2 }
+                else if d0 == "*" && d1 == "/" { depth = depth - 1; i = i + 2 }
+                else { i = i + 1 }
+            }
+            continue
+        }
+        // ---- identifiers / keywords / string-prefix forms ----
+        if is_ident_start(c) {
+            let start = i
+            while i < n && is_ident_cont(cs[i]) { i = i + 1 }
+            let word = substring(src, start, i)
+            let nx = if i < n { cs[i] } else { "" }
+            // f"…" — one token, interpolation-aware
+            if word == "f" && nx == "\"" {
+                i = i + 1
+                let mut depth = 0
+                let mut inner = false
+                while i < n {
+                    let ch = cs[i]
+                    let ah = if i + 1 < n { cs[i + 1] } else { "" }
+                    if inner {
+                        if ch == "\\" { i = i + 2; continue }
+                        if ch == "\"" { inner = false }
+                        i = i + 1
+                        continue
+                    }
+                    if ch == "\\" { i = i + 2; continue }
+                    if ch == "{" {
+                        if ah == "{" { i = i + 2; continue }
+                        depth = depth + 1
+                        i = i + 1
+                        continue
+                    }
+                    if ch == "}" {
+                        if depth == 0 && ah == "}" { i = i + 2; continue }
+                        if depth > 0 { depth = depth - 1 }
+                        i = i + 1
+                        continue
+                    }
+                    if ch == "\"" {
+                        if depth == 0 { i = i + 1; break }
+                        inner = true
+                        i = i + 1
+                        continue
+                    }
+                    i = i + 1
+                }
+                push(out, "fstr\t" + esc(substring(src, start, i)))
+                continue
+            }
+            // json"…" / sql"…" / re"…"
+            if (word == "json" || word == "sql" || word == "re") && nx == "\"" {
+                i = i + 1
+                while i < n && cs[i] != "\"" {
+                    if cs[i] == "\\" { i = i + 1 }
+                    i = i + 1
+                }
+                i = i + 1
+                let stop = if i < n { i } else { n }
+                push(out, "tag\t" + esc(substring(src, start, stop)))
+                continue
+            }
+            // r"…" / r#"…"# with matched hashes
+            if word == "r" && (nx == "\"" || nx == "#") {
+                let mut hashes = 0
+                let mut j = i
+                while j < n && cs[j] == "#" { hashes = hashes + 1; j = j + 1 }
+                let jq = if j < n { cs[j] } else { "" }
+                if jq == "\"" {
+                    j = j + 1
+                    let mut done = false
+                    while j < n && !done {
+                        if cs[j] == "\"" {
+                            let mut k = 0
+                            while k < hashes && j + 1 + k < n && cs[j + 1 + k] == "#" { k = k + 1 }
+                            if k == hashes { j = j + 1 + hashes; done = true; continue }
+                        }
+                        j = j + 1
+                    }
+                    let stop = if j < n { j } else { n }
+                    push(out, "raw\t" + esc(substring(src, start, stop)))
+                    i = j
+                    continue
+                }
+                // `r` + hashes but no quote: plain ident `r`, rescan from here
+            }
+            if map_has(kws, word) { push(out, "kw\t" + word) }
+            else { push(out, "ident\t" + word) }
+            continue
+        }
+        // ---- numbers ----
+        if is_digit(c) {
+            let start = i
+            if c == "0" && (c1 == "x" || c1 == "b" || c1 == "o") {
+                let base = c1
+                i = i + 2
+                while i < n {
+                    let d = cs[i]
+                    let mut ok = false
+                    if base == "x" { ok = is_hex(d) || d == "_" }
+                    else if base == "b" { ok = d == "0" || d == "1" || d == "_" }
+                    else {
+                        if d == "" { ok = false }
+                        else {
+                            let o = ord(d)
+                            ok = (o >= 48 && o <= 55) || d == "_"
+                        }
+                    }
+                    if !ok { break }
+                    i = i + 1
+                }
+                i = eat_int_suffix(src, cs, n, i)
+                push(out, "int\t" + substring(src, start, i))
+                continue
+            }
+            while i < n && (is_digit(cs[i]) || cs[i] == "_") { i = i + 1 }
+            let mut is_float = false
+            let dot = if i < n { cs[i] } else { "" }
+            let after_dot = if i + 1 < n { cs[i + 1] } else { "" }
+            if dot == "." && is_digit(after_dot) {
+                is_float = true
+                i = i + 1
+                while i < n && (is_digit(cs[i]) || cs[i] == "_") { i = i + 1 }
+            }
+            // exponent: e/E [+/-] digits (only when digits actually follow)
+            let e = if i < n { cs[i] } else { "" }
+            if e == "e" || e == "E" {
+                let mut j = i + 1
+                let sgn = if j < n { cs[j] } else { "" }
+                if sgn == "+" || sgn == "-" { j = j + 1 }
+                let dj = if j < n { cs[j] } else { "" }
+                if is_digit(dj) {
+                    is_float = true
+                    i = j
+                    while i < n && is_digit(cs[i]) { i = i + 1 }
+                }
+            }
+            if is_float {
+                // float suffix f32/f64
+                let f = if i < n { cs[i] } else { "" }
+                if f == "f" && (substring(src, i + 1, i + 3) == "32" || substring(src, i + 1, i + 3) == "64") {
+                    i = i + 3
+                }
+                push(out, "float\t" + substring(src, start, i))
+            } else {
+                i = eat_int_suffix(src, cs, n, i)
+                push(out, "int\t" + substring(src, start, i))
+            }
+            continue
+        }
+        // ---- plain string ----
+        if c == "\"" {
+            let start = i
+            i = i + 1
+            while i < n && cs[i] != "\"" {
+                if cs[i] == "\\" { i = i + 1 }
+                i = i + 1
+            }
+            i = i + 1
+            let stop = if i < n { i } else { n }
+            push(out, "str\t" + esc(substring(src, start, stop)))
+            continue
+        }
+        // ---- char literal vs lifetime ----
+        if c == "'" {
+            let c2 = if i + 2 < n { cs[i + 2] } else { "" }
+            if c1 == "\\" {
+                let start = i
+                i = i + 2
+                let u0 = if i < n { cs[i] } else { "" }
+                let u1 = if i + 1 < n { cs[i + 1] } else { "" }
+                if u0 == "u" && u1 == "{" {
+                    while i < n && cs[i] != "}" { i = i + 1 }
+                    i = i + 1
+                } else {
+                    i = i + 1
+                }
+                let q = if i < n { cs[i] } else { "" }
+                if q == "'" { i = i + 1 }
+                let stop = if i < n { i } else { n }
+                push(out, "char\t" + esc(substring(src, start, stop)))
+                continue
+            }
+            if c2 == "'" && c1 != "'" {
+                push(out, "char\t" + esc(substring(src, i, i + 3)))
+                i = i + 3
+                continue
+            }
+            if is_ident_start(c1) {
+                let start = i
+                i = i + 2
+                while i < n && is_ident_cont(cs[i]) { i = i + 1 }
+                push(out, "life\t" + substring(src, start, i))
+                continue
+            }
+            push(out, "punct\t'")
+            i = i + 1
+            continue
+        }
+        // ---- punctuation: maximal munch 3 → 2 → 1 ----
+        if i + 3 <= n {
+            let p3 = substring(src, i, i + 3)
+            if contains_elem(p3s, p3) {
+                push(out, "punct\t" + esc(p3))
+                i = i + 3
+                continue
+            }
+        }
+        if i + 2 <= n {
+            let p2 = substring(src, i, i + 2)
+            if contains_elem(p2s, p2) {
+                push(out, "punct\t" + esc(p2))
+                i = i + 2
+                continue
+            }
+        }
+        push(out, "punct\t" + esc(c))
+        i = i + 1
+    }
+    push(out, "eof")
+    print(join(out, "\n"))
+}
+
+// consume an optional (i|u)(8|16|32|64|128|size) suffix, returning the new index
+fn eat_int_suffix(src, cs, n, i) {
+    let c = if i < n { cs[i] } else { "" }
+    if c == "i" || c == "u" {
+        let rest = substring(src, i + 1, i + 5)
+        if starts_with(rest, "128") { return i + 4 }
+        if starts_with(rest, "64") { return i + 3 }
+        if starts_with(rest, "32") { return i + 3 }
+        if starts_with(rest, "16") { return i + 3 }
+        if starts_with(rest, "8") { return i + 2 }
+        if starts_with(rest, "size") { return i + 5 }
+    }
+    i
+}

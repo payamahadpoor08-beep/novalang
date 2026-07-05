@@ -60,3 +60,6 @@ jobs:
           bash tests/lsp_smoke.sh
           bash tests/pkg_smoke.sh
           bash tests/registry_smoke.sh
+
+      - name: Self-hosting gate (Nova lexer in Nova, byte-identical vs Rust)
+        run: bash tests/selfhost_smoke.sh

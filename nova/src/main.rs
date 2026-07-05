@@ -12,6 +12,7 @@ mod diag;
 mod obfuscate;
 mod lsp;
 mod registry;
+mod tokens;
 
 use std::io::{self, Write, BufRead};
 use std::process::exit;
@@ -274,6 +275,13 @@ fn main() {
             let path = require_path(&args);
             let src = read(&path);
             print!("{}", doc_extract(&path, &src));
+        }
+        "tokens" => {
+            // the canonical token dump — the self-hosting stage-1 reference
+            // (selfhost/lexer.nova must produce byte-identical output)
+            let path = require_path(&args);
+            let src = read(&path);
+            print!("{}", tokens::dump(&src));
         }
         "fmt" => {
             // `nova fmt <file>` prints to stdout; `nova fmt -w <file>` rewrites in place
