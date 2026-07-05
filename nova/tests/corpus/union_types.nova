@@ -1,0 +1,43 @@
+// `union` declarations: a tagged union (variants with optional payloads),
+// lowered to the same runtime as `enum` — constructed by name, destructured
+// with `match`. Byte-identical across interp and all VM/JIT modes.
+
+union Json {
+    JNull,
+    JBool(Bool),
+    JNum(Int),
+    JStr(Str),
+    JArr(Int),
+}
+
+fn describe(j) {
+    match j {
+        JNull => "null",
+        JBool(b) => if b { "true" } else { "false" },
+        JNum(n) => "num:" + str(n),
+        JStr(s) => "str:" + s,
+        JArr(len) => "arr[" + str(len) + "]",
+    }
+}
+
+union Tree {
+    Leaf(Int),
+    Node(Int, Int),
+}
+
+fn sum(t) {
+    match t {
+        Leaf(v) => v,
+        Node(a, b) => a + b,
+    }
+}
+
+fn main() {
+    print(describe(JNull))
+    print(describe(JBool(true)))
+    print(describe(JNum(42)))
+    print(describe(JStr("hi")))
+    print(describe(JArr(3)))
+    print(sum(Leaf(7)))
+    print(sum(Node(10, 20)))
+}

@@ -15,7 +15,7 @@ marketing table. Legend:
 |---|---|---|
 | structs + methods (`impl`) | Run | interp.rs `make_struct`, `call_method_vals` |
 | tuple structs / `data C(...)` | Run | parser + interp |
-| enums with payloads + `match`/`=>` + guards | Run (VM-native) | interp `match_pattern`, bytecode `Op::MatchTest` |
+| enums + **`union`** with payloads + `match`/`=>` + guards | Run (VM-native) | interp `match_pattern`; `union` lowered to enum runtime |
 | closures / lambdas `x => ...` (+ block body) | Run (VM-native) | interp `call_closure`, bytecode lambda chunks |
 | generics `[T]` + trait bounds `[T: Trait]` + `where` | Check | types.rs `FnSig`, bound checks, return substitution |
 | traits + `impl Trait for T` (default/required methods) | Run | interp `methods`, trait defaults |
@@ -79,8 +79,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
 | `#[polymorph]` | **Parse only — no-op.** In a tree-walker, random dispatch among semantically-identical clones is a no-op by construction; it is properly an AOT-codegen concern (emit N equivalent C variants) and is deferred to that phase — deliberately not faked. |
 
-## Absent ❌ (not in grammar, despite the table)
-`union` types are not in the grammar and not implemented.
+## Absent ❌
+(none outstanding from the marketing table — `union` now implemented as a tagged union, lowered to the enum runtime; see `tests/corpus/union_types.nova`.)
 
 ## Tooling status
 | tool | status |
