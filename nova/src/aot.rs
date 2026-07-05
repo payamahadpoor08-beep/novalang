@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use crate::ast::*;
 use crate::jit::{eligible_set, float_eligible_set};
 
-pub enum Backend { C, Llvm, Wasm, Arm }
+pub enum Backend { C, Llvm, Wasm, Arm, Arm32 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tier { Typed, Boxed }
@@ -256,7 +256,7 @@ pub fn emit(prog: &Program, backend: &Backend) -> Option<(String, Tier)> {
         // ARM and WASM cross-compile the same portable C (typed + boxed):
         // nova_rt.c is ordinary libc C — the aarch64 cross gcc links it, and
         // clang links it against wasi-libc for wasm32-wasi.
-        Backend::C | Backend::Arm | Backend::Wasm => {
+        Backend::C | Backend::Arm | Backend::Arm32 | Backend::Wasm => {
             if let Some(code) = emit_boxed(prog) { return Some((code, Tier::Boxed)); }
         }
         Backend::Llvm => {
@@ -282,7 +282,7 @@ fn emit_typed(prog: &Program, backend: &Backend) -> Option<String> {
     Some(match backend {
         // ARM and WASM reuse the portable C codegen (printf-based); only the
         // compiler + run harness differ (cross gcc+qemu / clang wasm32-wasi+node).
-        Backend::C | Backend::Arm | Backend::Wasm => CEmit::new(&a).emit(),
+        Backend::C | Backend::Arm | Backend::Arm32 | Backend::Wasm => CEmit::new(&a).emit(),
         Backend::Llvm => LlEmit::new(&a).emit(),
     })
 }

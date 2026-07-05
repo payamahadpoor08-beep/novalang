@@ -94,8 +94,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | LSP, package manager | Not implemented (design only) |
 | **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
-| **ARM target** (`nova build --aot=arm`) — typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, shipped only if byte-identical to `nova run` under `qemu-aarch64` (`tests/arm_smoke.sh`). For Raspberry Pi / aarch64 mobile. |
-| 32-bit / other mobile targets | Not implemented (same cross-compile pattern, add on request) |
+| **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
+| **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |
 
 ## The three real gaps that matter for "AOT/speed"
 1. **AOT native for mixed int/float kernels.** `nova build --aot` now compiles

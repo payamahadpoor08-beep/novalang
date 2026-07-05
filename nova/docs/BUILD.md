@@ -59,9 +59,12 @@ binary with `aarch64-linux-gnu-gcc -static`, for Raspberry Pi / aarch64 mobile.
 It ships only if it passes the oracle gate: the binary is run under
 `qemu-aarch64` and its output must be byte-identical to `nova run`. Requires
 `aarch64-linux-gnu-gcc` and (to self-verify) `qemu-aarch64`
-(`apt-get install gcc-aarch64-linux-gnu qemu-user`). Embed-tier programs aren't
+(`apt-get install gcc-aarch64-linux-gnu qemu-user`). **`--aot=arm32`** does the
+same for **ARMv7 (32-bit hard-float)** — older / weaker phones — via
+`arm-linux-gnueabihf-gcc -marm`, verified under `qemu-arm`
+(`apt-get install gcc-arm-linux-gnueabihf`). Embed-tier programs aren't
 ARM-AOT-able (the embed binary would be the host arch); use the typed/boxed
-tiers. See `tests/arm_smoke.sh`.
+tiers. See `tests/arm_smoke.sh` (covers both arches).
 
 ## Commands
 
@@ -69,7 +72,8 @@ tiers. See `tests/arm_smoke.sh`.
 nova build program.nova            # embed build (always succeeds)
 nova build --aot program.nova      # typed→boxed→embed via the C backend
 nova build --aot=wasm program.nova # wasm32-wasi (typed+boxed), node-WASI-verified
-nova build --aot=arm program.nova  # static aarch64 (typed+boxed), qemu-verified
+nova build --aot=arm program.nova  # static aarch64/ARMv8 (typed+boxed), qemu-verified
+nova build --aot=arm32 program.nova # static ARMv7/32-bit (typed+boxed), qemu-verified
 nova build --aot=llvm program.nova # same tiers via the LLVM backend
 ```
 
