@@ -1,0 +1,27 @@
+// A mixed int/float kernel (mandelbrot escape counter): int loop counters +
+// float coordinates + to_float conversions + f64 comparisons. AOT now types
+// each local i64/double (mirroring the JIT's NumGen) and lowers it to a TRUE
+// standalone native binary (typed tier), not the embed fallback. Byte-identical.
+
+fn count(w, h, maxi) {
+    let mut total = 0
+    for py in 0..h {
+        for px in 0..w {
+            let x0 = to_float(px) / to_float(w) * 3.5 - 2.5
+            let y0 = to_float(py) / to_float(h) * 2.0 - 1.0
+            let mut x = 0.0
+            let mut y = 0.0
+            let mut it = 0
+            while x * x + y * y <= 4.0 && it < maxi {
+                let xt = x * x - y * y + x0
+                y = 2.0 * x * y + y0
+                x = xt
+                it = it + 1
+            }
+            if it == maxi { total = total + 1 }
+        }
+    }
+    total
+}
+
+fn main() { print(count(80, 60, 100)) }

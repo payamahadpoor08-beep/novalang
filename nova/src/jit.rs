@@ -632,6 +632,45 @@ fn is_num_intrinsic(name: &str) -> bool { matches!(name, "to_float" | "to_int") 
 // (kind I, deopts on overflow) and the return may be I or F.
 struct NumCheck { kinds: HashMap<String, FKind> }
 
+// Public for the AOT backend: if `f` is numeric-eligible (mixed int/float, all
+// params int), return (result kind, per-local FKind map). None if ineligible.
+// Rejects functions containing `**` (the AOT mixed path can't emit its
+// deopt-on-overflow semantics) so those fall back to embed honestly.
+pub fn numeric_kinds(f: &Func) -> Option<(FKind, HashMap<String, FKind>)> {
+    if body_has_pow(&f.body) { return None; }
+    let mut c = NumCheck { kinds: HashMap::new() };
+    for p in &f.params { c.kinds.insert(p.clone(), FKind::I); }
+    if f.body.is_empty() || !always_returns(&f.body) { return None; }
+    let mut ret: Option<FKind> = None;
+    if !c.stmts(&f.body, &mut ret) { return None; }
+    ret.map(|rk| (rk, c.kinds))
+}
+
+fn body_has_pow(body: &[Stmt]) -> bool {
+    fn se(e: &Expr) -> bool {
+        match e {
+            Expr::At { expr, .. } | Expr::Unary { expr, .. } => se(expr),
+            Expr::Binary { op, lhs, rhs } => *op == BinOp::Pow || se(lhs) || se(rhs),
+            Expr::If { cond, then, els } => se(cond) || se(then) || se(els),
+            Expr::Call { args, .. } => args.iter().any(se),
+            Expr::Block { stmts, tail } => stmts.iter().any(ss) || tail.as_ref().map_or(false, |t| se(t)),
+            _ => false,
+        }
+    }
+    fn ss(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value)
+            | Stmt::Return(Some(value)) => se(value),
+            Stmt::If { cond, then, els } => se(cond) || then.iter().any(ss)
+                || els.as_ref().map_or(false, |e| e.iter().any(ss)),
+            Stmt::While { cond, body } => se(cond) || body.iter().any(ss),
+            Stmt::ForRange { start, end, body, .. } => se(start) || se(end) || body.iter().any(ss),
+            _ => false,
+        }
+    }
+    body.iter().any(ss)
+}
+
 impl NumCheck {
     // returns the function's result kind if it is numeric-eligible
     fn check_fn(f: &Func) -> Option<FKind> {
