@@ -92,8 +92,9 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | LSP, package manager | Not implemented (design only) |
-| **WASM target** (`nova build --aot=wasm`) — typed tier | Run ✅ — freestanding wasm32 via clang (no wasi-sysroot; `print` routes to JS host imports), shipped only if byte-identical to `nova run` under node (`tests/wasm_smoke.sh`). Boxed/embed (strings/arrays) await a wasi-sysroot. |
-| ARM / 32-bit / mobile targets | Not implemented — needs `qemu`/cross-libc to build+byte-verify (absent here); deferred until provably byte-identical (ROADMAP §4) |
+| **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
+| **ARM target** (`nova build --aot=arm`) — typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, shipped only if byte-identical to `nova run` under `qemu-aarch64` (`tests/arm_smoke.sh`). For Raspberry Pi / aarch64 mobile. |
+| 32-bit / other mobile targets | Not implemented (same cross-compile pattern, add on request) |
 
 ## The three real gaps that matter for "AOT/speed"
 1. **AOT native for mixed/array kernels.** `nova build --aot` compiles pure-int
