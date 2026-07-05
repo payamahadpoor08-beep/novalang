@@ -10,6 +10,7 @@ mod build;
 mod aot;
 mod diag;
 mod obfuscate;
+mod lsp;
 
 use std::io::{self, Write, BufRead};
 use std::process::exit;
@@ -333,11 +334,14 @@ fn main() {
                 Err(e) => { eprintln!("{}", e); exit(1); }
             }
         }
+        "lsp" => lsp::run(),
+        "add" => pkg_add(&args),
+        "deps" => pkg_deps(),
         "daemon" => run_daemon(),
         "version" | "--version" | "-v" => println!("Nova {}", VERSION),
         other => {
             eprintln!("unknown command: {}", other);
-            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | repl | daemon | version]");
+            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | lsp | add <src> [name] | deps | repl | daemon | version]");
             exit(2);
         }
     }
@@ -660,6 +664,14 @@ pub(crate) fn resolve_import(base: &std::path::Path, rel: &str) -> std::path::Pa
         let p = std::path::Path::new(&root).join(rel.strip_prefix("std/").unwrap_or(rel));
         if p.exists() { return p; }
     }
+    // vendored dependencies (the package manager): `nova add` copies deps into
+    // ./nova_modules, so `use "dep"` / `use "dep.nova"` resolves from any project.
+    for cand in [
+        std::path::Path::new("nova_modules").join(rel),
+        std::path::Path::new("nova_modules").join(format!("{}.nova", rel.trim_end_matches(".nova"))),
+    ] {
+        if cand.exists() { return cand; }
+    }
     if let Ok(exe) = std::env::current_exe() {
         for up in [exe.parent(), exe.parent().and_then(|p| p.parent()),
                    exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())] {
@@ -670,6 +682,34 @@ pub(crate) fn resolve_import(base: &std::path::Path, rel: &str) -> std::path::Pa
         }
     }
     local
+}
+
+// The package manager: `nova add <src.nova> [name]` vendors a dependency into
+// ./nova_modules/<name>.nova and records it in ./nova.deps; `nova deps` lists
+// them. Vendored deps are resolved by `resolve_import` above, so a program can
+// `use "name"` regardless of where the source lived. Minimal but real — no
+// registry/network, just local/path deps (the honest, verifiable core).
+fn pkg_add(args: &[String]) {
+    let src = match args.get(2) { Some(s) => s.clone(), None => { eprintln!("usage: nova add <src.nova> [name]"); exit(2); } };
+    let stem = std::path::Path::new(&src).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = args.get(3).cloned().unwrap_or(stem);
+    let content = match std::fs::read_to_string(&src) { Ok(c) => c, Err(e) => { eprintln!("error: cannot read {}: {}", src, e); exit(1); } };
+    if let Err(e) = std::fs::create_dir_all("nova_modules") { eprintln!("error: {}", e); exit(1); }
+    let dest = format!("nova_modules/{}.nova", name);
+    if let Err(e) = std::fs::write(&dest, &content) { eprintln!("error: cannot write {}: {}", dest, e); exit(1); }
+    // record in nova.deps (idempotent: replace an existing line for this name)
+    let manifest = std::fs::read_to_string("nova.deps").unwrap_or_default();
+    let mut lines: Vec<String> = manifest.lines().filter(|l| !l.starts_with(&format!("{} =", name))).map(|s| s.to_string()).collect();
+    lines.push(format!("{} = {}", name, src));
+    let _ = std::fs::write("nova.deps", lines.join("\n") + "\n");
+    println!("added `{}` -> {} (use \"{}\")", name, dest, name);
+}
+
+fn pkg_deps() {
+    match std::fs::read_to_string("nova.deps") {
+        Ok(m) if !m.trim().is_empty() => { print!("{}", m); }
+        _ => println!("no dependencies (use `nova add <src.nova> [name]`)"),
+    }
 }
 
 fn load_module(
