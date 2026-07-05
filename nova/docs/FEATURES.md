@@ -42,7 +42,7 @@ marketing table. Legend:
 | **local int-field structs JIT'd (arena slots)** | Run — struct kernel 0.25s vs 2.84s pure-VM (~11×); aliases share the handle; escapes stay interp/VM |
 | AOT native (C + LLVM), **pure-int/float** kernels | Run — fib native 7ms ≈ C |
 | AOT native for **local-int-array** kernels (sieve) | Run — true standalone native binary (typed tier), not embed |
-| AOT native for **mixed int/float** kernels (mandel) | **Parse→embed** — see gap #1 below |
+| AOT native for **mixed int/float** kernels (mandel) | Run — true standalone native binary (typed tier, per-variable i64/double typing); 52ms |
 
 ## Attributes — now real (v3.28, Phase 1) ✅
 Attributes are no longer discarded; these carry tested semantics on every tier
@@ -97,8 +97,9 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
 | **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |
 
-## The three real gaps that matter for "AOT/speed"
-1. **AOT native for mixed int/float kernels.** `nova build --aot` now compiles
+## Remaining AOT notes
+1. **(resolved) AOT native for mixed int/float kernels.** fib, sieve AND mandel
+   now compile to true standalone native binaries. Historical note: `nova build --aot` now compiles
    pure-int functions (fib) AND **local-int-array kernels (sieve)** to standalone
    native binaries — the C emitter has a `NIA` int-array (the C twin of the JIT
    arena), so sieve is a true native `aot_sieve` (typed tier, byte-identical, also

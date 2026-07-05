@@ -28,6 +28,8 @@ impl Tier {
 pub struct AotProgram<'p> {
     int_fns: Vec<&'p Func>,
     float_fns: Vec<&'p Func>,
+    // mixed int/float functions (per-variable typing, from jit::numeric_kinds)
+    num_fns: Vec<&'p Func>,
     // main's body with the parser's implicit trailing `return <expr>`
     // rewritten back to plain expression statements
     main_body: Vec<Stmt>,
@@ -39,6 +41,10 @@ pub fn analyze(prog: &Program) -> Option<AotProgram<'_>> {
     let floats = float_eligible_set(prog, &ints);
     let mut int_fns = Vec::new();
     let mut float_fns = Vec::new();
+    let mut num_fns = Vec::new();
+    // num fns returning int are, from a caller's view, int-returning: fold them
+    // into the int set so main's gate accepts calls to them.
+    let mut ints_ext = ints.clone();
     let mut main = None;
     for item in &prog.items {
         let f = match item {
@@ -51,6 +57,10 @@ pub fn analyze(prog: &Program) -> Option<AotProgram<'_>> {
         if f.name == "main" { main = Some(f); continue; }
         if ints.contains(&f.name) { int_fns.push(f); }
         else if floats.contains(&f.name) { float_fns.push(f); }
+        else if let Some((rk, _)) = crate::jit::numeric_kinds(f) {
+            num_fns.push(f);
+            if rk == crate::jit::FKind::I { ints_ext.insert(f.name.clone()); }
+        }
         else { return None; }
     }
     let main = main?;
@@ -59,8 +69,8 @@ pub fn analyze(prog: &Program) -> Option<AotProgram<'_>> {
     fix_main_tail(&mut main_body);
     let mut scopes = vec![HashSet::new()];
     let main_arrays = main_body_arrays(&main_body);
-    if !main_body.iter().all(|s| main_stmt_ok(s, &ints, &main_arrays, &mut scopes)) { return None; }
-    Some(AotProgram { int_fns, float_fns, main_body })
+    if !main_body.iter().all(|s| main_stmt_ok(s, &ints_ext, &main_arrays, &mut scopes)) { return None; }
+    Some(AotProgram { int_fns, float_fns, num_fns, main_body })
 }
 
 // the parser turns main's trailing expression (and the tails of a trailing
@@ -331,6 +341,11 @@ struct CEmit<'p> {
 
 fn mangle(n: &str) -> String { format!("nv_{}", n) }
 
+// C type for a numeric kind
+fn ck(k: crate::jit::FKind) -> &'static str {
+    match k { crate::jit::FKind::F => "double", crate::jit::FKind::I => "i64" }
+}
+
 // mini dynamic int64 array — the C equivalent of the JIT's local-array arena.
 // Only emitted when a function actually uses local int arrays.
 const NIA_PRELUDE: &str = "\
@@ -357,11 +372,135 @@ impl<'p> CEmit<'p> {
         if self.uses_arrays() { self.out.push_str(NIA_PRELUDE); }
         for f in &self.a.int_fns { self.proto(f, "i64"); }
         for f in &self.a.float_fns { self.proto(f, "double"); }
+        for f in self.a.num_fns.clone() {
+            let (rk, _) = crate::jit::numeric_kinds(f).unwrap();
+            // num fns take all-int params; only the return type varies
+            let ps: Vec<String> = f.params.iter().map(|p| format!("i64 {}", mangle(p))).collect();
+            let _ = writeln!(self.out, "static {} {}({});", ck(rk), mangle(&f.name), ps.join(", "));
+        }
         self.out.push('\n');
         for f in self.a.int_fns.clone() { self.func(f, false); }
         for f in self.a.float_fns.clone() { self.func(f, true); }
+        for f in self.a.num_fns.clone() { self.num_func(f); }
         self.main();
         self.out
+    }
+
+    // Emit a mixed int/float function: each local is typed i64 or double per
+    // jit::numeric_kinds; arithmetic promotes to double when either side is
+    // float; comparisons are done as f64 (Nova semantics); to_float/to_int are
+    // C casts. Mirrors the JIT's NumGen.
+    fn num_func(&mut self, f: &Func) {
+        let (rk, kinds) = crate::jit::numeric_kinds(f).unwrap();
+        let ps: Vec<String> = f.params.iter().map(|p| format!("i64 {}", mangle(p))).collect();
+        let _ = writeln!(self.out, "static {} {}({}) {{", ck(rk), mangle(&f.name), ps.join(", "));
+        let mut vars: Vec<String> = Vec::new();
+        collect_vars(&f.body, &mut vars);
+        for v in &vars {
+            if !f.params.contains(v) {
+                let t = kinds.get(v).map(|k| ck(*k)).unwrap_or("i64");
+                let _ = writeln!(self.out, "  {} {} = {};", t, mangle(v),
+                    if kinds.get(v) == Some(&crate::jit::FKind::F) { "0.0" } else { "0" });
+            }
+        }
+        for s in &f.body { self.num_stmt(s, 1, &kinds); }
+        let _ = writeln!(self.out, "  return {};\n}}\n", if rk == crate::jit::FKind::F { "0.0" } else { "0" });
+    }
+
+    fn num_stmt(&mut self, s: &Stmt, d: usize, k: &HashMap<String, crate::jit::FKind>) {
+        let ind = "  ".repeat(d);
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                let (v, _) = self.num_expr(value, k);
+                let _ = writeln!(self.out, "{}{} = {};", ind, mangle(name), v);
+            }
+            Stmt::Return(Some(e)) => { let (v, _) = self.num_expr(e, k); let _ = writeln!(self.out, "{}return {};", ind, v); }
+            Stmt::Return(None) => { let _ = writeln!(self.out, "{}return 0;", ind); }
+            Stmt::Expr(e) => { let (v, _) = self.num_expr(e, k); let _ = writeln!(self.out, "{}(void)({});", ind, v); }
+            Stmt::If { cond, then, els } => {
+                let c = self.num_cond(cond, k);
+                let _ = writeln!(self.out, "{}if ({}) {{", ind, c);
+                for s in then { self.num_stmt(s, d + 1, k); }
+                if let Some(e) = els { let _ = writeln!(self.out, "{}}} else {{", ind); for s in e { self.num_stmt(s, d + 1, k); } }
+                let _ = writeln!(self.out, "{}}}", ind);
+            }
+            Stmt::While { cond, body } => {
+                let c = self.num_cond(cond, k);
+                let _ = writeln!(self.out, "{}while ({}) {{", ind, c);
+                for s in body { self.num_stmt(s, d + 1, k); }
+                let _ = writeln!(self.out, "{}}}", ind);
+            }
+            Stmt::ForRange { var, start, end, inclusive, body } => {
+                let (a, _) = self.num_expr(start, k);
+                let (b, _) = self.num_expr(end, k);
+                let cmp = if *inclusive { "<=" } else { "<" };
+                let v = mangle(var);
+                let _ = writeln!(self.out, "{}for ({} = {}; {} {} {}; {}++) {{", ind, v, a, v, cmp, b, v);
+                for s in body { self.num_stmt(s, d + 1, k); }
+                let _ = writeln!(self.out, "{}}}", ind);
+            }
+            Stmt::Break(None) => { let _ = writeln!(self.out, "{}break;", ind); }
+            Stmt::Continue => { let _ = writeln!(self.out, "{}continue;", ind); }
+            _ => {}
+        }
+    }
+
+    // returns (C expr, kind). Casts inserted so mixed arithmetic matches Nova.
+    fn num_expr(&mut self, e: &Expr, k: &HashMap<String, crate::jit::FKind>) -> (String, crate::jit::FKind) {
+        use crate::jit::FKind::{F, I};
+        match e {
+            Expr::At { expr, .. } => self.num_expr(expr, k),
+            Expr::Int(n) => (format!("{}LL", n), I),
+            Expr::Float(x) => (c_float(*x), F),
+            Expr::Ident(n) => (mangle(n), k.get(n).copied().unwrap_or(I)),
+            Expr::Unary { op: UnOp::Neg, expr } => { let (v, kk) = self.num_expr(expr, k); (format!("(-({}))", v), kk) }
+            Expr::Binary { op, lhs, rhs } if matches!(op, BinOp::Add|BinOp::Sub|BinOp::Mul|BinOp::Div|BinOp::Rem) => {
+                let (a, la) = self.num_expr(lhs, k);
+                let (b, lb) = self.num_expr(rhs, k);
+                let c = match op { BinOp::Add=>"+", BinOp::Sub=>"-", BinOp::Mul=>"*", BinOp::Div=>"/", _=>"%" };
+                if la == I && lb == I {
+                    // int op int stays i64 (matches interp; overflow rejected via no-pow gate scope)
+                    (format!("(({}) {} ({}))", a, c, b), I)
+                } else if matches!(op, BinOp::Rem) {
+                    // float remainder -> fmod (needs math), but Nova uses %; keep as fmod
+                    (format!("__builtin_fmod((double)({}), (double)({}))", a, b), F)
+                } else {
+                    (format!("((double)({}) {} (double)({}))", a, c, b), F)
+                }
+            }
+            Expr::If { cond, then, els } => {
+                let c = self.num_cond(cond, k);
+                let (t, tk) = self.num_expr(then, k);
+                let (e2, _) = self.num_expr(els, k);
+                (format!("(({}) ? ({}) : ({}))", c, t, e2), tk)
+            }
+            Expr::Call { callee, args } if callee == "to_float" && args.len() == 1 => {
+                let (v, _) = self.num_expr(&args[0], k); (format!("((double)({}))", v), F)
+            }
+            Expr::Call { callee, args } if callee == "to_int" && args.len() == 1 => {
+                let (v, _) = self.num_expr(&args[0], k); (format!("((i64)({}))", v), I)
+            }
+            _ => ("0".into(), I),
+        }
+    }
+
+    // a boolean condition in a num fn: comparisons are done as f64 (Nova compares
+    // numbers as f64); &&/||/! compose.
+    fn num_cond(&mut self, e: &Expr, k: &HashMap<String, crate::jit::FKind>) -> String {
+        match e {
+            Expr::At { expr, .. } => self.num_cond(expr, k),
+            Expr::Unary { op: UnOp::Not, expr } => format!("(!({}))", self.num_cond(expr, k)),
+            Expr::Binary { op: BinOp::And, lhs, rhs } => format!("(({}) && ({}))", self.num_cond(lhs, k), self.num_cond(rhs, k)),
+            Expr::Binary { op: BinOp::Or, lhs, rhs } => format!("(({}) || ({}))", self.num_cond(lhs, k), self.num_cond(rhs, k)),
+            Expr::Binary { op, lhs, rhs }
+                if matches!(op, BinOp::Lt|BinOp::Le|BinOp::Gt|BinOp::Ge|BinOp::Eq|BinOp::Ne) => {
+                let (a, _) = self.num_expr(lhs, k);
+                let (b, _) = self.num_expr(rhs, k);
+                let c = match op { BinOp::Lt=>"<", BinOp::Le=>"<=", BinOp::Gt=>">", BinOp::Ge=>">=", BinOp::Eq=>"==", _=>"!=" };
+                format!("((double)({}) {} (double)({}))", a, c, b)
+            }
+            _ => "0".into(),
+        }
     }
 
     fn proto(&mut self, f: &Func, ty: &str) {
@@ -1233,6 +1372,7 @@ static double xflt(NV a){ double r=nv_as_float(a); nv_release(a); return r; }
         let ap = AotProgram {
             int_fns: self.b.int_fns.clone(),
             float_fns: self.b.float_fns.clone(),
+            num_fns: Vec::new(),
             main_body: Vec::new(),
         };
         let mut typed = CEmit::new(&ap);
@@ -1562,6 +1702,7 @@ impl<'p, 'a> LlBox<'p, 'a> {
         let ap = AotProgram {
             int_fns: self.b.int_fns.clone(),
             float_fns: self.b.float_fns.clone(),
+            num_fns: Vec::new(),
             main_body: Vec::new(),
         };
         let mut typed = LlEmit::new(&ap);
