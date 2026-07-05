@@ -68,7 +68,7 @@ fn main() {
                         return;
                     }
                     Ok(None) if matches!(bk, aot::Backend::Wasm) => {
-                        eprintln!("note: program not WASM-able (typed tier only; needs clang+node, verified vs `nova run`); no .wasm emitted");
+                        eprintln!("note: program not WASM-able (typed/boxed tier only, not embed; needs clang wasm32 + a wasi-sysroot + node, verified vs `nova run`); no .wasm emitted");
                         exit(1);
                     }
                     Ok(None) if matches!(bk, aot::Backend::Arm) => {

@@ -99,56 +99,61 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
     }
 }
 
-// Node harness: instantiate the freestanding wasm, supply the two host imports
-// (integer + string printing) formatting exactly like `nova run`, drive `main`,
-// and print the collected output. Verified against the oracle by the caller.
+// Node harness: instantiate the wasm32-wasi module, run it under node's WASI
+// (stdout captured), so the byte-diff gate can compare against `nova run`.
 const WASM_HARNESS: &str = r#"import { readFileSync } from 'node:fs';
-const bytes = readFileSync(process.argv[2]);
-const out = [];
-const dec = new TextDecoder();
-let mem;
-const env = {
-  print_i64: (v) => out.push(v.toString()),
-  print_str: (ptr, len) => out.push(dec.decode(new Uint8Array(mem.buffer, Number(ptr), Number(len)))),
-};
-const { instance } = await WebAssembly.instantiate(bytes, { env });
-mem = instance.exports.memory;
-instance.exports.main();
-process.stdout.write(out.length ? out.join("\n") + "\n" : "");
+import { WASI } from 'node:wasi';
+const wasi = new WASI({ version: 'preview1', args: [], env: {} });
+const wasm = await WebAssembly.compile(readFileSync(process.argv[2]));
+const inst = await WebAssembly.instantiate(wasm, wasi.getImportObject());
+wasi.start(inst);
 "#;
 
-// Compile the typed C to freestanding wasm32 with clang, run it under node, and
-// ship the `.wasm` only if its output is byte-identical to `nova run`. Requires
-// `clang` (wasm target) and `node`; absent either, returns Ok(None) (no wasm,
-// honest fallback — never wrong output). No wasi-sysroot needed: `print` routes
-// to JS imports, so nothing links libc.
+// a wasi sysroot: a dir whose lib/wasm32-wasi has libc.a (apt's wasi-libc puts
+// it at /usr/lib/wasm32-wasi, i.e. sysroot = /usr)
+fn wasi_sysroot() -> Option<&'static str> {
+    for root in ["/usr", "/opt/wasi-sysroot", "/usr/share/wasi-sysroot"] {
+        if Path::new(root).join("lib/wasm32-wasi/libc.a").is_file() { return Some(root); }
+    }
+    None
+}
+
+// Compile the portable AOT C (typed OR boxed, incl. nova_rt.c) to wasm32-wasi
+// with clang + a wasi-libc sysroot, run it under node's WASI, and ship the
+// `.wasm` only if its output is byte-identical to `nova run`. Requires `clang`
+// (wasm32 target), a wasi sysroot, and `node`; absent any, returns Ok(None) (no
+// wasm, honest fallback — never wrong output).
 fn build_wasm(entry: &str, out: &Path, code: &str, tier: crate::aot::Tier)
     -> Result<Option<crate::aot::Tier>, String>
 {
     let node = which("node");
     let clang = which("clang");
-    if node.is_none() || clang.is_none() { return Ok(None); }
+    let sysroot = wasi_sysroot();
+    let (Some(node), Some(clang), Some(sysroot)) = (node, clang, sysroot) else { return Ok(None) };
     let cdir = out.parent().unwrap_or(Path::new("."));
     let tmp_c = out.with_extension("wasm.c");
     let wasm = out.with_extension("wasm");
     let harness = cdir.join(".nova_wasm_harness.mjs");
+    let rt = cdir.join("nova_rt.c");
+    let boxed = matches!(tier, crate::aot::Tier::Boxed);
     std::fs::write(&tmp_c, code).map_err(|e| e.to_string())?;
     std::fs::write(&harness, WASM_HARNESS).map_err(|e| e.to_string())?;
+    if boxed { std::fs::write(&rt, NOVA_RT).map_err(|e| e.to_string())?; }
     let cleanup = |extra: bool| {
         let _ = std::fs::remove_file(&tmp_c);
         let _ = std::fs::remove_file(&harness);
+        let _ = std::fs::remove_file(&rt);
         if extra { let _ = std::fs::remove_file(&wasm); }
     };
-    let status = Command::new(clang.unwrap())
-        .args(["--target=wasm32", "-O2", "-nostdlib",
-               "-Wl,--no-entry", "-Wl,--export-dynamic", "-Wl,--allow-undefined"])
-        .arg("-o").arg(&wasm).arg(&tmp_c)
+    let status = Command::new(&clang)
+        .arg("--target=wasm32-wasi").arg(format!("--sysroot={}", sysroot))
+        .arg("-O2").arg("-o").arg(&wasm).arg(&tmp_c)
         .status().map_err(|e| format!("cannot run clang: {}", e))?;
     if !status.success() { cleanup(true); return Ok(None); }
     // oracle gate: node-run wasm output must equal `nova run` byte-for-byte
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let expect = Command::new(&exe).arg("run").arg(entry).output().map_err(|e| e.to_string())?;
-    let got = Command::new(node.unwrap()).arg(&harness).arg(&wasm).output()
+    let got = Command::new(&node).arg("--no-warnings").arg(&harness).arg(&wasm).output()
         .map_err(|e| format!("cannot run node: {}", e))?;
     cleanup(false);
     if expect.stdout == got.stdout && got.status.success() {
