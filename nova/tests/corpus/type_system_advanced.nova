@@ -1,0 +1,28 @@
+// Advanced type-system surface that now parses + runs (gradually): associated
+// types in traits/impls, effect-polymorphic signatures `![E]`, and higher-kinded
+// type params `[F[_]]`. All resolve gradually (Unknown where not concrete), so
+// they never false-flag and run byte-identically.
+
+trait Source {
+    type Item;
+    fn head(self) -> Item;
+}
+
+struct Nums { a: Int, b: Int }
+impl Source for Nums {
+    type Item = Int;
+    fn head(self) -> Int { self.a }
+}
+
+// effect-polymorphic: `![E]` propagates the callee's effects (accepted, gradual)
+fn twice(f, x) -> Int ![E] { f(f(x)) }
+
+// higher-kinded param `[F[_]]` (kind-accepted; erased to Unknown)
+fn ident[F[_], A](x) { x }
+
+fn main() {
+    let n = Nums { a: 7, b: 9 }
+    print(n.head())
+    print(twice((k) => k * 2, 3))
+    print(ident(99))
+}

@@ -32,6 +32,7 @@ marketing table. Legend:
 | f-strings, tagged strings (`json"..."`), raw strings | Run | parser/interp |
 | collections: array/map/set literals, `[0; n]` fill | Run | interp + bytecode |
 | lazy streams: generators (`yield`) + `stream[T]` return type, pulled by `for x in` | Run | interp `gen_produce`, `Value::Generator`; `tests/corpus/stream_lazy.nova` |
+| associated types (`type Item;` + impl `type Item = X`), effect-poly `![E]`, HKT `[F[_]]` | Run (gradual) | parse + resolve to Unknown where not concrete; `tests/corpus/type_system_advanced.nova` |
 | stdlib (math/strings/arrays/random/time/json + list/sort/mathx/strx/ds/func/json/setx/fmtx/datex) | Run | `std/*.nova`, builtins |
 
 ## Numeric performance (v3.27) — Run ✅
@@ -73,9 +74,6 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 These build AST nodes but currently do nothing at runtime — the honest truth:
 | feature | status |
 |---|---|
-| Higher-Kinded Types `[T[_]]` | Parse only (checker erases to Unknown) |
-| associated types (`type Item;` in traits) | Parse only |
-| effect polymorphism `![E]` | Parse only (monomorphic effects only) |
 | AST quasiquotation `ast!{...}` / procedural macros | Parse only |
 | `#[polymorph]` | **Parse only — no-op.** In a tree-walker, random dispatch among semantically-identical clones is a no-op by construction; it is properly an AOT-codegen concern (emit N equivalent C variants) and is deferred to that phase — deliberately not faked. |
 

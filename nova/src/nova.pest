@@ -193,8 +193,13 @@ trait_decl = {
     ~ "{" ~ trait_item* ~ "}"
 }
 trait_item = {
-    attribute* ~ (method_sig ~ (block | ";") | kw_const ~ ident ~ ":" ~ type_expr ~ ("=" ~ expr)? ~ ";")
+    attribute* ~ (method_sig ~ (block | ";")
+        | kw_const ~ ident ~ ":" ~ type_expr ~ ("=" ~ expr)? ~ ";"
+        | assoc_type)
 }
+// associated type: `type Item;` (required) or `type Item = Concrete;` (default).
+// The name is resolved structurally (traits are runtime-transparent in Nova).
+assoc_type = { kw_type ~ ident ~ ("=" ~ type_expr)? ~ ";" }
 method_sig = {
     kw_async? ~ kw_fn ~ ident ~ generic_params?
     ~ "(" ~ params? ~ ")" ~ ret_type? ~ effects_clause? ~ where_clause?
@@ -204,7 +209,7 @@ impl_block = {
     kw_impl ~ generic_params? ~ type_expr ~ (kw_for ~ type_expr)? ~ where_clause?
     ~ "{" ~ impl_item* ~ "}"
 }
-impl_item = { attribute* ~ visibility? ~ (func_decl | const_decl) }
+impl_item = { attribute* ~ visibility? ~ (func_decl | const_decl | assoc_type) }
 
 migrate_decl = { kw_migrate ~ kw_from ~ type_path ~ kw_to ~ type_path ~ block }
 
