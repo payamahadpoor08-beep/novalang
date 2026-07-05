@@ -45,6 +45,7 @@ fn main() {
                 "--aot" | "--aot=c" => Some(aot::Backend::C),
                 "--aot=llvm" => Some(aot::Backend::Llvm),
                 "--aot=wasm" => Some(aot::Backend::Wasm),
+                "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(aot::Backend::Arm),
                 _ => None,
             });
             if let Some(bk) = aot_backend {
@@ -58,6 +59,7 @@ fn main() {
                             aot::Backend::C => ("c", "native"),
                             aot::Backend::Llvm => ("llvm", "native"),
                             aot::Backend::Wasm => ("wasm", "wasm32"),
+                            aot::Backend::Arm => ("arm", "aarch64"),
                         };
                         let art = if matches!(bk, aot::Backend::Wasm) {
                             out.with_extension("wasm").display().to_string()
@@ -67,6 +69,10 @@ fn main() {
                     }
                     Ok(None) if matches!(bk, aot::Backend::Wasm) => {
                         eprintln!("note: program not WASM-able (typed tier only; needs clang+node, verified vs `nova run`); no .wasm emitted");
+                        exit(1);
+                    }
+                    Ok(None) if matches!(bk, aot::Backend::Arm) => {
+                        eprintln!("note: program not ARM-AOT-able or diverged in verify (needs aarch64-linux-gnu-gcc + qemu-aarch64); no arm binary emitted");
                         exit(1);
                     }
                     Ok(None) => eprintln!(
@@ -523,6 +529,7 @@ BUILD FLAGS:
   --aot | --aot=c      pure native binary via the C backend (cc -O2)
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
   --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
+  --aot=arm            static aarch64 binary, typed+boxed (cross gcc, qemu-verified)
                        (AOT output is verified byte-identical to `nova run`
                         at build time; non-AOT-able programs fall back to the
                         embedded-runtime build automatically)

@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use crate::ast::*;
 use crate::jit::{eligible_set, float_eligible_set};
 
-pub enum Backend { C, Llvm, Wasm }
+pub enum Backend { C, Llvm, Wasm, Arm }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tier { Typed, Boxed }
@@ -186,7 +186,9 @@ pub fn emit(prog: &Program, backend: &Backend) -> Option<(String, Tier)> {
     // clang uses for `NV` (a value passed as (i8 tag, i64 payload), returned as
     // `{i8,i64}`). Either way the byte-diff gate verifies the result.
     match backend {
-        Backend::C => {
+        // ARM cross-compiles the same portable C (typed + boxed): nova_rt.c is
+        // ordinary libc C, so the aarch64 cross gcc links it fine.
+        Backend::C | Backend::Arm => {
             if let Some(code) = emit_boxed(prog) { return Some((code, Tier::Boxed)); }
         }
         Backend::Llvm => {
@@ -214,7 +216,8 @@ fn emit_typed(prog: &Program, backend: &Backend) -> Option<String> {
         if !float_body_no_shadow(&f.body, &mut scopes) { return None; }
     }
     Some(match backend {
-        Backend::C => CEmit::new(&a).emit(),
+        // ARM reuses the portable C codegen; only the compiler + run harness differ.
+        Backend::C | Backend::Arm => CEmit::new(&a).emit(),
         Backend::Wasm => CEmit::new_wasm(&a).emit(),
         Backend::Llvm => LlEmit::new(&a).emit(),
     })

@@ -43,9 +43,12 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
     if matches!(backend, crate::aot::Backend::Wasm) {
         return build_wasm(entry, out, &code, tier);
     }
+    let arm = matches!(backend, crate::aot::Backend::Arm);
     let (ext, cc) = match backend {
         crate::aot::Backend::C => ("c", "cc"),
         crate::aot::Backend::Llvm => ("ll", "clang"),
+        // ARM: cross-compile the portable C with the aarch64 gcc, run under qemu.
+        crate::aot::Backend::Arm => ("c", "aarch64-linux-gnu-gcc"),
         crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
     };
     let tmp = out.with_extension(ext);
@@ -62,7 +65,9 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         std::fs::write(&rt, NOVA_RT).map_err(|e| e.to_string())?;
     }
     let mut cmd = Command::new(cc);
-    cmd.arg("-O3").arg("-flto");
+    // ARM cross gcc: build a static aarch64 binary (so qemu needs no sysroot libs)
+    // and skip -flto (the cross toolchain's LTO plugin isn't always present).
+    if arm { cmd.arg("-O2").arg("-static"); } else { cmd.arg("-O3").arg("-flto"); }
     if matches!(backend, crate::aot::Backend::Llvm) { cmd.arg("-Wno-override-module"); }
     if llvm_boxed { cmd.arg("-Dstatic="); }
     for f in extra_flags { cmd.arg(f); }
@@ -74,11 +79,16 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         let _ = std::fs::remove_file(&tmp);
         return Ok(None);
     }
-    // the oracle gate: ship only if byte-identical to `nova run`
+    // the oracle gate: ship only if byte-identical to `nova run`. ARM binaries
+    // run under qemu-aarch64 (the emulator present in this environment).
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let expect = Command::new(&exe).arg("run").arg(entry).output()
         .map_err(|e| e.to_string())?;
-    let got = Command::new(out).output().map_err(|e| e.to_string())?;
+    let got = if arm {
+        Command::new("qemu-aarch64").arg(out).output()
+    } else {
+        Command::new(out).output()
+    }.map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&rt);
     if expect.stdout == got.stdout && expect.status.code() == got.status.code() {

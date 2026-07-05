@@ -54,12 +54,25 @@ Run the result in any WASM host that supplies the two imports (see
 (strings, arrays, maps) are **not** WASM-able yet — that needs a wasi-sysroot for
 the refcounted runtime.
 
+## ARM target (`--aot=arm`)
+
+`nova build --aot=arm program.nova` cross-compiles the **same portable AOT C**
+(typed *and* boxed — `nova_rt.c` is ordinary libc C) to a **static aarch64**
+binary with `aarch64-linux-gnu-gcc -static`, for Raspberry Pi / aarch64 mobile.
+It ships only if it passes the oracle gate: the binary is run under
+`qemu-aarch64` and its output must be byte-identical to `nova run`. Requires
+`aarch64-linux-gnu-gcc` and (to self-verify) `qemu-aarch64`
+(`apt-get install gcc-aarch64-linux-gnu qemu-user`). Embed-tier programs aren't
+ARM-AOT-able (the embed binary would be the host arch); use the typed/boxed
+tiers. See `tests/arm_smoke.sh`.
+
 ## Commands
 
 ```bash
 nova build program.nova            # embed build (always succeeds)
 nova build --aot program.nova      # typed→boxed→embed via the C backend
 nova build --aot=wasm program.nova # freestanding wasm32 (typed tier), node-verified
+nova build --aot=arm program.nova  # static aarch64 (typed+boxed), qemu-verified
 nova build --aot=llvm program.nova # same tiers via the LLVM backend
 ```
 
