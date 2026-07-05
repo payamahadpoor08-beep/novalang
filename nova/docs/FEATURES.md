@@ -95,6 +95,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
 | **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |
+| **self-hosting, stage 1: the Nova lexer in Nova** (`selfhost/lexer.nova` + `nova tokens` reference) | Run ✅ — byte-identical token dumps vs the Rust reference on all 94 corpus+std+example files (including lexing itself), 4-tier identical; `tests/selfhost_smoke.sh`, `docs/SELFHOST.md`. Stages 2–5 (parser/checker/eval/fixpoint) are honestly *not* claimed yet. |
 
 ## Remaining AOT notes
 1. **(resolved) AOT native for mixed int/float kernels.** fib, sieve AND mandel
