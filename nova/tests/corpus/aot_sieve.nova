@@ -1,0 +1,36 @@
+// A pure local-int-array kernel: build/index/mutate/len over a JIT-arena array,
+// no strings/heap — so `nova build --aot` lowers it to a TRUE standalone native
+// binary (typed tier), not the embed fallback. Byte-identical across tiers.
+
+fn count_primes(n) {
+    let s = []
+    for i in 0..n { push(s, 1) }
+    s[0] = 0
+    s[1] = 0
+    let mut i = 2
+    while i * i < n {
+        if s[i] == 1 {
+            let mut j = i * i
+            while j < n { s[j] = 0; j = j + i }
+        }
+        i = i + 1
+    }
+    let mut c = 0
+    for k in 0..n { c = c + s[k] }
+    c
+}
+
+fn sum_squares(n) {
+    let a = []
+    let mut i = 0
+    while i < n { push(a, i * i); i = i + 1 }
+    let mut t = 0
+    let mut k = 0
+    while k < len(a) { t = t + a[k]; k = k + 1 }
+    t
+}
+
+fn main() {
+    print(count_primes(100))
+    print(sum_squares(20))
+}
