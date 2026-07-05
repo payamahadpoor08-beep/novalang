@@ -58,7 +58,8 @@ pub fn analyze(prog: &Program) -> Option<AotProgram<'_>> {
     let mut main_body = main.body.clone();
     fix_main_tail(&mut main_body);
     let mut scopes = vec![HashSet::new()];
-    if !main_body.iter().all(|s| main_stmt_ok(s, &ints, &mut scopes)) { return None; }
+    let main_arrays = main_body_arrays(&main_body);
+    if !main_body.iter().all(|s| main_stmt_ok(s, &ints, &main_arrays, &mut scopes)) { return None; }
     Some(AotProgram { int_fns, float_fns, main_body })
 }
 
@@ -81,13 +82,26 @@ fn fix_main_tail(body: &mut Vec<Stmt>) {
 
 // main may use the int-pure statement set (plus print) — with two extra
 // restrictions the C/LLVM lowering needs: no `**`, and no shadowing `let`
-fn main_stmt_ok(s: &Stmt, ints: &HashSet<String>, scopes: &mut Vec<HashSet<String>>) -> bool {
-    stmt_ok(s, ints, scopes, false)
+fn main_stmt_ok(s: &Stmt, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &mut Vec<HashSet<String>>) -> bool {
+    stmt_ok(s, ints, arrays, scopes, false)
 }
 
-fn stmt_ok(s: &Stmt, ints: &HashSet<String>, scopes: &mut Vec<HashSet<String>>, allow_ret: bool) -> bool {
+fn strip_ats(e: &Expr) -> &Expr { match e { Expr::At { expr, .. } => strip_ats(expr), o => o } }
+fn arr_ident(e: &Expr) -> Option<&str> {
+    match strip_ats(e) { Expr::Ident(n) => Some(n), _ => None }
+}
+// a call that is an array builtin (len/pop/push) on a local array var
+fn arr_builtin(callee: &str, args: &[Expr], arrays: &HashSet<String>) -> bool {
+    match callee {
+        "len" | "pop" => args.len() == 1 && arr_ident(&args[0]).map_or(false, |n| arrays.contains(n)),
+        "push" => args.len() == 2 && arr_ident(&args[0]).map_or(false, |n| arrays.contains(n)),
+        _ => false,
+    }
+}
+
+fn stmt_ok(s: &Stmt, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &mut Vec<HashSet<String>>, allow_ret: bool) -> bool {
     match s {
-        Stmt::Return(Some(e)) => allow_ret && int_expr_ok(e, ints, scopes),
+        Stmt::Return(Some(e)) => allow_ret && int_expr_ok(e, ints, arrays, scopes),
         Stmt::Expr(e) => {
             let mut e = e;
             while let Expr::At { expr, .. } = e { e = expr; }
@@ -95,47 +109,79 @@ fn stmt_ok(s: &Stmt, ints: &HashSet<String>, scopes: &mut Vec<HashSet<String>>, 
                 if callee == "print" && args.len() == 1 {
                     let mut a = &args[0];
                     while let Expr::At { expr, .. } = a { a = expr; }
-                    return matches!(a, Expr::Str(_)) || int_expr_ok(a, ints, scopes);
+                    return matches!(a, Expr::Str(_)) || int_expr_ok(a, ints, arrays, scopes);
+                }
+                // `push(arr, v)` as a statement (returns null in the interp)
+                if callee == "push" && arr_builtin(callee, args, arrays) {
+                    return int_expr_ok(&args[1], ints, arrays, scopes);
                 }
             }
-            int_expr_ok(e, ints, scopes)
+            int_expr_ok(e, ints, arrays, scopes)
         }
         Stmt::Let { name, value, .. } => {
-            if !int_expr_ok(value, ints, scopes) { return false; }
+            // a local int-array var: an int array literal or an alias of another
+            // array var (aliases share storage in C exactly as in the interp)
+            if arrays.contains(name) {
+                let ok = match strip_ats(value) {
+                    Expr::Array(els) => els.iter().all(|e| int_expr_ok(e, ints, arrays, scopes)),
+                    Expr::Ident(src) => arrays.contains(src),
+                    _ => false,
+                };
+                if !ok || scopes.iter().any(|sc| sc.contains(name)) { return false; }
+                scopes.last_mut().unwrap().insert(name.clone());
+                return true;
+            }
+            if !int_expr_ok(value, ints, arrays, scopes) { return false; }
             if scopes.iter().any(|sc| sc.contains(name)) { return false; } // shadowing
             scopes.last_mut().unwrap().insert(name.clone());
             true
         }
         Stmt::Assign { name, value } => {
-            if !int_expr_ok(value, ints, scopes) { return false; }
+            if arrays.contains(name) {
+                let ok = match strip_ats(value) {
+                    Expr::Array(els) => els.iter().all(|e| int_expr_ok(e, ints, arrays, scopes)),
+                    Expr::Ident(src) => arrays.contains(src),
+                    _ => false,
+                };
+                if !ok { return false; }
+                if !scopes.iter().any(|sc| sc.contains(name)) { scopes.last_mut().unwrap().insert(name.clone()); }
+                return true;
+            }
+            if !int_expr_ok(value, ints, arrays, scopes) { return false; }
             if !scopes.iter().any(|sc| sc.contains(name)) {
                 scopes.last_mut().unwrap().insert(name.clone());
             }
             true
         }
+        // arr[i] = v on a local int array var
+        Stmt::IndexAssign { base, index, value } => {
+            arr_ident(base).map_or(false, |n| arrays.contains(n))
+                && int_expr_ok(index, ints, arrays, scopes)
+                && int_expr_ok(value, ints, arrays, scopes)
+        }
         Stmt::If { cond, then, els } => {
-            if !int_expr_ok(cond, ints, scopes) { return false; }
+            if !int_expr_ok(cond, ints, arrays, scopes) { return false; }
             scopes.push(HashSet::new());
-            let a = then.iter().all(|s| stmt_ok(s, ints, scopes, allow_ret));
+            let a = then.iter().all(|s| stmt_ok(s, ints, arrays, scopes, allow_ret));
             scopes.pop();
             scopes.push(HashSet::new());
-            let b = els.as_ref().map_or(true, |e| e.iter().all(|s| stmt_ok(s, ints, scopes, allow_ret)));
+            let b = els.as_ref().map_or(true, |e| e.iter().all(|s| stmt_ok(s, ints, arrays, scopes, allow_ret)));
             scopes.pop();
             a && b
         }
         Stmt::While { cond, body } => {
-            if !int_expr_ok(cond, ints, scopes) { return false; }
+            if !int_expr_ok(cond, ints, arrays, scopes) { return false; }
             scopes.push(HashSet::new());
-            let r = body.iter().all(|s| stmt_ok(s, ints, scopes, allow_ret));
+            let r = body.iter().all(|s| stmt_ok(s, ints, arrays, scopes, allow_ret));
             scopes.pop();
             r
         }
         Stmt::ForRange { var, start, end, body, .. } => {
-            if !int_expr_ok(start, ints, scopes) || !int_expr_ok(end, ints, scopes) { return false; }
+            if !int_expr_ok(start, ints, arrays, scopes) || !int_expr_ok(end, ints, arrays, scopes) { return false; }
             if scopes.iter().any(|sc| sc.contains(var)) { return false; }
             scopes.push(HashSet::new());
             scopes.last_mut().unwrap().insert(var.clone());
-            let r = body.iter().all(|s| stmt_ok(s, ints, scopes, allow_ret));
+            let r = body.iter().all(|s| stmt_ok(s, ints, arrays, scopes, allow_ret));
             scopes.pop();
             r
         }
@@ -145,35 +191,56 @@ fn stmt_ok(s: &Stmt, ints: &HashSet<String>, scopes: &mut Vec<HashSet<String>>, 
     }
 }
 
-fn int_expr_ok(e: &Expr, ints: &HashSet<String>, scopes: &Vec<HashSet<String>>) -> bool {
+fn int_expr_ok(e: &Expr, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &Vec<HashSet<String>>) -> bool {
     match e {
-        Expr::At { expr, .. } => int_expr_ok(expr, ints, scopes),
+        Expr::At { expr, .. } => int_expr_ok(expr, ints, arrays, scopes),
         Expr::Int(_) => true,
-        Expr::Ident(n) => scopes.iter().any(|sc| sc.contains(n)),
+        // a scalar int var — an array var is NOT a scalar
+        Expr::Ident(n) => !arrays.contains(n) && scopes.iter().any(|sc| sc.contains(n)),
         Expr::Unary { op, expr } =>
-            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && int_expr_ok(expr, ints, scopes),
+            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && int_expr_ok(expr, ints, arrays, scopes),
         Expr::Binary { op, lhs, rhs } =>
             !matches!(op, BinOp::Pow)
-            && int_expr_ok(lhs, ints, scopes) && int_expr_ok(rhs, ints, scopes),
+            && int_expr_ok(lhs, ints, arrays, scopes) && int_expr_ok(rhs, ints, arrays, scopes),
         Expr::If { cond, then, els } =>
-            int_expr_ok(cond, ints, scopes) && int_expr_ok(then, ints, scopes)
-            && int_expr_ok(els, ints, scopes),
-        Expr::Call { callee, args } =>
-            ints.contains(callee) && args.iter().all(|a| int_expr_ok(a, ints, scopes)),
+            int_expr_ok(cond, ints, arrays, scopes) && int_expr_ok(then, ints, arrays, scopes)
+            && int_expr_ok(els, ints, arrays, scopes),
+        // arr[i] read on a local int array var yields a scalar
+        Expr::Index { base, index } =>
+            arr_ident(base).map_or(false, |n| arrays.contains(n))
+            && int_expr_ok(index, ints, arrays, scopes),
+        Expr::Call { callee, args } => {
+            if arr_builtin(callee, args, arrays) {
+                callee != "push" // len/pop yield scalars; push is statement-only
+            } else {
+                ints.contains(callee) && args.iter().all(|a| int_expr_ok(a, ints, arrays, scopes))
+            }
+        }
         _ => false,
     }
 }
 
 // same restrictions for function bodies (the JIT allows Pow/shadowing because
 // it can deopt; AOT cannot). Checked per-function before emission.
+// array vars of a bare statement block (for main, which isn't a Func)
+fn main_body_arrays(body: &[Stmt]) -> HashSet<String> {
+    let synth = crate::ast::Func {
+        name: String::new(), params: vec![], param_types: vec![], param_modes: vec![],
+        ret_type: None, type_params: vec![], where_bounds: vec![], effects: None,
+        body: body.to_vec(), is_async: false, attrs: vec![],
+    };
+    crate::jit::array_vars(&synth)
+}
+
 fn fn_body_ok(f: &Func, ints: &HashSet<String>) -> bool {
     let mut scopes = vec![HashSet::new()];
     for p in &f.params { scopes.last_mut().unwrap().insert(p.clone()); }
-    f.body.iter().all(|s| fn_stmt_ok(s, ints, &mut scopes))
+    let arrays = crate::jit::array_vars(f);
+    f.body.iter().all(|s| fn_stmt_ok(s, ints, &arrays, &mut scopes))
 }
 
-fn fn_stmt_ok(s: &Stmt, ints: &HashSet<String>, scopes: &mut Vec<HashSet<String>>) -> bool {
-    stmt_ok(s, ints, scopes, true)
+fn fn_stmt_ok(s: &Stmt, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &mut Vec<HashSet<String>>) -> bool {
+    stmt_ok(s, ints, arrays, scopes, true)
 }
 
 pub fn emit(prog: &Program, backend: &Backend) -> Option<(String, Tier)> {
@@ -258,15 +325,36 @@ fn float_body_no_shadow(body: &[Stmt], scopes: &mut Vec<HashSet<String>>) -> boo
 struct CEmit<'p> {
     a: &'p AotProgram<'p>,
     out: String,
+    // the array vars of the function currently being emitted (declared as NIA*)
+    cur_arrays: HashSet<String>,
 }
 
 fn mangle(n: &str) -> String { format!("nv_{}", n) }
 
+// mini dynamic int64 array — the C equivalent of the JIT's local-array arena.
+// Only emitted when a function actually uses local int arrays.
+const NIA_PRELUDE: &str = "\
+#include <stdlib.h>\n\
+typedef struct { i64* d; i64 n, cap; } NIA;\n\
+static NIA* nia_new(void){ NIA* a=(NIA*)malloc(sizeof(NIA)); a->d=0; a->n=0; a->cap=0; return a; }\n\
+static void nia_push(NIA* a, i64 v){ if(a->n==a->cap){ a->cap=a->cap?a->cap*2:8; a->d=(i64*)realloc(a->d,(size_t)a->cap*sizeof(i64)); } a->d[a->n++]=v; }\n\
+static i64 nia_get(NIA* a, i64 i){ return a->d[i]; }\n\
+static void nia_set(NIA* a, i64 i, i64 v){ a->d[i]=v; }\n\
+static i64 nia_len(NIA* a){ return a->n; }\n\
+static i64 nia_pop(NIA* a){ return a->d[--a->n]; }\n\n";
+
 impl<'p> CEmit<'p> {
-    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new() } }
+    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new(), cur_arrays: HashSet::new() } }
+
+    // any int fn (or main) that uses local arrays?
+    fn uses_arrays(&self) -> bool {
+        self.a.int_fns.iter().any(|f| !crate::jit::array_vars(f).is_empty())
+            || !main_body_arrays(&self.a.main_body).is_empty()
+    }
 
     fn emit(mut self) -> String {
         self.out.push_str("#include <stdio.h>\n#include <stdint.h>\ntypedef int64_t i64;\n\n");
+        if self.uses_arrays() { self.out.push_str(NIA_PRELUDE); }
         for f in &self.a.int_fns { self.proto(f, "i64"); }
         for f in &self.a.float_fns { self.proto(f, "double"); }
         self.out.push('\n');
@@ -283,26 +371,37 @@ impl<'p> CEmit<'p> {
 
     fn func(&mut self, f: &Func, is_float: bool) {
         let ty = if is_float { "double" } else { "i64" };
+        self.cur_arrays = if is_float { HashSet::new() } else { crate::jit::array_vars(f) };
         let ps: Vec<String> = f.params.iter().map(|p| format!("{} {}", ty, mangle(p))).collect();
         let _ = writeln!(self.out, "static {} {}({}) {{", ty, mangle(&f.name), ps.join(", "));
         let mut vars: Vec<String> = Vec::new();
         collect_vars(&f.body, &mut vars);
         for v in &vars {
             if !f.params.contains(v) {
-                let _ = writeln!(self.out, "  {} {} = 0;", ty, mangle(v));
+                if self.cur_arrays.contains(v) {
+                    let _ = writeln!(self.out, "  NIA* {} = 0;", mangle(v));
+                } else {
+                    let _ = writeln!(self.out, "  {} {} = 0;", ty, mangle(v));
+                }
             }
         }
         for s in &f.body { self.stmt(s, 1, is_float); }
         let _ = writeln!(self.out, "  return 0;\n}}\n");
+        self.cur_arrays = HashSet::new();
     }
 
     fn main(&mut self) {
+        self.cur_arrays = main_body_arrays(&self.a.main_body);
         self.out.push_str("int main(void) {\n");
         let mut vars: Vec<String> = Vec::new();
         collect_vars(&self.a.main_body, &mut vars);
-        for v in &vars { let _ = writeln!(self.out, "  i64 {} = 0;", mangle(v)); }
+        for v in &vars {
+            if self.cur_arrays.contains(v) { let _ = writeln!(self.out, "  NIA* {} = 0;", mangle(v)); }
+            else { let _ = writeln!(self.out, "  i64 {} = 0;", mangle(v)); }
+        }
         for s in &self.a.main_body.clone() { self.stmt(s, 1, false); }
         self.out.push_str("  return 0;\n}\n");
+        self.cur_arrays = HashSet::new();
     }
 
     fn stmt(&mut self, s: &Stmt, d: usize, fl: bool) {
@@ -323,13 +422,40 @@ impl<'p> CEmit<'p> {
                         }
                         return;
                     }
+                    // push(arr, v) on a local array var -> nia_push
+                    if callee == "push" && arr_builtin(callee, args, &self.cur_arrays) {
+                        let name = arr_ident(&args[0]).unwrap();
+                        let v = self.expr(&args[1], fl);
+                        let _ = writeln!(self.out, "{}nia_push({}, {});", ind, mangle(name), v);
+                        return;
+                    }
                 }
                 let v = self.expr(inner, fl);
                 let _ = writeln!(self.out, "{}(void)({});", ind, v);
             }
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } if self.cur_arrays.contains(name) => {
+                match strip_ats(value) {
+                    Expr::Array(els) => {
+                        let _ = writeln!(self.out, "{}{} = nia_new();", ind, mangle(name));
+                        for e in els {
+                            let v = self.expr(e, fl);
+                            let _ = writeln!(self.out, "{}nia_push({}, {});", ind, mangle(name), v);
+                        }
+                    }
+                    // alias: same NIA* handle -> shared storage, like the interp's Rc
+                    Expr::Ident(src) => { let _ = writeln!(self.out, "{}{} = {};", ind, mangle(name), mangle(src)); }
+                    _ => {}
+                }
+            }
             Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
                 let v = self.expr(value, fl);
                 let _ = writeln!(self.out, "{}{} = {};", ind, mangle(name), v);
+            }
+            Stmt::IndexAssign { base, index, value } => {
+                let name = arr_ident(base).unwrap();
+                let i = self.expr(index, fl);
+                let v = self.expr(value, fl);
+                let _ = writeln!(self.out, "{}nia_set({}, {}, {});", ind, mangle(name), i, v);
             }
             Stmt::Return(Some(e)) => {
                 let v = self.expr(e, fl);
@@ -423,7 +549,22 @@ impl<'p> CEmit<'p> {
                 let e2 = self.expr(els, fl);
                 format!("(({}) ? ({}) : ({}))", c, t, e2)
             }
+            // arr[i] read on a local int array var
+            Expr::Index { base, index } if arr_ident(base).map_or(false, |n| self.cur_arrays.contains(n)) => {
+                let name = arr_ident(base).unwrap();
+                let i = self.expr(index, fl);
+                format!("nia_get({}, {})", mangle(name), i)
+            }
             Expr::Call { callee, args } => {
+                // len(arr)/pop(arr) on a local array var
+                if arr_builtin(callee, args, &self.cur_arrays) {
+                    let name = arr_ident(&args[0]).unwrap();
+                    return match callee.as_str() {
+                        "len" => format!("nia_len({})", mangle(name)),
+                        "pop" => format!("nia_pop({})", mangle(name)),
+                        _ => "0".into(),
+                    };
+                }
                 let is_float_fn = self.a.float_fns.iter().any(|f| &f.name == callee);
                 let vals: Vec<String> = args.iter().map(|a| self.expr(a, is_float_fn)).collect();
                 format!("{}({})", mangle(callee), vals.join(", "))

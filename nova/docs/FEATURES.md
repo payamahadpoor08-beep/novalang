@@ -31,6 +31,7 @@ marketing table. Legend:
 | `??` null-coalescing, ranges, slices, comprehensions | Run | interp + bytecode |
 | f-strings, tagged strings (`json"..."`), raw strings | Run | parser/interp |
 | collections: array/map/set literals, `[0; n]` fill | Run | interp + bytecode |
+| lazy streams: generators (`yield`) + `stream[T]` return type, pulled by `for x in` | Run | interp `gen_produce`, `Value::Generator`; `tests/corpus/stream_lazy.nova` |
 | stdlib (math/strings/arrays/random/time/json + list/sort/mathx/strx/ds/func/json/setx/fmtx/datex) | Run | `std/*.nova`, builtins |
 
 ## Numeric performance (v3.27) — Run ✅
@@ -40,7 +41,8 @@ marketing table. Legend:
 | local integer arrays JIT'd (arena) | Run — sieve 49ms (was 858ms) |
 | **local int-field structs JIT'd (arena slots)** | Run — struct kernel 0.25s vs 2.84s pure-VM (~11×); aliases share the handle; escapes stay interp/VM |
 | AOT native (C + LLVM), **pure-int/float** kernels | Run — fib native 7ms ≈ C |
-| AOT native for **mixed/array** kernels | **Parse→embed** — see gap #1 below |
+| AOT native for **local-int-array** kernels (sieve) | Run — true standalone native binary (typed tier), not embed |
+| AOT native for **mixed int/float** kernels (mandel) | **Parse→embed** — see gap #1 below |
 
 ## Attributes — now real (v3.28, Phase 1) ✅
 Attributes are no longer discarded; these carry tested semantics on every tier
@@ -71,7 +73,6 @@ Attributes are no longer discarded; these carry tested semantics on every tier
 These build AST nodes but currently do nothing at runtime — the honest truth:
 | feature | status |
 |---|---|
-| `stream[T]` | Parse only (no streaming runtime) |
 | Higher-Kinded Types `[T[_]]` | Parse only (checker erases to Unknown) |
 | associated types (`type Item;` in traits) | Parse only |
 | effect polymorphism `![E]` | Parse only (monomorphic effects only) |
@@ -97,13 +98,13 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | 32-bit / other mobile targets | Not implemented (same cross-compile pattern, add on request) |
 
 ## The three real gaps that matter for "AOT/speed"
-1. **AOT native for mixed/array kernels.** `nova build --aot` compiles pure-int
-   functions to a standalone native binary (fib), but sieve (arrays) and mandel
-   (mixed int/float) fall back to the **embed** build — the interpreter+VM
-   wrapped in a binary. They still run at JIT speed (65ms), but they are not
-   yet true standalone native code. Fix: extend `aot.rs::emit_typed` (the C
-   text emitter) to per-variable `int64_t`/`double` + arrays, mirroring the
-   JIT's `NumGen`/array track, plus a Rust-`Display` float printer.
+1. **AOT native for mixed int/float kernels.** `nova build --aot` now compiles
+   pure-int functions (fib) AND **local-int-array kernels (sieve)** to standalone
+   native binaries — the C emitter has a `NIA` int-array (the C twin of the JIT
+   arena), so sieve is a true native `aot_sieve` (typed tier, byte-identical, also
+   cross-compiles to arm/wasm). Still embed-only: **mixed int/float** in one
+   function (mandel) — needs per-variable `int64_t`/`double` typing mirroring the
+   JIT's `NumGen`. Mandel still runs at JIT speed via embed.
 2. **Full generics in `types.rs`**: element types (`[T]`) are erased to Unknown
    (design in ROADMAP §2).
 3. **Interpreter `Rc`/tree-walking floor**: `nova run` is the oracle, not a
