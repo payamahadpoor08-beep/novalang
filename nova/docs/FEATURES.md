@@ -38,6 +38,7 @@ marketing table. Legend:
 |---|---|
 | tiered Cranelift JIT: i64, f64, **mixed int/float** tracks | Run — mandelbrot 65ms (was 4934ms) |
 | local integer arrays JIT'd (arena) | Run — sieve 49ms (was 858ms) |
+| **local int-field structs JIT'd (arena slots)** | Run — struct kernel 0.25s vs 2.84s pure-VM (~11×); aliases share the handle; escapes stay interp/VM |
 | AOT native (C + LLVM), **pure-int/float** kernels | Run — fib native 7ms ≈ C |
 | AOT native for **mixed/array** kernels | **Parse→embed** — see gap #1 below |
 

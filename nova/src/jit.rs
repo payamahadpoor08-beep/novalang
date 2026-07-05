@@ -106,12 +106,17 @@ extern "C" fn nova_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
 // it calls is itself eligible.
 pub fn eligible_set(prog: &Program) -> HashSet<String> {
     let mut funcs: HashMap<&str, &Func> = HashMap::new();
+    let mut defs: HashMap<String, Vec<String>> = HashMap::new();
     for item in &prog.items {
-        if let Item::Func(f) = item { funcs.insert(&f.name, f); }
+        match item {
+            Item::Func(f) => { funcs.insert(&f.name, f); }
+            Item::Struct(sd) => { defs.insert(sd.name.clone(), sd.fields.clone()); }
+            _ => {}
+        }
     }
     // start from everything structurally OK (calls allowed to anything for now)
     let mut set: HashSet<String> = funcs.values()
-        .filter(|f| f.params.len() <= MAX_ARITY && locally_ok(f))
+        .filter(|f| f.params.len() <= MAX_ARITY && locally_ok(f, &defs))
         .map(|f| f.name.clone())
         .collect();
     // remove any function that calls a name outside the set, until stable
@@ -120,7 +125,8 @@ pub fn eligible_set(prog: &Program) -> HashSet<String> {
         for name in &set {
             let f = funcs[name.as_str()];
             let arrays = array_vars(f);
-            if collect_real_calls(&f.body, &arrays).iter().any(|c| !set.contains(c)) {
+            let structs = struct_vars(f, &defs);
+            if collect_real_calls(&f.body, &arrays, &structs).iter().any(|c| !set.contains(c)) {
                 remove = Some(name.clone());
                 break;
             }
@@ -134,10 +140,11 @@ pub fn eligible_set(prog: &Program) -> HashSet<String> {
 }
 
 // structural integer-purity, allowing calls (validated by the fixpoint)
-fn locally_ok(f: &Func) -> bool {
+fn locally_ok(f: &Func, defs: &HashMap<String, Vec<String>>) -> bool {
     let arrays = array_vars(f);
+    let structs = struct_vars(f, defs);
     !f.body.is_empty()
-        && f.body.iter().all(|s| stmt_pure(s, &arrays))
+        && f.body.iter().all(|s| stmt_pure(s, &arrays, &structs))
         && always_returns(&f.body)
 }
 
@@ -219,6 +226,100 @@ fn check_array_assign_conflicts(body: &[Stmt], set: &HashSet<String>, bad: &mut 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Local-struct support for the i64 track. A variable is a "struct var" when it
+// is only ever assigned a struct literal with one consistent field order (or an
+// alias of another struct var). Fields hold scalars; reads/writes lower to the
+// same arena as arrays (a struct is a fixed block of slots, field name -> slot
+// index). Struct vars must never escape — same rule as array vars.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn struct_vars(f: &Func, defs: &HashMap<String, Vec<String>>)
+    -> HashMap<String, Vec<String>>
+{
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    loop {
+        let before = map.len();
+        collect_struct_assigns(&f.body, defs, &mut map);
+        if map.len() == before { break; }
+    }
+    // drop vars that are also assigned non-struct values or a different shape
+    let mut bad: HashSet<String> = HashSet::new();
+    check_struct_assign_conflicts(&f.body, &map, &mut bad);
+    for b in bad { map.remove(&b); }
+    map
+}
+
+fn lit_shape(fields: &[(String, Expr)]) -> Vec<String> {
+    fields.iter().map(|(n, _)| n.clone()).collect()
+}
+
+// a literal is JIT-safe only when its struct is declared and its field-name
+// set exactly matches the declaration (the interpreter errors on unknown
+// structs, missing fields, and unknown fields — those must stay interp-run)
+fn lit_matches_def(name: &str, fields: &[(String, Expr)],
+                   defs: &HashMap<String, Vec<String>>) -> bool {
+    match defs.get(name) {
+        Some(decl) => decl.len() == fields.len()
+            && decl.iter().all(|d| fields.iter().any(|(fname, _)| fname == d)),
+        None => false,
+    }
+}
+
+fn collect_struct_assigns(body: &[Stmt], defs: &HashMap<String, Vec<String>>,
+                          map: &mut HashMap<String, Vec<String>>) {
+    for s in body {
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                match strip_at(value) {
+                    Expr::StructLit { name: sname, fields }
+                        if !map.contains_key(name) && lit_matches_def(sname, fields, defs) =>
+                    {
+                        map.insert(name.clone(), lit_shape(fields));
+                    }
+                    Expr::Ident(src) => {
+                        if let Some(shape) = map.get(src).cloned() {
+                            map.entry(name.clone()).or_insert(shape);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Stmt::If { then, els, .. } => {
+                collect_struct_assigns(then, defs, map);
+                if let Some(e) = els { collect_struct_assigns(e, defs, map); }
+            }
+            Stmt::While { body, .. } | Stmt::ForRange { body, .. } =>
+                collect_struct_assigns(body, defs, map),
+            _ => {}
+        }
+    }
+}
+
+fn check_struct_assign_conflicts(body: &[Stmt], map: &HashMap<String, Vec<String>>,
+                                 bad: &mut HashSet<String>) {
+    for s in body {
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value }
+                if map.contains_key(name) =>
+            {
+                match strip_at(value) {
+                    Expr::StructLit { fields, .. } if lit_shape(fields) == map[name] => {}
+                    Expr::Ident(src) if map.get(src) == map.get(name) && map.contains_key(src) => {}
+                    _ => { bad.insert(name.clone()); }
+                }
+            }
+            Stmt::If { then, els, .. } => {
+                check_struct_assign_conflicts(then, map, bad);
+                if let Some(e) = els { check_struct_assign_conflicts(e, map, bad); }
+            }
+            Stmt::While { body, .. } | Stmt::ForRange { body, .. } =>
+                check_struct_assign_conflicts(body, map, bad),
+            _ => {}
+        }
+    }
+}
+
 // is this call one of the array builtins applied to a local array var?
 fn array_builtin_call(callee: &str, args: &[Expr], arrays: &HashSet<String>) -> bool {
     match callee {
@@ -241,72 +342,93 @@ fn always_returns(body: &[Stmt]) -> bool {
     }
 }
 
-fn stmt_pure(s: &Stmt, arrays: &HashSet<String>) -> bool {
+fn stmt_pure(s: &Stmt, arrays: &HashSet<String>, structs: &HashMap<String, Vec<String>>) -> bool {
     match s {
         Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
             if arrays.contains(name) {
                 // an array var may only be (re)assigned an array literal of
                 // scalars or an alias of another array var
                 match strip_at(value) {
-                    Expr::Array(elems) => elems.iter().all(|e| expr_pure(e, arrays)),
+                    Expr::Array(elems) => elems.iter().all(|e| expr_pure(e, arrays, structs)),
                     Expr::Ident(src) => arrays.contains(src),
                     _ => false,
                 }
+            } else if structs.contains_key(name) {
+                // a struct var: a same-shape literal with pure field values, or
+                // an alias of a same-shape struct var
+                match strip_at(value) {
+                    Expr::StructLit { fields, .. } =>
+                        lit_shape(fields) == structs[name]
+                        && fields.iter().all(|(_, e)| expr_pure(e, arrays, structs)),
+                    Expr::Ident(src) => structs.get(src) == structs.get(name)
+                        && structs.contains_key(src),
+                    _ => false,
+                }
             } else {
-                expr_pure(value, arrays)
+                expr_pure(value, arrays, structs)
             }
         }
+        // p.field = value on a local struct var with a known field
+        Stmt::FieldAssign { base, field, value } =>
+            as_ident(base).and_then(|n| structs.get(n))
+                .map_or(false, |shape| shape.iter().any(|f| f == field))
+            && expr_pure(value, arrays, structs),
         Stmt::Expr(e) => {
             // allow `push(arr, v)` as a statement (it returns null in the interp)
             if let Expr::Call { callee, args } = strip_at(e) {
                 if callee == "push" && array_builtin_call(callee, args, arrays) {
-                    return expr_pure(&args[1], arrays);
+                    return expr_pure(&args[1], arrays, structs);
                 }
             }
-            expr_pure(e, arrays)
+            expr_pure(e, arrays, structs)
         }
-        Stmt::Return(Some(e)) => expr_pure(e, arrays),
+        Stmt::Return(Some(e)) => expr_pure(e, arrays, structs),
         Stmt::Return(None) => false,
         Stmt::IndexAssign { base, index, value } =>
             as_ident(base).map_or(false, |n| arrays.contains(n))
-            && expr_pure(index, arrays) && expr_pure(value, arrays),
+            && expr_pure(index, arrays, structs) && expr_pure(value, arrays, structs),
         Stmt::If { cond, then, els } =>
-            expr_pure(cond, arrays) && then.iter().all(|s| stmt_pure(s, arrays))
-            && els.as_ref().map_or(true, |e| e.iter().all(|s| stmt_pure(s, arrays))),
+            expr_pure(cond, arrays, structs) && then.iter().all(|s| stmt_pure(s, arrays, structs))
+            && els.as_ref().map_or(true, |e| e.iter().all(|s| stmt_pure(s, arrays, structs))),
         Stmt::While { cond, body } =>
-            expr_pure(cond, arrays) && body.iter().all(|s| stmt_pure(s, arrays)),
+            expr_pure(cond, arrays, structs) && body.iter().all(|s| stmt_pure(s, arrays, structs)),
         Stmt::ForRange { start, end, body, .. } =>
-            expr_pure(start, arrays) && expr_pure(end, arrays)
-            && body.iter().all(|s| stmt_pure(s, arrays)),
+            expr_pure(start, arrays, structs) && expr_pure(end, arrays, structs)
+            && body.iter().all(|s| stmt_pure(s, arrays, structs)),
         Stmt::Break(None) | Stmt::Continue => true,
         _ => false,
     }
 }
 
-fn expr_pure(e: &Expr, arrays: &HashSet<String>) -> bool {
+fn expr_pure(e: &Expr, arrays: &HashSet<String>, structs: &HashMap<String, Vec<String>>) -> bool {
     match e {
-        Expr::At { expr, .. } => expr_pure(expr, arrays),
+        Expr::At { expr, .. } => expr_pure(expr, arrays, structs),
         Expr::Int(_) => true,
-        Expr::Ident(n) => !arrays.contains(n), // an array var is not a scalar
+        // an array/struct var is not a scalar (escape = ineligible)
+        Expr::Ident(n) => !arrays.contains(n) && !structs.contains_key(n),
+        // p.field read on a local struct var with a known field is a scalar
+        Expr::Field { base, field } =>
+            as_ident(base).and_then(|n| structs.get(n))
+                .map_or(false, |shape| shape.iter().any(|f| f == field)),
         Expr::Unary { op, expr } =>
-            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && expr_pure(expr, arrays),
+            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && expr_pure(expr, arrays, structs),
         Expr::Binary { op, lhs, rhs } =>
-            binop_pure(*op) && expr_pure(lhs, arrays) && expr_pure(rhs, arrays),
+            binop_pure(*op) && expr_pure(lhs, arrays, structs) && expr_pure(rhs, arrays, structs),
         Expr::If { cond, then, els } =>
-            expr_pure(cond, arrays) && expr_pure(then, arrays) && expr_pure(els, arrays),
+            expr_pure(cond, arrays, structs) && expr_pure(then, arrays, structs) && expr_pure(els, arrays, structs),
         Expr::Block { stmts, tail } =>
-            stmts.iter().all(|s| stmt_pure(s, arrays))
-            && tail.as_ref().map_or(false, |t| expr_pure(t, arrays)),
+            stmts.iter().all(|s| stmt_pure(s, arrays, structs))
+            && tail.as_ref().map_or(false, |t| expr_pure(t, arrays, structs)),
         Expr::Index { base, index } =>
             as_ident(base).map_or(false, |n| arrays.contains(n))
-            && expr_pure(index, arrays),
+            && expr_pure(index, arrays, structs),
         // len/pop on a local array var yield scalars; other calls must have
         // <= MAX_ARITY scalar args (callee eligibility enforced by the fixpoint)
         Expr::Call { callee, args } => {
             if array_builtin_call(callee, args, arrays) {
                 callee != "push" // push yields null; only allowed as a statement
             } else {
-                args.len() <= MAX_ARITY && args.iter().all(|a| expr_pure(a, arrays))
+                args.len() <= MAX_ARITY && args.iter().all(|a| expr_pure(a, arrays, structs))
             }
         }
         _ => false,
@@ -635,63 +757,71 @@ fn collect_calls(body: &[Stmt]) -> Vec<String> {
 
 // like collect_calls, but array builtins on local array vars (len/push/pop)
 // are not real calls — they lower to arena helpers, not Nova functions
-fn collect_real_calls(body: &[Stmt], arrays: &HashSet<String>) -> Vec<String> {
+fn collect_real_calls(body: &[Stmt], arrays: &HashSet<String>, structs: &HashMap<String, Vec<String>>) -> Vec<String> {
     let mut out = Vec::new();
-    for s in body { real_calls_stmt(s, arrays, &mut out); }
+    for s in body { real_calls_stmt(s, arrays, structs, &mut out); }
     out
 }
-fn real_calls_stmt(s: &Stmt, arrays: &HashSet<String>, out: &mut Vec<String>) {
+fn real_calls_stmt(s: &Stmt, arrays: &HashSet<String>, structs: &HashMap<String, Vec<String>>, out: &mut Vec<String>) {
     match s {
         Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value)
-        | Stmt::Return(Some(value)) => real_calls_expr(value, arrays, out),
+        | Stmt::Return(Some(value)) => real_calls_expr(value, arrays, structs, out),
         Stmt::IndexAssign { base, index, value } => {
-            real_calls_expr(base, arrays, out);
-            real_calls_expr(index, arrays, out);
-            real_calls_expr(value, arrays, out);
+            real_calls_expr(base, arrays, structs, out);
+            real_calls_expr(index, arrays, structs, out);
+            real_calls_expr(value, arrays, structs, out);
+        }
+        Stmt::FieldAssign { base, value, .. } => {
+            real_calls_expr(base, arrays, structs, out);
+            real_calls_expr(value, arrays, structs, out);
         }
         Stmt::If { cond, then, els } => {
-            real_calls_expr(cond, arrays, out);
-            for s in then { real_calls_stmt(s, arrays, out); }
-            if let Some(e) = els { for s in e { real_calls_stmt(s, arrays, out); } }
+            real_calls_expr(cond, arrays, structs, out);
+            for s in then { real_calls_stmt(s, arrays, structs, out); }
+            if let Some(e) = els { for s in e { real_calls_stmt(s, arrays, structs, out); } }
         }
         Stmt::While { cond, body } => {
-            real_calls_expr(cond, arrays, out);
-            for s in body { real_calls_stmt(s, arrays, out); }
+            real_calls_expr(cond, arrays, structs, out);
+            for s in body { real_calls_stmt(s, arrays, structs, out); }
         }
         Stmt::ForRange { start, end, body, .. } => {
-            real_calls_expr(start, arrays, out);
-            real_calls_expr(end, arrays, out);
-            for s in body { real_calls_stmt(s, arrays, out); }
+            real_calls_expr(start, arrays, structs, out);
+            real_calls_expr(end, arrays, structs, out);
+            for s in body { real_calls_stmt(s, arrays, structs, out); }
         }
         _ => {}
     }
 }
-fn real_calls_expr(e: &Expr, arrays: &HashSet<String>, out: &mut Vec<String>) {
+fn real_calls_expr(e: &Expr, arrays: &HashSet<String>, structs: &HashMap<String, Vec<String>>, out: &mut Vec<String>) {
     match e {
-        Expr::At { expr, .. } | Expr::Unary { expr, .. } => real_calls_expr(expr, arrays, out),
+        Expr::At { expr, .. } | Expr::Unary { expr, .. } => real_calls_expr(expr, arrays, structs, out),
         Expr::Binary { lhs, rhs, .. } => {
-            real_calls_expr(lhs, arrays, out);
-            real_calls_expr(rhs, arrays, out);
+            real_calls_expr(lhs, arrays, structs, out);
+            real_calls_expr(rhs, arrays, structs, out);
         }
         Expr::If { cond, then, els } => {
-            real_calls_expr(cond, arrays, out);
-            real_calls_expr(then, arrays, out);
-            real_calls_expr(els, arrays, out);
+            real_calls_expr(cond, arrays, structs, out);
+            real_calls_expr(then, arrays, structs, out);
+            real_calls_expr(els, arrays, structs, out);
         }
         Expr::Block { stmts, tail } => {
-            for s in stmts { real_calls_stmt(s, arrays, out); }
-            if let Some(t) = tail { real_calls_expr(t, arrays, out); }
+            for s in stmts { real_calls_stmt(s, arrays, structs, out); }
+            if let Some(t) = tail { real_calls_expr(t, arrays, structs, out); }
         }
         Expr::Index { base, index } => {
-            real_calls_expr(base, arrays, out);
-            real_calls_expr(index, arrays, out);
+            real_calls_expr(base, arrays, structs, out);
+            real_calls_expr(index, arrays, structs, out);
         }
+        Expr::StructLit { fields, .. } => {
+            for (_, v) in fields { real_calls_expr(v, arrays, structs, out); }
+        }
+        Expr::Field { base, .. } => real_calls_expr(base, arrays, structs, out),
         Expr::Call { callee, args } => {
             if !array_builtin_call(callee, args, arrays) {
                 out.push(callee.clone());
             }
             // still scan args (a push value may itself contain a real call)
-            for a in args { real_calls_expr(a, arrays, out); }
+            for a in args { real_calls_expr(a, arrays, structs, out); }
         }
         _ => {}
     }
@@ -783,8 +913,13 @@ impl Jit {
         }
         if eligible.is_empty() && feligible.is_empty() && numeric.is_empty() { return None; }
         let mut funcs: HashMap<&str, &Func> = HashMap::new();
+        let mut sdefs: HashMap<String, Vec<String>> = HashMap::new();
         for item in &prog.items {
-            if let Item::Func(f) = item { funcs.insert(&f.name, f); }
+            match item {
+                Item::Func(f) => { funcs.insert(&f.name, f); }
+                Item::Struct(sd) => { sdefs.insert(sd.name.clone(), sd.fields.clone()); }
+                _ => {}
+            }
         }
 
         let mut flags = settings::builder();
@@ -854,8 +989,9 @@ impl Jit {
             ctx.func.signature.returns.push(AbiParam::new(I64));
             {
                 let arrays = array_vars(f);
+                let structs = struct_vars(f, &sdefs);
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, &f.params);
+                let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params);
                 g.lower(&f.body)?;
                 b.finalize();
             }
@@ -1919,6 +2055,8 @@ struct FnGen<'a, 'b> {
     ids: &'a HashMap<String, (FuncId, usize)>,
     helpers: &'a HashMap<&'static str, FuncId>,
     arrays: HashSet<String>, // local array vars: I64 arena handles
+    // local struct vars: arena handle + field order (field name -> slot index)
+    structs: HashMap<String, Vec<String>>,
     vars: HashMap<String, Variable>,
     n_vars: usize,
     deopt_ptr: Value,
@@ -1931,7 +2069,8 @@ impl<'a, 'b> FnGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut JITModule,
            ids: &'a HashMap<String, (FuncId, usize)>,
            helpers: &'a HashMap<&'static str, FuncId>,
-           arrays: HashSet<String>, params: &[String]) -> Self {
+           arrays: HashSet<String>, structs: HashMap<String, Vec<String>>,
+           params: &[String]) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -1939,7 +2078,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         let param_vals: Vec<Value> = b.block_params(entry)[1..].to_vec();
         let deopt_block = b.create_block();
         let mut g = FnGen {
-            b, module, ids, helpers, arrays, vars: HashMap::new(), n_vars: 0,
+            b, module, ids, helpers, arrays, structs, vars: HashMap::new(), n_vars: 0,
             deopt_ptr, deopt_block, loops: Vec::new(), returned: false,
         };
         for (i, p) in params.iter().enumerate() {
@@ -1973,6 +2112,25 @@ impl<'a, 'b> FnGen<'a, 'b> {
             self.helper_call("nova_arr_push", &[h, v], false);
         }
         Some(())
+    }
+
+    // build a fresh arena block from a struct literal (one slot per field, in
+    // shape order) and bind it to `name`
+    fn build_struct(&mut self, name: &str, fields: &[(String, Expr)]) -> Option<()> {
+        let h = self.helper_call("nova_arr_new", &[], false)?;
+        let var = self.declare(name);
+        self.b.def_var(var, h);
+        for (_, fe) in fields {
+            let v = self.expr(fe)?;
+            let h = self.b.use_var(var);
+            self.helper_call("nova_arr_push", &[h, v], false);
+        }
+        Some(())
+    }
+
+    // slot index for `field` on struct var `name`
+    fn struct_slot(&self, name: &str, field: &str) -> Option<i64> {
+        self.structs.get(name)?.iter().position(|f| f == field).map(|i| i as i64)
     }
 
     fn declare(&mut self, name: &str) -> Variable {
@@ -2029,6 +2187,18 @@ impl<'a, 'b> FnGen<'a, 'b> {
                         }
                         _ => return None,
                     }
+                } else if self.structs.contains_key(name) {
+                    match strip_at(value) {
+                        Expr::StructLit { fields, .. } => { self.build_struct(name, fields)?; }
+                        Expr::Ident(src) => {
+                            // alias: same handle (shared, like the interp's Rc struct)
+                            let sv = *self.vars.get(src)?;
+                            let h = self.b.use_var(sv);
+                            let var = self.declare(name);
+                            self.b.def_var(var, h);
+                        }
+                        _ => return None,
+                    }
                 } else {
                     let v = self.expr(value)?;
                     let var = self.declare(name);
@@ -2059,6 +2229,17 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 let av = *self.vars.get(name)?;
                 let h = self.b.use_var(av);
                 let i = self.expr(index)?;
+                let v = self.expr(value)?;
+                self.helper_call("nova_arr_set", &[self.deopt_ptr, h, i, v], true);
+            }
+            // p.field = v on a local struct var: a slot store (index known at
+            // compile time, always in bounds by construction)
+            Stmt::FieldAssign { base, field, value } => {
+                let name = as_ident(base)?;
+                let slot = self.struct_slot(name, field)?;
+                let sv = *self.vars.get(name)?;
+                let h = self.b.use_var(sv);
+                let i = self.b.ins().iconst(I64, slot);
                 let v = self.expr(value)?;
                 self.helper_call("nova_arr_set", &[self.deopt_ptr, h, i, v], true);
             }
@@ -2212,6 +2393,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 let av = *self.vars.get(name)?;
                 let h = self.b.use_var(av);
                 let i = self.expr(index)?;
+                self.helper_call("nova_arr_get", &[self.deopt_ptr, h, i], true)
+            }
+            // p.field on a local struct var: a slot load (compile-time index,
+            // always in bounds by construction)
+            Expr::Field { base, field } => {
+                let name = as_ident(base)?;
+                let slot = self.struct_slot(name, field)?;
+                let sv = *self.vars.get(name)?;
+                let h = self.b.use_var(sv);
+                let i = self.b.ins().iconst(I64, slot);
                 self.helper_call("nova_arr_get", &[self.deopt_ptr, h, i], true)
             }
             Expr::Call { callee, args } => {
@@ -2622,6 +2813,25 @@ mod jit_tests {
             "fn hot(x){ x * 1.0001 + 0.5 }\n\
              fn main(){ let t = 0.0; let i = 0.0; while i < 500.0 { t = hot(t); i = i + 1.0 } t }", 50);
         assert!(names.contains(&"hot".to_string()), "hot float fn must compile");
+    }
+    #[test] fn struct_kernel_compiles_and_matches() {
+        // a local int-field struct kernel compiles on the i64 track (arena
+        // slots) and matches the VM byte-for-byte; aliases share the handle
+        let names = same_tiered(
+            "struct P { x: Int, y: Int }\n\
+             fn walk(n){ let p = P { x: 0, y: 0 }; let i = 0;\n\
+               while i < n { p.x = p.x + 2; p.y = p.y + p.x; i = i + 1 } p.x + p.y }\n\
+             fn main(){ let t = 0; for k in 0..200 { t = t + walk(50) } t }", 50);
+        assert!(names.contains(&"walk".to_string()), "struct kernel must compile: {:?}", names);
+    }
+    #[test] fn struct_escape_stays_off_jit() {
+        // returning the struct (escape) keeps the function ineligible — the
+        // interp/VM still run it correctly, just uncompiled
+        let names = same_tiered(
+            "struct P { x: Int, y: Int }\n\
+             fn esc(){ let p = P { x: 1, y: 2 }; p }\n\
+             fn main(){ let e = esc(); e.x + e.y }", 0);
+        assert!(!names.contains(&"esc".to_string()), "escaping struct must not compile");
     }
     #[test] fn simd_hint_eagerly_compiles_without_loop() {
         // `#[simd]` is an eager-compile JIT hint (like `#[hot]`): a loop-free
