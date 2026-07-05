@@ -11,6 +11,7 @@ mod aot;
 mod diag;
 mod obfuscate;
 mod lsp;
+mod registry;
 
 use std::io::{self, Write, BufRead};
 use std::process::exit;
@@ -336,12 +337,18 @@ fn main() {
         }
         "lsp" => lsp::run(),
         "add" => pkg_add(&args),
+        "remove" | "rm" => pkg_remove(&args),
         "deps" => pkg_deps(),
+        "install" | "fetch" => pkg_install(false),
+        "update" => pkg_install(true),
+        "tree" => pkg_tree(),
+        "publish" => pkg_publish(&args),
+        "registry" => pkg_registry(&args),
         "daemon" => run_daemon(),
         "version" | "--version" | "-v" => println!("Nova {}", VERSION),
         other => {
             eprintln!("unknown command: {}", other);
-            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | lsp | add <src> [name] | deps | repl | daemon | version]");
+            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | lsp | add <src|name@req> [name] | remove <name> | deps | install | update | tree | publish <index-dir> | registry <index-dir> [--port N] | repl | daemon | version]");
             exit(2);
         }
     }
@@ -649,7 +656,13 @@ fn delim_balance(s: &str) -> i32 {
 // imports and cycles are safe), and all items are merged into one Program.
 fn load_program(path: &str) -> Result<ast::Program, String> {
     let mut visited = std::collections::HashSet::new();
-    load_module(path, &mut visited)
+    let mut program = load_module(path, &mut visited)?;
+    // Two-mode abilities: merge any `[abilities]` declared in nova.hgx onto the
+    // program's functions before execution/checking (see registry::apply_abilities).
+    if let Some(Ok(cfg)) = config::load_hgx(std::path::Path::new(".")) {
+        if !cfg.abilities.is_empty() { registry::apply_abilities(&mut program, &cfg.abilities); }
+    }
+    Ok(program)
 }
 
 // Import search order: relative to the importing file, then $NOVA_STD's
@@ -689,27 +702,147 @@ pub(crate) fn resolve_import(base: &std::path::Path, rel: &str) -> std::path::Pa
 // them. Vendored deps are resolved by `resolve_import` above, so a program can
 // `use "name"` regardless of where the source lived. Minimal but real — no
 // registry/network, just local/path deps (the honest, verifiable core).
+// `nova add` has two modes:
+//   * `nova add <file.nova> [name]` — vendor a local file into nova_modules and
+//     record it in nova.deps (the original quick, offline path — unchanged).
+//   * `nova add <name>@<req>` (or `<name> --version <req>` / `--git <url>` /
+//     `--path <p>`) — add a `[dependencies]` entry to nova.hgx, then `install`.
 fn pkg_add(args: &[String]) {
-    let src = match args.get(2) { Some(s) => s.clone(), None => { eprintln!("usage: nova add <src.nova> [name]"); exit(2); } };
-    let stem = std::path::Path::new(&src).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let name = args.get(3).cloned().unwrap_or(stem);
-    let content = match std::fs::read_to_string(&src) { Ok(c) => c, Err(e) => { eprintln!("error: cannot read {}: {}", src, e); exit(1); } };
-    if let Err(e) = std::fs::create_dir_all("nova_modules") { eprintln!("error: {}", e); exit(1); }
-    let dest = format!("nova_modules/{}.nova", name);
-    if let Err(e) = std::fs::write(&dest, &content) { eprintln!("error: cannot write {}: {}", dest, e); exit(1); }
-    // record in nova.deps (idempotent: replace an existing line for this name)
-    let manifest = std::fs::read_to_string("nova.deps").unwrap_or_default();
-    let mut lines: Vec<String> = manifest.lines().filter(|l| !l.starts_with(&format!("{} =", name))).map(|s| s.to_string()).collect();
-    lines.push(format!("{} = {}", name, src));
-    let _ = std::fs::write("nova.deps", lines.join("\n") + "\n");
-    println!("added `{}` -> {} (use \"{}\")", name, dest, name);
+    let spec = match args.get(2) { Some(s) => s.clone(), None => { eprintln!("usage: nova add <src.nova> [name] | <name>@<req>"); exit(2); } };
+    // local-file mode: the arg names an existing .nova file
+    if std::path::Path::new(&spec).is_file() {
+        let stem = std::path::Path::new(&spec).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let name = args.get(3).filter(|a| !a.starts_with("--")).cloned().unwrap_or(stem);
+        let content = match std::fs::read_to_string(&spec) { Ok(c) => c, Err(e) => { eprintln!("error: cannot read {}: {}", spec, e); exit(1); } };
+        if let Err(e) = std::fs::create_dir_all("nova_modules") { eprintln!("error: {}", e); exit(1); }
+        let dest = format!("nova_modules/{}.nova", name);
+        if let Err(e) = std::fs::write(&dest, &content) { eprintln!("error: cannot write {}: {}", dest, e); exit(1); }
+        let manifest = std::fs::read_to_string("nova.deps").unwrap_or_default();
+        let mut lines: Vec<String> = manifest.lines().filter(|l| !l.starts_with(&format!("{} =", name))).map(|s| s.to_string()).collect();
+        lines.push(format!("{} = {}", name, spec));
+        let _ = std::fs::write("nova.deps", lines.join("\n") + "\n");
+        println!("added `{}` -> {} (use \"{}\")", name, dest, name);
+        return;
+    }
+    // registry/git/path mode: mutate nova.hgx [dependencies], then install
+    let (name, ver_inline) = match spec.split_once('@') { Some((n, v)) => (n.to_string(), Some(v.to_string())), None => (spec.clone(), None) };
+    let flag = |k: &str| args.iter().skip(3).position(|a| a == k).and_then(|i| args.get(3 + i + 1)).cloned();
+    let entry = if let Some(g) = flag("--git") {
+        match flag("--rev") { Some(r) => format!("{{ git = \"{}\", rev = \"{}\" }}", g, r), None => format!("{{ git = \"{}\" }}", g) }
+    } else if let Some(p) = flag("--path") {
+        format!("{{ path = \"{}\" }}", p)
+    } else {
+        format!("\"{}\"", ver_inline.or_else(|| flag("--version")).unwrap_or_else(|| "*".into()))
+    };
+    if let Err(e) = hgx_upsert_dependency(&name, &entry) { eprintln!("error: {}", e); exit(1); }
+    println!("added `{}` to nova.hgx [dependencies]", name);
+    pkg_install(false);
+}
+
+// Insert/replace a `name = <entry>` line under `[dependencies]` in nova.hgx,
+// creating the file / section if needed. Preserves all other content.
+fn hgx_upsert_dependency(name: &str, entry: &str) -> Result<(), String> {
+    let path = std::path::Path::new("nova.hgx");
+    let text = std::fs::read_to_string(path).unwrap_or_else(|_| "[package]\nname = \"app\"\nversion = \"0.1.0\"\n".to_string());
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let dep_hdr = lines.iter().position(|l| l.trim() == "[dependencies]");
+    let new_line = format!("{} = {}", name, entry);
+    match dep_hdr {
+        Some(h) => {
+            // find the extent of the section, replace an existing key or append
+            let end = lines[h + 1..].iter().position(|l| l.trim_start().starts_with('[')).map(|i| h + 1 + i).unwrap_or(lines.len());
+            if let Some(k) = lines[h + 1..end].iter().position(|l| l.split('=').next().map(|s| s.trim() == name).unwrap_or(false)) {
+                lines[h + 1 + k] = new_line;
+            } else {
+                lines.insert(end, new_line);
+            }
+        }
+        None => { lines.push("[dependencies]".into()); lines.push(new_line); }
+    }
+    std::fs::write(path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
+fn pkg_remove(args: &[String]) {
+    let name = match args.get(2) { Some(s) => s.clone(), None => { eprintln!("usage: nova remove <name>"); exit(2); } };
+    let mut changed = false;
+    if let Ok(text) = std::fs::read_to_string("nova.hgx") {
+        let kept: Vec<String> = text.lines().filter(|l| !l.split('=').next().map(|s| s.trim() == name).unwrap_or(false)).map(|s| s.to_string()).collect();
+        if kept.len() != text.lines().count() { let _ = std::fs::write("nova.hgx", kept.join("\n") + "\n"); changed = true; }
+    }
+    let _ = std::fs::remove_file(format!("nova_modules/{}.nova", name));
+    let _ = std::fs::remove_dir_all(format!("nova_modules/{}", name));
+    if let Ok(text) = std::fs::read_to_string("nova.deps") {
+        let kept: Vec<String> = text.lines().filter(|l| !l.starts_with(&format!("{} =", name))).map(|s| s.to_string()).collect();
+        let _ = std::fs::write("nova.deps", kept.join("\n") + "\n");
+    }
+    println!("{} `{}`", if changed { "removed" } else { "removed (vendored files)" }, name);
 }
 
 fn pkg_deps() {
+    if let Some(Ok(cfg)) = config::load_hgx(std::path::Path::new(".")) {
+        if !cfg.dependencies.is_empty() {
+            println!("dependencies (nova.hgx):");
+            for d in &cfg.dependencies {
+                let src = d.git.clone().map(|g| format!("git {}", g))
+                    .or_else(|| d.path.clone().map(|p| format!("path {}", p)))
+                    .unwrap_or_else(|| d.version.clone().unwrap_or_else(|| "*".into()));
+                println!("  {} = {}", d.name, src);
+            }
+            return;
+        }
+    }
     match std::fs::read_to_string("nova.deps") {
         Ok(m) if !m.trim().is_empty() => { print!("{}", m); }
-        _ => println!("no dependencies (use `nova add <src.nova> [name]`)"),
+        _ => println!("no dependencies (use `nova add <name>@<req>` or `nova add <src.nova> [name]`)"),
     }
+}
+
+fn load_cfg_or_exit() -> config::HgxConfig {
+    match config::load_hgx(std::path::Path::new(".")) {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => { eprintln!("{}", e); exit(1); }
+        None => { eprintln!("error: no nova.hgx in this directory"); exit(1); }
+    }
+}
+
+fn pkg_install(update: bool) {
+    let cfg = load_cfg_or_exit();
+    match registry::install(&cfg, update) {
+        Ok(locked) if locked.is_empty() => println!("no dependencies to install"),
+        Ok(locked) => {
+            println!("{} {} package(s), locked in nova.lock:", if update { "updated" } else { "installed" }, locked.len());
+            print!("{}", registry::tree(&locked));
+        }
+        Err(e) => { eprintln!("error: {}", e); exit(1); }
+    }
+}
+
+fn pkg_tree() {
+    // prefer the lock (reproducible); fall back to a fresh resolve
+    let locked = if let Ok(text) = std::fs::read_to_string("nova.lock") {
+        registry::read_lock(&text)
+    } else {
+        let cfg = load_cfg_or_exit();
+        match registry::install(&cfg, false) { Ok(l) => l, Err(e) => { eprintln!("error: {}", e); exit(1); } }
+    };
+    if locked.is_empty() { println!("no dependencies"); } else { print!("{}", registry::tree(&locked)); }
+}
+
+fn pkg_publish(args: &[String]) {
+    let index_dir = match args.get(2) { Some(s) => s.clone(), None => { eprintln!("usage: nova publish <index-dir>"); exit(2); } };
+    let cfg = load_cfg_or_exit();
+    match registry::publish(std::path::Path::new("."), std::path::Path::new(&index_dir), &cfg) {
+        Ok(sha) => println!("published {} {} to {} (sha256 {})", cfg.name, cfg.version, index_dir, &sha[..16]),
+        Err(e) => { eprintln!("error: {}", e); exit(1); }
+    }
+}
+
+fn pkg_registry(args: &[String]) {
+    let dir = match args.iter().skip(2).find(|a| !a.starts_with("--")) { Some(s) => s.clone(), None => { eprintln!("usage: nova registry <index-dir> [--port N]"); exit(2); } };
+    let port: u16 = args.iter().skip(2).find_map(|a| a.strip_prefix("--port=")).and_then(|s| s.parse().ok())
+        .or_else(|| args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()))
+        .unwrap_or(7878);
+    if let Err(e) = registry::serve(std::path::Path::new(&dir), port) { eprintln!("error: {}", e); exit(1); }
 }
 
 fn load_module(

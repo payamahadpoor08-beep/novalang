@@ -1,4 +1,4 @@
-# Nova — feature reality audit (v3.28)
+# Nova — feature reality audit (v3.29)
 
 An honest, source-verified answer to "which grammar features are actually
 implemented, and which only parse?" Status is derived from the code, not the
@@ -91,7 +91,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | **LSP** (`nova lsp`) — full IDE server: diagnostics, hover, completion, signatureHelp, goto-definition, references, documentHighlight, document/workspace symbols, rename, formatting, semanticTokens, foldingRange | Run ✅ — 11-capability suite in `tests/lsp_smoke.sh` |
-| **package manager** (`nova add <src> [name]`, `nova deps`) — vendors deps into `nova_modules/`, resolved by `use "name"` | Run ✅ — local/path deps; `tests/pkg_smoke.sh` |
+| **package registry** (`nova add`/`remove`/`install`/`update`/`tree`/`publish`/`registry`) — real registry on `nova.hgx` `[dependencies]`: SemVer resolver (caret/tilde/wildcard/range) + reproducible `nova.lock`, `.nvpkg` archives, SHA-256 verification, an HTTP index server (`nova registry`) + client, registry/path/git sources, and **two-mode `[abilities]`** (attributes declarable in the manifest, merged onto code) | Run ✅ — full loop (publish→serve→resolve→fetch→verify→vendor→run byte-identical) in `tests/registry_smoke.sh`; local vendor path in `tests/pkg_smoke.sh`; see `docs/REGISTRY.md` |
 | **WASM target** (`nova build --aot=wasm`) — typed + boxed | Run ✅ — compiles the portable AOT C (incl. `nova_rt.c`) to `wasm32-wasi` via clang + a wasi-libc sysroot, shipped only if byte-identical to `nova run` under node's WASI (`tests/wasm_smoke.sh`). Strings/arrays included; only embed-tier programs are excluded. |
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
 | **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |

@@ -54,3 +54,9 @@ jobs:
             b=$(echo "$a" | ./target/release/nova fmt /dev/stdin)
             [ "$a" = "$b" ] || { echo "fmt not idempotent: $f"; exit 1; }
           done
+
+      - name: Tooling smoke tests (LSP, package registry)
+        run: |
+          bash tests/lsp_smoke.sh
+          bash tests/pkg_smoke.sh
+          bash tests/registry_smoke.sh
