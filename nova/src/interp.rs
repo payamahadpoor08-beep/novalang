@@ -444,6 +444,15 @@ pub struct Interp {
     history: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
     // `#[anti_tamper]` baseline body hashes recorded at first call.
     tamper_base: RefCell<HashMap<String, i64>>,
+    // `#[instrument]` call counts (queryable via instrument_of); `#[budget(n)]` /
+    // `#[cost]` remaining-call allowance (throws when exhausted, budget_of reads
+    // it); `#[cache(ttl: n)]` remaining reuses before a memo entry is recomputed;
+    // one-shot `#[experimental]` warning set; `snapshot`/`rollback` named values.
+    instrument: RefCell<HashMap<String, i64>>,
+    budget: RefCell<HashMap<String, i64>>,
+    cache_ttl: RefCell<HashMap<String, i64>>,
+    experimental_warned: RefCell<std::collections::HashSet<String>>,
+    snapshots: RefCell<HashMap<String, Value>>,
     // state migrations keyed by the source ("from") type name: (to, body).
     migrations: HashMap<String, (String, Vec<Stmt>)>,
     // results of `#[comptime]` functions, evaluated once before main.
@@ -587,6 +596,11 @@ impl Interp {
             deprecated_warned: RefCell::new(std::collections::HashSet::new()),
             history: RefCell::new(HashMap::new()),
             tamper_base: RefCell::new(HashMap::new()),
+            instrument: RefCell::new(HashMap::new()),
+            budget: RefCell::new(HashMap::new()),
+            cache_ttl: RefCell::new(HashMap::new()),
+            experimental_warned: RefCell::new(std::collections::HashSet::new()),
+            snapshots: RefCell::new(HashMap::new()),
             migrations,
             comptime: RefCell::new(HashMap::new()),
         })
@@ -898,12 +912,50 @@ impl Interp {
             }
         }
 
-        // memo / memoize: return a cached result if present
-        let memo_key = if has("memo") || has("memoize") {
+        // experimental / since: warn once per function, like deprecate
+        if has("experimental") || has("since") {
+            if self.experimental_warned.borrow_mut().insert(name.to_string()) {
+                eprintln!("warning: `{}` is experimental", name);
+            }
+        }
+
+        // budget(n) / cost: a call allowance — throw once it is exhausted. The
+        // remaining count is queryable via budget_of(name).
+        if let Some(att) = func.attrs.iter().find(|a| a.name == "budget" || a.name == "cost") {
+            if let Some(n) = att.args.iter().find_map(|(_, v)| v.parse::<i64>().ok()) {
+                let mut b = self.budget.borrow_mut();
+                let rem = b.entry(name.to_string()).or_insert(n);
+                if *rem <= 0 {
+                    drop(b);
+                    return self.fail_assert(format!("budget exceeded in `{}`", name));
+                }
+                *rem -= 1;
+            }
+        }
+
+        // instrument: count calls (queryable via instrument_of)
+        if has("instrument") {
+            *self.instrument.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
+        }
+
+        // memo / memoize: return a cached result if present. cache(ttl: n) is a
+        // memo whose entry is reused at most n times before being recomputed.
+        let ttl = func.attrs.iter().find(|a| a.name == "cache")
+            .and_then(|a| a.int_arg("ttl").or_else(|| a.int_arg("")));
+        let memo_key = if has("memo") || has("memoize") || ttl.is_some() {
             Some(format!("{}|{}", name, args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")))
         } else { None };
         if let Some(k) = &memo_key {
-            if let Some(v) = self.memo.borrow().get(k) { return Ok(v.clone()); }
+            let fresh = match ttl {
+                Some(_) => {
+                    let mut c = self.cache_ttl.borrow_mut();
+                    match c.get_mut(k) { Some(r) if *r > 0 => { *r -= 1; true } _ => false }
+                }
+                None => true,
+            };
+            if fresh {
+                if let Some(v) = self.memo.borrow().get(k) { return Ok(v.clone()); }
+            }
         }
 
         // anti_debug: refuse to run under a debugger (best-effort)
@@ -983,9 +1035,12 @@ impl Interp {
             }
         }
 
-        // memo: store a successful result
+        // memo: store a successful result (cache(ttl) also seeds the reuse count)
         if let (Some(k), Ok(v)) = (&memo_key, &result) {
             self.memo.borrow_mut().insert(k.clone(), v.clone());
+            if let Some(n) = ttl {
+                self.cache_ttl.borrow_mut().insert(k.clone(), n.max(0));
+            }
         }
         result
     }
@@ -1158,6 +1213,33 @@ impl Interp {
                 let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
                     _ => return Err("profile_of expects a function name".into()) };
                 return Ok(Value::Int(*self.profile.borrow().get(&tgt).unwrap_or(&0)));
+            }
+            // `#[instrument]` support: call count of an instrumented function.
+            "instrument_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("instrument_of expects a function name".into()) };
+                return Ok(Value::Int(*self.instrument.borrow().get(&tgt).unwrap_or(&0)));
+            }
+            // `#[budget(n)]` support: the remaining call allowance (0 once spent).
+            "budget_of" => {
+                let tgt = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("budget_of expects a function name".into()) };
+                return Ok(Value::Int(*self.budget.borrow().get(&tgt).unwrap_or(&0)));
+            }
+            // `#[snapshot]` / `#[rollback]` support: capture and restore a named
+            // value. `snapshot(id, value)` stores it; `rollback(id)` returns the
+            // last snapshot (or null).
+            "snapshot" => {
+                let id = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("snapshot expects (id: string, value)".into()) };
+                let v = args.get(1).cloned().unwrap_or(Value::Null);
+                self.snapshots.borrow_mut().insert(id, v.clone());
+                return Ok(v);
+            }
+            "rollback" => {
+                let id = match args.get(0) { Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("rollback expects an id string".into()) };
+                return Ok(self.snapshots.borrow().get(&id).cloned().unwrap_or(Value::Null));
             }
             // `#[integrity]` support: a stable content hash of a function's body,
             // so a program can verify its own code hasn't been altered.
@@ -4328,6 +4410,36 @@ mod attr_tests {
                    format!("{:?}", Ok::<_,String>(Value::Int(4))));
         let a = interp.call("attrs_of", vec![Value::Str("q".into())]).unwrap();
         if let Value::Array(arr) = a { assert_eq!(arr.borrow().len(), 2); } else { panic!("expected array"); }
+    }
+
+    #[test]
+    fn budget_instrument_cache_snapshot() {
+        let src = "#[budget(calls: \"2\")] fn lim(x){ x }\n\
+                   #[instrument] fn tr(n){ n }\n\
+                   #[cache(ttl: 1)] fn sq(n){ n * n }\nfn main(){ 0 }";
+        let prog = parse_program(src).expect("parse");
+        let interp = Interp::new(&prog).expect("interp");
+        // budget: two calls succeed, budget_of drops to 0, the third throws
+        assert!(interp.call("lim", vec![Value::Int(1)]).is_ok());
+        assert!(interp.call("lim", vec![Value::Int(2)]).is_ok());
+        assert_eq!(format!("{:?}", interp.call("budget_of", vec![Value::Str("lim".into())])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(0))));
+        assert!(interp.call("lim", vec![Value::Int(3)]).is_err());
+        // instrument: counts calls
+        for _ in 0..3 { let _ = interp.call("tr", vec![Value::Int(1)]); }
+        assert_eq!(format!("{:?}", interp.call("instrument_of", vec![Value::Str("tr".into())])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(3))));
+        // cache(ttl:1): reused once then recomputed — value stays correct
+        assert_eq!(format!("{:?}", interp.call("sq", vec![Value::Int(5)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(25))));
+        assert_eq!(format!("{:?}", interp.call("sq", vec![Value::Int(5)])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(25))));
+        // snapshot / rollback round-trips a value; missing id -> null
+        interp.call("snapshot", vec![Value::Str("k".into()), Value::Int(42)]).unwrap();
+        assert_eq!(format!("{:?}", interp.call("rollback", vec![Value::Str("k".into())])),
+                   format!("{:?}", Ok::<_,String>(Value::Int(42))));
+        assert_eq!(format!("{:?}", interp.call("rollback", vec![Value::Str("absent".into())])),
+                   format!("{:?}", Ok::<_,String>(Value::Null)));
     }
 
     #[test]

@@ -248,7 +248,8 @@ pub(crate) fn is_behavioural_attr(name: &str) -> bool {
         "self_healing" | "retry" | "hot_swap" | "memo" | "memoize"
         | "requires" | "ensures" | "assumes" | "trace" | "log" | "audit"
         | "profile" | "deprecate" | "deprecated" | "time_travel"
-        | "anti_debug" | "anti_tamper" | "integrity" | "comptime")
+        | "anti_debug" | "anti_tamper" | "integrity" | "comptime"
+        | "budget" | "cost" | "instrument" | "cache" | "experimental" | "since")
 }
 
 // Does any (nested) `let` in this body carry a refinement-type annotation?

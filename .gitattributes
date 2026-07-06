@@ -1,0 +1,17 @@
+# GitHub Linguist configuration.
+#
+# Nova is not yet in the upstream github/linguist database, so `.nova` files are
+# reported as "Other". These directives mark them as a first-class, detectable
+# language named "Nova"; the label takes effect once the language exists upstream
+# (see linguist/ for the ready-to-submit contribution kit) — the mapping here is
+# the in-repo half.
+*.nova linguist-language=Nova linguist-detectable=true
+
+# The self-hosting compiler front-end IS the language, written in Nova — count it.
+selfhost/*.nova linguist-language=Nova
+
+# Generated / vendored / non-source trees don't count toward the language stats.
+nova/target/**        linguist-generated=true
+nova/nova_modules/**  linguist-vendored=true
+bench/**              linguist-vendored=true
+*.lock                linguist-generated=true

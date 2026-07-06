@@ -1,0 +1,195 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Nova",
+  "scopeName": "source.nova",
+  "fileTypes": ["nova"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#attributes" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#declarations" },
+    { "include": "#types" },
+    { "include": "#operators" },
+    { "include": "#lifetimes" },
+    { "include": "#functioncall" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.nova",
+          "match": "//[/!].*$"
+        },
+        {
+          "name": "comment.line.double-slash.nova",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.nova",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [{ "include": "#comments" }]
+        }
+      ]
+    },
+    "attributes": {
+      "name": "meta.attribute.nova",
+      "begin": "#!?\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.attribute.nova" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.attribute.nova" } },
+      "patterns": [
+        { "name": "entity.name.tag.attribute.nova", "match": "[A-Za-z_][A-Za-z0-9_]*" },
+        { "include": "#strings" },
+        { "include": "#numbers" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nova",
+          "match": "\\b(if|else|for|while|loop|break|continue|return|match|await|spawn|select|defer|yield|try|catch|finally|throw|in|on)\\b"
+        },
+        {
+          "name": "keyword.other.nova",
+          "match": "\\b(fn|let|mut|use|mod|as|pub|macro|extern|migrate|from|to|test|machine|initial|where|async)\\b"
+        },
+        {
+          "name": "storage.type.nova",
+          "match": "\\b(struct|enum|trait|impl|union|data|type|const|static|stream|chan|ast)\\b"
+        },
+        {
+          "name": "storage.modifier.nova",
+          "match": "\\b(mut|ref|move|linear|affine|shared)\\b"
+        },
+        {
+          "name": "constant.language.nova",
+          "match": "\\b(true|false|null|self|super|crate)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.fn.nova" },
+            "2": { "name": "entity.name.function.nova" }
+          }
+        },
+        {
+          "match": "\\b(struct|enum|trait|union|data|machine|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.nova" },
+            "2": { "name": "entity.name.type.nova" }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.nova",
+          "match": "\\b(Int|Float|Str|String|Bool|Char|Array|Map|Set|Any|Unit)\\b"
+        },
+        {
+          "name": "entity.name.type.nova",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.nova",
+          "match": "\\b[0-9][0-9_]*(\\.[0-9][0-9_]*)([eE][+-]?[0-9]+)?(f32|f64)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.nova",
+          "match": "\\b[0-9][0-9_]*[eE][+-]?[0-9]+(f32|f64)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.hex.nova",
+          "match": "\\b0x[0-9A-Fa-f_]+([iu](8|16|32|64|128|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.binary.nova",
+          "match": "\\b0b[01_]+([iu](8|16|32|64|128|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.octal.nova",
+          "match": "\\b0o[0-7_]+([iu](8|16|32|64|128|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.nova",
+          "match": "\\b[0-9][0-9_]*([iu](8|16|32|64|128|size))?\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.raw.nova",
+          "begin": "r(#*)\"",
+          "end": "\"\\1"
+        },
+        {
+          "name": "string.interpolated.nova",
+          "begin": "f\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#escapes" },
+            {
+              "name": "meta.interpolation.nova",
+              "begin": "\\{",
+              "end": "\\}",
+              "beginCaptures": { "0": { "name": "punctuation.definition.interpolation.begin.nova" } },
+              "endCaptures": { "0": { "name": "punctuation.definition.interpolation.end.nova" } },
+              "patterns": [
+                { "include": "#keywords" },
+                { "include": "#numbers" },
+                { "include": "#strings" },
+                { "include": "#operators" }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.tagged.nova",
+          "begin": "(json|sql|re)\"",
+          "beginCaptures": { "1": { "name": "entity.name.tag.nova" } },
+          "end": "\"",
+          "patterns": [{ "include": "#escapes" }]
+        },
+        {
+          "name": "string.quoted.double.nova",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [{ "include": "#escapes" }]
+        },
+        {
+          "name": "string.quoted.single.nova",
+          "match": "'(\\\\(u\\{[0-9A-Fa-f]+\\}|[btnfr\"'\\\\0])|[^'\\\\])'"
+        }
+      ]
+    },
+    "escapes": {
+      "name": "constant.character.escape.nova",
+      "match": "\\\\(u\\{[0-9A-Fa-f]+\\}|[btnfr\"'\\\\0])"
+    },
+    "lifetimes": {
+      "name": "storage.modifier.lifetime.nova",
+      "match": "'[A-Za-z_][A-Za-z0-9_]*\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.nova",
+      "match": "->>|>>>|<<=|>>=|\\.\\.=|===|!==|<=>|\\?\\?=|<<|>>|=>|==|!=|>=|<=|&&|\\|\\||\\*\\*|\\?\\?|\\.\\.|->|:=|\\+=|-=|\\*=|/=|%=|\\^=|&=|\\|=|<-|\\|>|[-+*/%<>=!&|^~?.]"
+    },
+    "functioncall": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": { "1": { "name": "entity.name.function.call.nova" } }
+    }
+  }
+}

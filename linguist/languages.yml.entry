@@ -1,0 +1,13 @@
+# Entry to add to github/linguist's `lib/linguist/languages.yml`
+# (insert in alphabetical order, between "Nix" and "Nu"). The `language_id`
+# below is a placeholder — linguist maintainers assign the final canonical id
+# (a stable random 32-bit int) during review; run `script/update-ids` per their
+# CONTRIBUTING guide, or leave a note in the PR asking them to allocate it.
+Nova:
+  type: programming
+  color: "#4b8bf5"
+  extensions:
+    - ".nova"
+  tm_scope: source.nova
+  ace_mode: text
+  language_id: 100000001

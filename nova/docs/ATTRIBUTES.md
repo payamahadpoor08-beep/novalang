@@ -75,6 +75,37 @@ fn double_up(x) { x + x }
 ### `#[retry(attempts: N)]`
 Alias of `#[self_healing]`: retry the call on a runtime error up to N times.
 
+### `#[budget(...)]` / `#[cost(...)]`
+A **call allowance**: the function may be invoked a fixed number of times; the
+next call throws a catchable `budget exceeded in \`name\`` error. `budget_of("name")`
+returns the remaining allowance. Real resource-bounding for hot paths / rate
+limits.
+
+```nova
+#[budget(calls: "3")]
+fn limited(x) { x * 2 }
+// limited(..) works 3 times; budget_of("limited") == 0; the 4th call throws
+```
+
+### `#[instrument]`
+Counts calls, queryable via `instrument_of("name")` — like `#[profile]`, for
+call-frequency instrumentation.
+
+### `#[cache(ttl: N)]`
+A **memo with a bounded lifetime**: a cached result is reused at most N times
+before the body is recomputed and the entry refreshed. `#[cache(ttl: 0)]`
+degenerates to always-recompute; a plain `#[memo]` never expires.
+
+### `#[experimental]` / `#[since(...)]`
+Prints a one-time `warning: \`name\` is experimental` to stderr on first call —
+the API-stability counterpart of `#[deprecate]`.
+
+### `snapshot(id, value)` / `rollback(id)`
+State capture/restore builtins (the runtime side of `#[snapshot]`/`#[rollback]`):
+`snapshot("k", v)` stores `v` under `k` and returns it; `rollback("k")` returns
+the last snapshot (or `null`). Combine with `#[time_travel]`'s `history_of` for
+full checkpoint/restore.
+
 ### `#[trace]` / `#[log]` / `#[audit]`
 Prints a deterministic `trace: name(args) -> result` line on every call.
 
@@ -153,14 +184,19 @@ Returns the array of every attribute name on a function. Because **all** attribu
 are captured (not just the behavioural ones), even attributes whose full behaviour
 is still on the roadmap are visible and usable via this builtin.
 
-## Roadmap (parse-only today — being implemented in later phases)
-`#[polymorph]` remains a no-op: in a tree-walker, random dispatch among
-semantically-identical clones changes nothing observable, so shipping it as "done"
-would be dishonest — it belongs in the AOT-codegen phase (emit N equivalent
-variants). Plus remaining optimisation hints (`#[inline_cache]`, `#[tail_call]`)
-and metadata tags (`#[since]`, `#[example]`, `#[budget]`, …): all are **captured and
-introspectable via `attrs_of`** today; each gains full behaviour in later phases and
-is marked done in FEATURES.md only when a corpus test proves it.
+## Compiler / AOT-only attributes (honestly not runtime behaviour)
+A few attributes are **inherently compiler or AOT-codegen directives** with no
+observable effect in a tree-walking interpreter, so faking runtime behaviour for
+them would be dishonest. They are **captured and introspectable via `attrs_of`**
+(and their config via `meta_of`), and belong to the AOT/compiler phase:
+`#[polymorph]` (emit N equivalent native variants — random dispatch is a no-op in
+an interpreter), `#[compiler(mode:)]`, `#[predict]`, `#[incremental]`,
+`#[hot_reload]`, `#[pack]` (struct layout), and optimisation hints
+`#[inline_cache]` / `#[tail_call]`. Each gains real behaviour in the AOT phase and
+is marked done in FEATURES.md only when a corpus test proves it. (Note the
+**`nova demon` Demon Compiler** already delivers the daemon/incremental/hot-reload
+*tooling* — see `#[demon(...)]` above — so those capabilities exist as a command
+even though the per-function directive forms remain AOT concerns.)
 
 ---
 
