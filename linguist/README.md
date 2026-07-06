@@ -37,9 +37,14 @@ repositories** before it is accepted; the `.gitattributes` half already gives th
 correct label the moment the upstream entry merges.
 
 ## Honest status
-- ✅ `.gitattributes` mapping + this complete, valid contribution kit are in the
-  repo now.
-- ⏳ GitHub will render the language bar as **Nova** only after the upstream
-  linguist PR is merged (adoption-gated) — that step is outside this repository.
+- ✅ This complete, valid contribution kit (grammar + `languages.yml` entry +
+  samples) is in the repo now, ready to submit upstream.
+- 🟡 **Interim:** because GitHub ignores an unknown `linguist-language=Nova`,
+  the repo `.gitattributes` currently maps `*.nova` to **Rust** (Nova's closest
+  known relative) so the language bar shows source code instead of "Other".
+  This is a temporary stand-in, clearly documented in `.gitattributes`.
+- ⏳ GitHub renders the literal label **Nova** only after the upstream linguist PR
+  is merged (adoption-gated) — that step is outside this repository. Once it
+  lands, flip the two `.gitattributes` lines back to `linguist-language=Nova`.
 
 [github/linguist]: https://github.com/github/linguist
