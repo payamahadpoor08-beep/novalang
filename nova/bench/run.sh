@@ -31,6 +31,8 @@ for w in "${WORKLOADS[@]}"; do
   echo "### $w"
   [ -f "$w/main.c" ]    && cc  -O2 -o "$w/c.out"   "$w/main.c"   -lm 2>/dev/null
   [ -f "$w/main.cpp" ]  && c++ -O2 -o "$w/cpp.out" "$w/main.cpp" -lm 2>/dev/null
+  [ -f "$w/main.rs" ]   && have rustc && rustc -O -o "$w/rs.out" "$w/main.rs" 2>/dev/null
+  [ -f "$w/main.go" ]   && have go && (cd "$w" && go build -o go.out main.go 2>/dev/null)
   [ -f "$w/Main.java" ] && (cd "$w" && javac Main.java 2>/dev/null)
 
   declare -a rows=()
@@ -44,6 +46,8 @@ for w in "${WORKLOADS[@]}"; do
 
   have cc        && add "C (gcc -O2)"       "$(timecmd ./$w/c.out)"
   have c++       && add "C++ (g++ -O2)"     "$(timecmd ./$w/cpp.out)"
+  [ -x "$w/rs.out" ]     && add "Rust (rustc -O)" "$(timecmd ./$w/rs.out)"
+  [ -x "$w/go.out" ]     && add "Go"        "$(timecmd ./$w/go.out)"
   [ -f "$w/Main.class" ] && add "Java"      "$(timecmd java -cp $w Main)"
   # Nova AOT: `nova build` writes ./build/main relative to cwd, so build in-dir
   ( cd "$w" && "$NOVA" build --aot main.nova >/dev/null 2>&1 )
@@ -55,6 +59,7 @@ for w in "${WORKLOADS[@]}"; do
   have node      && add "TypeScript (node --strip-types)" "$(timecmd node --experimental-strip-types $w/main.ts)"
   add "Nova run (interp)"  "$(timecmd $NOVA run "$w/main.nova")"
   have python3   && add "Python 3"          "$(timecmd python3 $w/main.py)"
+  have ruby      && add "Ruby"              "$(timecmd ruby $w/main.rb)"
 
   # sort by ms ascending and print a table
   printf '\n| language | ms | result |\n|---|---:|---|\n'
