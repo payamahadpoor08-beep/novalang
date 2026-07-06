@@ -1,0 +1,36 @@
+// Attribute runtime, batch 2: budget/cost allowance, instrument counting,
+// cache(ttl) memoization, and snapshot/rollback — each with a deterministic,
+// byte-identical observable effect and its introspection builtin.
+
+#[budget(calls: "3")]
+fn limited(x) { x * 2 }
+
+#[instrument]
+fn tracked(n) { n + 1 }
+
+#[cache(ttl: 2)]
+fn squared(n) { n * n }
+
+fn main() {
+  // budget: three calls allowed, the fourth throws (catchable)
+  print(limited(1))                        // 2
+  print(limited(2))                        // 4
+  print(limited(3))                        // 6
+  print(budget_of("limited"))              // 0
+  try { limited(4) } catch e { print(e) }  // budget exceeded in `limited`
+
+  // instrument: call counting
+  tracked(1)
+  tracked(2)
+  tracked(3)
+  print(instrument_of("tracked"))          // 3
+
+  // cache(ttl: 2): computed once, reused
+  print(squared(5))                        // 25
+  print(squared(5))                        // 25
+
+  // snapshot / rollback: capture and restore named state
+  snapshot("cfg", [1, 2, 3])
+  print(rollback("cfg"))                   // [1, 2, 3]
+  print(rollback("absent"))                // null
+}

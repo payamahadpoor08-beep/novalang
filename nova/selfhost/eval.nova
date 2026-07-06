@@ -470,6 +470,24 @@ fn call_fn_attr(name, def, attrs, args, G) {
     let body = def[1]
     // profile: count calls
     if fn_has_attr(attrs, "profile") { let k = "profile:" + name; map_set(G[10], k, (if map_has(G[10], k) { map_get(G[10], k) } else { 0 }) + 1) }
+    // experimental / since: warn once
+    if fn_has_attr(attrs, "experimental") || fn_has_attr(attrs, "since") {
+        let ek = "exp:" + name
+        if !map_has(G[10], ek) { map_set(G[10], ek, true); eprint("warning: `" + name + "` is experimental") }
+    }
+    // budget(n) / cost: call allowance — throw once exhausted
+    let mut bc = ""
+    if fn_has_attr(attrs, "budget") { bc = fn_get_attr(attrs, "budget") }
+    if bc == "" && fn_has_attr(attrs, "cost") { bc = fn_get_attr(attrs, "cost") }
+    if bc != "" {
+        let n = extract_int_after(attr_arg(bc), "")
+        let bk = "budget:" + name
+        let rem = if map_has(G[10], bk) { map_get(G[10], bk) } else { n }
+        if rem <= 0 { throw "budget exceeded in `" + name + "`" }
+        map_set(G[10], bk, rem - 1)
+    }
+    // instrument: count calls
+    if fn_has_attr(attrs, "instrument") { let ik = "instrument:" + name; map_set(G[10], ik, (if map_has(G[10], ik) { map_get(G[10], ik) } else { 0 }) + 1) }
     // requires: precondition contract
     let mut ci = 0
     while ci < len(attrs) {
@@ -479,10 +497,20 @@ fn call_fn_attr(name, def, attrs, args, G) {
         }
         ci = ci + 1
     }
-    // memoization
-    let memo = fn_has_attr(attrs, "memo")
+    // memoization: #[memo] or #[cache(ttl: n)] (a memo reused at most n times)
+    let ca = fn_get_attr(attrs, "cache")
+    let ttl = if ca != "" { extract_int_after(attr_arg(ca), "") } else { 0 - 1 }
+    let memo = fn_has_attr(attrs, "memo") || ttl >= 0
     let mkey = if memo { "memo:" + name + ":" + args_key(args) } else { "" }
-    if memo && map_has(G[10], mkey) { return map_get(G[10], mkey) }
+    if memo && map_has(G[10], mkey) {
+        let mut fresh = true
+        if ttl >= 0 {
+            let ck = "cttl:" + mkey
+            let r = if map_has(G[10], ck) { map_get(G[10], ck) } else { 0 }
+            if r > 0 { map_set(G[10], ck, r - 1) } else { fresh = false }
+        }
+        if fresh { return map_get(G[10], mkey) }
+    }
     // hot-swapped body wins
     let mut result = null
     if map_has(G[10], "swap:" + name) { result = apply(map_get(G[10], "swap:" + name), args, G) }
@@ -523,7 +551,7 @@ fn call_fn_attr(name, def, attrs, args, G) {
         while len(hist) > depth { let mut nh = []; let mut i = 1; while i < len(hist) { push(nh, hist[i]); i = i + 1 } hist = nh }
         map_set(G[10], k, hist)
     }
-    if memo { map_set(G[10], mkey, result) }
+    if memo { map_set(G[10], mkey, result); if ttl >= 0 { map_set(G[10], "cttl:" + mkey, ttl) } }
     return result
 }
 fn eval_expr_str(src, env, G) {
@@ -1176,6 +1204,10 @@ fn builtin(name, args, G) {
     if name == "hot_swap" { map_set(G[10], "swap:" + args[0], args[1]); return null }
     if name == "integrity_of" { if map_has(G[0], args[0]) { let d = map_get(G[0], args[0]); return str_hash(tree_str(d[1]) + args[0]) } return 0 }
     if name == "profile_of" { let k = "profile:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return 0 }
+    if name == "instrument_of" { let k = "instrument:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return 0 }
+    if name == "budget_of" { let k = "budget:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return 0 }
+    if name == "snapshot" { let v = if len(args) > 1 { args[1] } else { null } map_set(G[10], "snap:" + args[0], v); return v }
+    if name == "rollback" { let k = "snap:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return null }
     if name == "attrs_of" { if map_has(G[0], args[0]) { let d = map_get(G[0], args[0]); if len(d) > 2 { return d[2] } } return [] }
     if name == "history_of" { let k = "history:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return [] }
     if name == "meta_of" {
