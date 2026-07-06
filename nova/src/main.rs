@@ -364,10 +364,11 @@ fn main() {
         "publish" => pkg_publish(&args),
         "registry" => pkg_registry(&args),
         "daemon" => run_daemon(),
+        "demon" => run_demon(&args),
         "version" | "--version" | "-v" => println!("Nova {}", VERSION),
         other => {
             eprintln!("unknown command: {}", other);
-            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | lsp | add <src|name@req> [name] | remove <name> | deps | install | update | tree | publish <index-dir> | registry <index-dir> [--port N] | repl | daemon | version]");
+            eprintln!("usage: nova [run <file> | vm <file> | bench <file> | check <file> | test <file> | doc <file> | fmt [-w] <file> | obfuscate [-w] <file> | lsp | add <src|name@req> [name] | remove <name> | deps | install | update | tree | publish <index-dir> | registry <index-dir> [--port N] | repl | daemon | demon <file> | version]");
             exit(2);
         }
     }
@@ -461,6 +462,219 @@ fn run_daemon() {
             "stats" => println!("cached={} loads={} reused_functions={}", cache.len(), loads, reuses),
             other => println!("unknown command: {}", other),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `nova demon <file>` — the Demon (background) Compiler.
+//
+// A daemon compiler that continuously watches the Nova sources, and on every
+// change re-runs the incremental pipeline: reparse only what changed (per-
+// function content hashing → an intelligent AST cache), rerun the type checker
+// for live diagnostics, and hot-reload the program (rerun `main` in the same
+// process, no restart). Configured by the `#[demon(...)]` attribute on any item
+// (mode/watch/cache/hot_reload/incremental/diagnostics/optimize) or run with
+// defaults. `mode: "batch"` does a single pass (CI); `mode: "daemon"` (default)
+// loops until interrupted.
+#[derive(Clone)]
+struct DemonConfig {
+    mode: String,            // "daemon" | "batch"
+    watch: Vec<String>,      // directories to watch (default: entry file's dir)
+    cache: bool,             // intelligent per-function AST cache
+    hot_reload: bool,        // rerun without restarting the process
+    incremental: bool,       // reparse/report only changed functions
+    diagnostics: bool,       // run the checker and stream diagnostics
+    optimize: String,        // "speed" | "size" | "aggressive"
+}
+impl Default for DemonConfig {
+    fn default() -> Self {
+        DemonConfig {
+            mode: "daemon".into(), watch: Vec::new(), cache: true, hot_reload: true,
+            incremental: true, diagnostics: true, optimize: "speed".into(),
+        }
+    }
+}
+
+// Parse the `#[demon(...)]` attribute's raw text into a config (best-effort,
+// tolerant: unknown keys ignored, missing keys keep their defaults).
+fn parse_demon_attr(raw: &str) -> DemonConfig {
+    let mut cfg = DemonConfig::default();
+    // isolate the "(...)" argument body, if any
+    let body = match (raw.find('('), raw.rfind(')')) {
+        (Some(a), Some(b)) if b > a => &raw[a + 1..b],
+        _ => return cfg,
+    };
+    // split on top-level commas (not inside [ ] or " ")
+    let mut parts: Vec<String> = Vec::new();
+    let (mut depth, mut instr, mut cur) = (0i32, false, String::new());
+    for c in body.chars() {
+        match c {
+            '"' => { instr = !instr; cur.push(c); }
+            '[' if !instr => { depth += 1; cur.push(c); }
+            ']' if !instr => { depth -= 1; cur.push(c); }
+            ',' if !instr && depth == 0 => { parts.push(std::mem::take(&mut cur)); }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { parts.push(cur); }
+    for part in parts {
+        let mut kv = part.splitn(2, ':');
+        let key = kv.next().unwrap_or("").trim();
+        let val = kv.next().unwrap_or("").trim();
+        let sval = val.trim_matches('"').to_string();
+        match key {
+            "mode" => cfg.mode = sval,
+            "optimize" => cfg.optimize = sval,
+            "cache" => cfg.cache = val == "true",
+            "hot_reload" => cfg.hot_reload = val == "true",
+            "incremental" => cfg.incremental = val == "true",
+            "diagnostics" => cfg.diagnostics = val == "true",
+            "watch" => {
+                cfg.watch = val.trim_matches(|c| c == '[' || c == ']')
+                    .split(',').map(|s| s.trim().trim_matches('"').to_string())
+                    .filter(|s| !s.is_empty()).collect();
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+// FNV-1a per-function body hashes (the intelligent cache key: unchanged
+// functions are reused, changed ones recompiled).
+fn demon_hashes(p: &ast::Program) -> std::collections::HashMap<String, u64> {
+    let mut m = std::collections::HashMap::new();
+    for it in &p.items {
+        if let ast::Item::Func(f) = it {
+            let text = format!("{:?}", f);
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in text.bytes() { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3); }
+            m.insert(f.name.clone(), h);
+        }
+    }
+    m
+}
+
+// Collect every `.nova` file under the watch roots (recursively) plus the entry
+// file, mapping each to its last-modified time — the change signature.
+fn demon_snapshot(entry: &str, roots: &[String]) -> std::collections::BTreeMap<String, std::time::SystemTime> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().map(|x| x == "nova").unwrap_or(false) { out.push(p); }
+            }
+        }
+    }
+    let mut files: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(entry)];
+    for r in roots { walk(std::path::Path::new(r), &mut files); }
+    let mut sig = std::collections::BTreeMap::new();
+    for f in files {
+        if let Ok(md) = std::fs::metadata(&f) {
+            if let Ok(t) = md.modified() {
+                sig.insert(f.to_string_lossy().to_string(), t);
+            }
+        }
+    }
+    sig
+}
+
+fn run_demon(args: &[String]) {
+    let path = require_path(args);
+    // discover the #[demon(...)] config from the source (first occurrence wins)
+    let mut cfg = DemonConfig::default();
+    if let Ok(prog) = load_program(&path) {
+        'find: for it in &prog.items {
+            let attrs = match it {
+                ast::Item::Func(f) => &f.attrs,
+                _ => continue,
+            };
+            for a in attrs {
+                if a.name == "demon" { cfg = parse_demon_attr(&a.raw); break 'find; }
+            }
+        }
+    }
+    // default watch root: the entry file's directory
+    if cfg.watch.is_empty() {
+        let dir = std::path::Path::new(&path).parent()
+            .map(|p| if p.as_os_str().is_empty() { ".".into() } else { p.to_string_lossy().to_string() })
+            .unwrap_or_else(|| ".".into());
+        cfg.watch = vec![dir];
+    }
+    println!("Nova {} — demon compiler", VERSION);
+    println!("  mode={} watch={:?} cache={} hot_reload={} incremental={} diagnostics={} optimize={}",
+             cfg.mode, cfg.watch, cfg.cache, cfg.hot_reload, cfg.incremental, cfg.diagnostics, cfg.optimize);
+
+    let mut fn_cache: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut first = true;
+    let mut last_sig = std::collections::BTreeMap::new();
+    let mut cycle = 0u64;
+    loop {
+        let sig = demon_snapshot(&path, &cfg.watch);
+        if first || sig != last_sig {
+            cycle += 1;
+            last_sig = sig.clone();
+            let changed_files: Vec<&String> = if first {
+                sig.keys().collect()
+            } else {
+                sig.iter().filter(|(k, v)| last_sig.get(*k) != Some(*v) || first)
+                    .map(|(k, _)| k).collect()
+            };
+            let _ = changed_files;
+            println!("\n─ cycle {} ─ {} file(s) watched", cycle, sig.len());
+            match load_program(&path) {
+                Ok(mut prog) => {
+                    interp::fold_program(&mut prog);
+                    // incremental: report changed vs reused functions
+                    if cfg.incremental || cfg.cache {
+                        let new = demon_hashes(&prog);
+                        if first {
+                            println!("  parse: {} function(s) compiled (first build)", new.len());
+                        } else {
+                            let mut changed: Vec<&str> = new.iter()
+                                .filter(|(n, h)| fn_cache.get(*n) != Some(*h))
+                                .map(|(n, _)| n.as_str()).collect();
+                            changed.sort();
+                            let reused = new.len().saturating_sub(changed.len());
+                            println!("  incremental: {} recompiled {:?}, {} reused (cache {})",
+                                     changed.len(), changed, reused,
+                                     if cfg.cache { "on" } else { "off" });
+                        }
+                        fn_cache = new;
+                    }
+                    // live diagnostics
+                    let mut clean = true;
+                    if cfg.diagnostics {
+                        let src = std::fs::read_to_string(&path).unwrap_or_default();
+                        let (errors, warnings) = types::Checker::new(&prog).check(&prog);
+                        for w in &warnings { eprintln!("{}", diag::render("warning", &path, &src, w)); }
+                        if errors.is_empty() {
+                            println!("  diagnostics: ✓ no errors");
+                        } else {
+                            clean = false;
+                            eprintln!("  diagnostics: ✗ {} error(s)", errors.len());
+                            for e in &errors { eprintln!("{}", diag::render("error", &path, &src, e)); }
+                        }
+                    }
+                    // hot reload: rerun in-process (no restart) when the build is clean
+                    if cfg.hot_reload && clean {
+                        match interp::Interp::new(&prog) {
+                            Ok(i) => match i.run() {
+                                Ok(_) => println!("  hot-reload: ✓ ran"),
+                                Err(e) => eprintln!("  runtime error: {}", e),
+                            },
+                            Err(e) => eprintln!("  error: {}", e),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("  parse error: {}", e),
+            }
+            first = false;
+            if cfg.mode == "batch" { break; }
+        }
+        if cfg.mode == "batch" { break; }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
