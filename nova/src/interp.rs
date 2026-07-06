@@ -387,8 +387,10 @@ pub(crate) enum Flow {
 pub struct Interp {
     funcs: FastMap<String, Func>,
     structs: HashMap<String, StructDef>,
-    // methods keyed by (type_name, method_name)
-    methods: HashMap<(String, String), Func>,
+    // methods, nested type_name -> method_name -> Rc<Func>. Nesting lets dispatch
+    // look up with &str keys (no per-call key allocation), and the Rc means the
+    // hot method-call path clones a refcount instead of the whole body AST.
+    methods: HashMap<String, HashMap<String, Rc<Func>>>,
     // variant_name -> (enum_name, arity)
     variants: FastMap<String, (String, usize)>,
     // module alias -> real module root (e.g. "m" -> "math")
@@ -474,7 +476,7 @@ impl Interp {
     pub fn new(program: &Program) -> Result<Self, String> {
         let mut funcs: FastMap<String, Func> = FastMap::default();
         let mut structs = HashMap::new();
-        let mut methods = HashMap::new();
+        let mut methods: HashMap<String, HashMap<String, Rc<Func>>> = HashMap::new();
         let mut variants: FastMap<String, (String, usize)> = FastMap::default();
         let mut module_aliases = HashMap::new();
         let mut tests = Vec::new();
@@ -511,7 +513,8 @@ impl Interp {
                     // implemented method names in this block
                     let mut provided: Vec<String> = Vec::new();
                     for m in &imp.methods {
-                        methods.insert((imp.type_name.clone(), m.name.clone()), m.clone());
+                        methods.entry(imp.type_name.clone()).or_default()
+                            .insert(m.name.clone(), Rc::new(m.clone()));
                         provided.push(m.name.clone());
                     }
                     // `impl Trait for Type`: pull in default methods + verify contract
@@ -522,7 +525,8 @@ impl Interp {
                         // add default methods that the impl didn't override
                         for d in &defaults {
                             if !provided.contains(&d.name) {
-                                methods.insert((imp.type_name.clone(), d.name.clone()), d.clone());
+                                methods.entry(imp.type_name.clone()).or_default()
+                                    .insert(d.name.clone(), Rc::new(d.clone()));
                                 provided.push(d.name.clone());
                             }
                         }
@@ -750,7 +754,8 @@ impl Interp {
                 Item::Struct(s) => { self.structs.insert(s.name.clone(), s.clone()); }
                 Item::Impl(imp) => {
                     for m in &imp.methods {
-                        self.methods.insert((imp.type_name.clone(), m.name.clone()), m.clone());
+                        self.methods.entry(imp.type_name.clone()).or_default()
+                            .insert(m.name.clone(), Rc::new(m.clone()));
                     }
                 }
                 Item::Enum(e) => {
@@ -2122,11 +2127,12 @@ impl Interp {
             }
         }
 
-        // user-defined struct methods
+        // user-defined struct methods — nested-map lookup with &str keys (no
+        // per-call key allocation) and an Rc clone (no body-AST deep copy)
         if let Value::Struct(ref inst) = receiver {
             let type_name = inst.borrow().type_name.clone();
-            let key = (type_name.clone(), method.to_string());
-            let func = self.methods.get(&key)
+            let func = self.methods.get(type_name.as_str())
+                .and_then(|m| m.get(method))
                 .ok_or_else(|| format!("type {} has no method: {}", type_name, method))?
                 .clone();
             // bind self + params
