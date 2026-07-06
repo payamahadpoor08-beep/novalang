@@ -1,0 +1,91 @@
+// Function attributes with real, tested semantics. Every tier (run/vm/jit)
+// must print byte-identically: attributed functions run through the interpreter
+// path on all tiers, so their behaviour is uniform.
+
+// #[self_healing]: the call retries on a runtime error. State shared through an
+// array (Rc-backed) persists across retries, so this deterministically succeeds
+// on the third attempt.
+#[self_healing(attempts: 5)]
+fn connect(state) {
+  state[0] = state[0] + 1
+  if state[0] < 3 { throw "transient failure" }
+  state[0]
+}
+
+// retries exhausted -> the error propagates, catchable like any other.
+#[self_healing(attempts: 3)]
+fn always_fails(c) { c[0] = c[0] + 1; throw "permanent" }
+
+// #[hot_swap]: the body can be replaced at runtime.
+#[hot_swap(scope: function)]
+fn formatter(x) { "v1:" + str(x) }
+
+// #[integrity]: a stable content hash of the function, for tamper detection.
+#[integrity]
+fn important() { 1 + 2 + 3 }
+
+fn main() {
+  s = [0]
+  print(connect(s))                 // 3 (succeeded on retry)
+
+  fails = [0]
+  try { always_fails(fails) } catch e {
+    print("gave up after " + str(fails[0]) + " attempts: " + e)
+  }
+
+  print(formatter(7))               // v1:7
+  hot_swap("formatter", (x) => "v2:" + str(x * 10))
+  print(formatter(7))               // v2:70
+
+  h1 = integrity_of("important")
+  print(h1 == integrity_of("important"))   // true — stable
+  print(h1 != integrity_of("connect"))
+  phase2()
+  phase3()
+  phase4()
+}
+
+// --- Phase 2 attributes ---
+#[memo]
+fn slow_fib(n) { if n < 2 { n } else { slow_fib(n-1) + slow_fib(n-2) } }
+
+#[requires(x >= 0)]
+#[ensures(result >= x)]
+fn double_up(x) { x + x }
+
+#[trace]
+fn tag(v) { v * 10 }
+
+#[profile]
+fn ping(n) { n }
+
+fn phase2() {
+  print(slow_fib(25))          // 75025, memoized
+  print(double_up(6))          // 12, contracts hold
+  print(tag(4))                // trace line + 40
+  ping(1); ping(1); ping(1)
+  print(profile_of("ping"))    // 3
+  print(len(attrs_of("double_up")))  // 2
+  try { double_up(0-1) } catch e { print("bad: " + e) }
+}
+
+#[time_travel(depth: 3)]
+fn track(n) { n + 100 }
+fn phase3() {
+  track(1); track(2); track(3); track(4)
+  print(history_of("track"))   // [102, 103, 104]
+}
+
+// --- Phase 4: advanced attributes ---
+#[version(v: "1.0")]
+#[anti_tamper]
+fn stable() { 7 * 6 }
+fn phase4() {
+  c = encrypt("classified", "pass")
+  print(c != "classified")
+  print(decrypt(c, "pass"))
+  print(meta_of("stable", "version"))
+  print(is_debugged())
+  print(stable())
+  print(stable())
+}

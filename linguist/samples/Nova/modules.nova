@@ -1,0 +1,39 @@
+use math.{sqrt, pow, pi, floor, gcd}
+use strings.{upper, split, join}
+use arrays.{sort, sum, reverse}
+
+fn main() {
+  print("=== math module ===")
+  print("sqrt(2):")
+  print(sqrt(2))
+  print("pow(2, 10):")
+  print(pow(2, 10))
+  print("pi:")
+  print(pi())
+  print("floor(3.7):")
+  print(floor(3.7))
+  print("gcd(48, 36):")
+  print(gcd(48, 36))
+
+  print("=== qualified calls also work ===")
+  print(math.max(5, 9))
+  print(math.min(5, 9))
+
+  print("=== strings module ===")
+  print("upper:")
+  print(upper("hello nova"))
+  print("split:")
+  parts = split("a,b,c,d", ",")
+  print(parts)
+  print("join:")
+  print(join(parts, " - "))
+
+  print("=== arrays module ===")
+  nums = [5, 2, 8, 1, 9, 3]
+  print("sorted:")
+  print(sort(nums))
+  print("reversed:")
+  print(reverse(nums))
+  print("sum:")
+  print(sum(nums))
+}
