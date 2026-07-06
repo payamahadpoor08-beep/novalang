@@ -75,6 +75,7 @@ enum Op {
     LocalsBinJf(u16, u16, BinOp, usize), // if !(locals[a] <op> locals[b]) jump
     BinLL(u16, u16, BinOp),              // push(locals[a] <op> locals[b])
     BinLC(u16, u32, BinOp),              // push(locals[a] <op> consts[k])
+    FieldLocal(u16, u32),                // push(locals[s].field) — LoadLocal;GetField
 }
 
 // Everything `Op::Try` needs at runtime. The body/catch/finally code ranges live
@@ -1296,6 +1297,15 @@ fn fuse(code: Vec<Op>) -> Vec<Op> {
                 continue;
             }
         }
+        // 2-op fusion: LoadLocal s; GetField n -> FieldLocal (`self.x`, `p.next`)
+        if i + 1 < n && !targets.contains(&(i + 1)) {
+            if let (Op::LoadLocal(s), Op::GetField(k)) = (&out[i], &out[i + 1]) {
+                out[i] = Op::FieldLocal(*s, *k);
+                out[i + 1] = Op::Nop;
+                i += 2;
+                continue;
+            }
+        }
         i += 1;
     }
     compact(out)
@@ -1402,6 +1412,7 @@ fn fmt_op(op: &Op, ch: &Chunk, c: &Compiled) -> String {
         Op::MakeRange(inc) => format!("MakeRange inclusive={}", inc),
         Op::Slice(lo, hi, inc) => format!("Slice lo={} hi={} inclusive={}", lo, hi, inc),
         Op::GetField(n) => format!("GetField .{}", c.names[*n as usize]),
+        Op::FieldLocal(s, n) => format!("FieldLocal {}.{}", s, c.names[*n as usize]),
         Op::SafeField(n) => format!("SafeField ?.{}", c.names[*n as usize]),
         Op::SetField(n) => format!("SetField .{}", c.names[*n as usize]),
         Op::MakeStruct(n, fs) => {
@@ -1432,7 +1443,7 @@ pub fn verify(c: &Compiled) -> Result<(), String> {
             }
             let slot = match op {
                 Op::LoadLocal(s) | Op::StoreLocal(s) | Op::IncLocal(s, _, _)
-                | Op::BinLC(s, _, _) => Some(*s as usize),
+                | Op::BinLC(s, _, _) | Op::FieldLocal(s, _) => Some(*s as usize),
                 Op::IterStep(it, idx, var, _) => Some((*it).max(*idx).max(*var) as usize),
                 Op::LocalsBinJf(a, b, _, _) | Op::BinLL(a, b, _) => Some((*a).max(*b) as usize),
                 _ => None,
@@ -1642,6 +1653,11 @@ impl<'a> Vm<'a> {
                 Op::GetField(n) => {
                     let base = stack.pop().unwrap();
                     stack.push(field_get(&base, &self.c.names[*n as usize])?);
+                }
+                Op::FieldLocal(s, n) => {
+                    // fused LoadLocal;GetField — the hot `self.x` / `node.next` path,
+                    // reads a field straight off a local with no stack round-trip.
+                    stack.push(field_get(&locals[*s as usize], &self.c.names[*n as usize])?);
                 }
                 Op::SafeField(n) => {
                     let base = stack.pop().unwrap();

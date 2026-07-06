@@ -1,0 +1,23 @@
+// Struct field access in a hot loop — exercises the FieldLocal superinstruction
+// (fused LoadLocal;GetField). Must stay byte-identical across run/vm/jit tiers.
+struct P { x: Int, y: Int, z: Int }
+struct Node { val: Int, tag: Str }
+
+fn sum_fields(p, n) {
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + p.x + p.y + p.z + p.x * p.y - p.z
+    i = i + 1
+  }
+  acc
+}
+
+fn main() {
+  let p = P { x: 3, y: 5, z: 7 }
+  print(sum_fields(p, 1000))          // 23000
+  let node = Node { val: 42, tag: "root" }
+  print(node.val)                     // 42
+  print(node.tag)                     // root
+  print(node.tag + "/" + str(node.val))  // root/42
+}
