@@ -1,4 +1,4 @@
-# Nova — feature reality audit (v3.30)
+# Nova — feature reality audit (v3.31)
 
 An honest, source-verified answer to "which grammar features are actually
 implemented, and which only parse?" Status is derived from the code, not the
@@ -96,7 +96,8 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **ARM64 target** (`nova build --aot=arm`) — ARMv8/aarch64, typed + boxed | Run ✅ — cross-compiles the portable AOT C (incl. `nova_rt.c`) to a static aarch64 binary via `aarch64-linux-gnu-gcc`, byte-identical under `qemu-aarch64`. Modern phones / Raspberry Pi. |
 | **ARM32 target** (`nova build --aot=arm32`) — ARMv7/armhf, typed + boxed | Run ✅ — static 32-bit ARM binary via `arm-linux-gnueabihf-gcc -marm`, byte-identical under `qemu-arm`. Older / weaker phones. Both arches gated by `tests/arm_smoke.sh`. |
 | **self-hosting, stage 1: the Nova lexer in Nova** (`selfhost/lexer.nova` + `nova tokens` reference) | Run ✅ — byte-identical token dumps vs the Rust reference on all 95 files (including lexing itself), 4-tier identical; `tests/selfhost_smoke.sh`, `docs/SELFHOST.md`. |
-| **self-hosting, stage 2: the Nova parser in Nova** (`selfhost/parser.nova` + `nova ast` reference) | Run ✅ — a complete recursive-descent + Pratt parser mirroring `nova.pest` **and** the `parser.rs` lowering (all desugarings: cast/pipeline/`??`/compound-assign/stream/macro-expansion-with-hygiene/implicit-return/…); canonical S-expression AST byte-identical to `nova ast` on all 95 files, **including parsing itself and the lexer**, 4-tier identical. Stages 3–5 (checker/eval/fixpoint) honestly *not* claimed yet. |
+| **self-hosting, stage 2: the Nova parser in Nova** (`selfhost/parser.nova` + `nova ast` reference) | Run ✅ — a complete recursive-descent + Pratt parser mirroring `nova.pest` **and** the `parser.rs` lowering (all desugarings: cast/pipeline/`??`/compound-assign/stream/macro-expansion-with-hygiene/implicit-return/…); canonical S-expression AST byte-identical to `nova ast` on all 96 files, **including parsing itself and the lexer**, 4-tier identical. |
+| **self-hosting, stage 3: the Nova checker in Nova** (`selfhost/checker.nova` + `nova check` reference) | Run ✅ — name resolution (undefined-variable) + unused-local warnings with position-accurate `diag.rs` caret frames; byte-identical to `nova check` on all 96 files, **including checking itself**, 4-tier identical (`tests/selfhost_smoke.sh`, `docs/SELFHOST.md`). Only the checks that fire on the corpus are ported; full type inference is future. Stages 4–5 (eval/fixpoint) honestly *not* claimed yet. |
 
 ## Remaining AOT notes
 1. **(resolved) AOT native for mixed int/float kernels.** fib, sieve AND mandel
