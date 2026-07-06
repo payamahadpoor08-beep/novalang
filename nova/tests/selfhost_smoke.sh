@@ -1,34 +1,48 @@
 #!/usr/bin/env bash
-# Self-hosting stage-1 gate: the Nova lexer written in Nova (selfhost/lexer.nova)
-# must produce a token dump BYTE-IDENTICAL to the Rust reference (`nova tokens`)
-# for every corpus, std, and example file — including lexing itself. The lexer
-# is a Nova program, so the 4-tier discipline applies to it too: interp, vm,
-# vm --no-jit, and vm --jit outputs must all agree.
+# Self-hosting gate — the Nova compiler front-end written in Nova, byte-verified
+# against the Rust reference over EVERY real file (tests/corpus + std + examples
+# + the selfhost sources themselves). No curated subset.
+#   stage 1  lexer   selfhost/lexer.nova   vs  `nova tokens`
+#   stage 2  parser  selfhost/parser.nova  vs  `nova ast`
+# Each Nova front-end is itself a Nova program, so the 4-tier discipline
+# (interp / vm / vm --no-jit / vm --jit) applies to it too.
 set -u
 BIN="$(cd "$(dirname "$0")/.." && pwd)/${1:-target/release/nova}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
 
-pass=0; fail=0
-for f in tests/corpus/*.nova std/*.nova examples/*.nova selfhost/lexer.nova; do
-  "$BIN" tokens "$f" > "$t/rust.txt" 2>/dev/null
-  "$BIN" run selfhost/lexer.nova "$f" > "$t/nova.txt" 2>/dev/null
-  if cmp -s "$t/rust.txt" "$t/nova.txt"; then pass=$((pass+1))
-  else fail=$((fail+1)); echo "  DIFF (rust vs nova lexer): $f"; fi
-done
-echo "selfhost lexer vs rust reference: $pass identical, $fail diffs"
+FILES=$(ls tests/corpus/*.nova std/*.nova examples/*.nova selfhost/*.nova)
+total=$(echo "$FILES" | wc -w | tr -d ' ')
+fail=0
 
-# 4-tier discipline on the lexer itself (one representative input)
-f=std/list.nova
-"$BIN" run          selfhost/lexer.nova "$f" > "$t/a.txt" 2>&1
-"$BIN" vm           selfhost/lexer.nova "$f" > "$t/b.txt" 2>&1
-"$BIN" vm --no-jit  selfhost/lexer.nova "$f" > "$t/c.txt" 2>&1
-"$BIN" vm --jit     selfhost/lexer.nova "$f" > "$t/d.txt" 2>&1
-if cmp -s "$t/a.txt" "$t/b.txt" && cmp -s "$t/a.txt" "$t/c.txt" && cmp -s "$t/a.txt" "$t/d.txt"; then
-  echo "selfhost lexer 4-tier: identical"
-else
-  echo "selfhost lexer 4-tier: DIVERGED"; fail=$((fail+1))
-fi
+# --- stage 1: lexer ---------------------------------------------------------
+lp=0
+for f in $FILES; do
+  if cmp -s <("$BIN" tokens "$f" 2>/dev/null) <("$BIN" run selfhost/lexer.nova "$f" 2>/dev/null); then lp=$((lp+1))
+  else echo "  lexer DIFF: $f"; fail=$((fail+1)); fi
+done
+echo "self-host lexer:  $lp/$total byte-identical vs \`nova tokens\`"
+
+# --- stage 2: parser --------------------------------------------------------
+pp=0
+for f in $FILES; do
+  if cmp -s <("$BIN" ast "$f" 2>/dev/null) <("$BIN" run selfhost/parser.nova "$f" 2>/dev/null); then pp=$((pp+1))
+  else echo "  parser DIFF: $f"; fail=$((fail+1)); fi
+done
+echo "self-host parser: $pp/$total byte-identical vs \`nova ast\`"
+
+# --- 4-tier discipline on the Nova front-ends themselves ---------------------
+for prog in selfhost/lexer.nova selfhost/parser.nova; do
+  case "$prog" in *lexer*) sub="tokens";; *) sub="ast";; esac
+  f=std/list.nova
+  "$BIN" run         "$prog" "$f" > "$t/a" 2>&1
+  "$BIN" vm          "$prog" "$f" > "$t/b" 2>&1
+  "$BIN" vm --no-jit "$prog" "$f" > "$t/c" 2>&1
+  "$BIN" vm --jit    "$prog" "$f" > "$t/d" 2>&1
+  if cmp -s "$t/a" "$t/b" && cmp -s "$t/a" "$t/c" && cmp -s "$t/a" "$t/d"; then
+    echo "$(basename "$prog") 4-tier: identical"
+  else echo "$(basename "$prog") 4-tier: DIVERGED"; fail=$((fail+1)); fi
+done
 
 [ "$fail" -eq 0 ] || exit 1
