@@ -465,7 +465,8 @@ attr_args = { attr_arg ~ ("," ~ attr_arg)* ~ ","? }
 attr_arg  = { ident ~ "=" ~ literal | attr_item }
 
 compiler_attr = {
-      "compiler"     ~ "(" ~ "mode" ~ ":" ~ ("daemon" | "batch") ~ ("," ~ "cache" ~ ":" ~ bool_lit)? ~ ")"
+      "demon"        ~ ("(" ~ demon_args ~ ")")?
+    | "compiler"     ~ "(" ~ "mode" ~ ":" ~ ("daemon" | "batch") ~ ("," ~ "cache" ~ ":" ~ bool_lit)? ~ ")"
     | "predict"      ~ "(" ~ "level" ~ ":" ~ ("aggressive" | "conservative" | "off") ~ ")"
     | "incremental"  ~ "(" ~ "depth" ~ ":" ~ ("infinite" | "function" | "module" | "crate") ~ ")"
     | "hot_reload"   ~ "(" ~ "instant" ~ ":" ~ bool_lit ~ ("," ~ "scope" ~ ":" ~ ("function" | "module"))? ~ ")"
@@ -512,6 +513,13 @@ compiler_attr = {
     | "inline_cache" | "memo" | "obfuscate" | "pin" | "prelude" | "simd"
     | "tail_call" | "trace" | "unsafe" | "zero_alloc"
 }
+
+// #[demon(...)] — the background/daemon compiler config: watch dirs, cache,
+// hot_reload, incremental, diagnostics, optimize level, mode (daemon|batch).
+demon_args  = { demon_arg ~ ("," ~ demon_arg)* ~ ","? }
+demon_arg   = { ident ~ ":" ~ demon_val }
+demon_val   = { string_lit | bool_lit | int_lit | demon_array }
+demon_array = { "[" ~ (string_lit ~ ("," ~ string_lit)*)? ~ ","? ~ "]" }
 
 migrate_attr_args = {
       "strategy" ~ ":" ~ ident

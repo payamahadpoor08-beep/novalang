@@ -114,6 +114,40 @@ a top-level item are left untouched, so behaviour is **byte-identical**
 marked `#[obfuscate]`, every user function is obfuscated. This is identifier
 stripping — real, defensible source obfuscation — **not** encryption.
 
+### `#[demon(...)]` + `nova demon <file>` — the Demon (background) Compiler
+A **daemon compiler** that continuously watches the Nova sources and, on every
+change, reruns the incremental pipeline: reparse only what changed (per-function
+FNV-1a content hashing → an **intelligent AST cache**, so unchanged functions are
+reused), rerun the **type checker** for **live diagnostics**, and **hot-reload**
+the program (rerun `main` in the same process — no restart). Configured by the
+attribute or run with defaults:
+
+```nova
+#[demon(
+    mode: "daemon",        // "daemon" (watch-loop) | "batch" (one pass, for CI)
+    watch: ["src/"],       // directories watched for .nova changes (default: file dir)
+    cache: true,           // intelligent per-function cache
+    hot_reload: true,      // rerun without restarting the process
+    incremental: true,     // reparse/report only changed functions
+    diagnostics: true,     // stream checker errors/warnings live
+    optimize: "speed"      // "speed" | "size" | "aggressive"
+)]
+fn main() { ... }
+```
+
+```
+nova demon src/main.nova     # start the background compiler
+```
+
+Each cycle prints which functions recompiled vs were reused, the live
+diagnostics (`✓ no errors` / `✗ N error(s)` with `diag.rs` caret frames), and the
+hot-reloaded run. `mode: "batch"` does a single pass and exits (CI/build);
+`mode: "daemon"` (default) loops until interrupted. File watching is portable
+mtime polling (no external dependency). Proven by `tests/demon_smoke.sh`
+(byte-checked batch pass, error diagnostics, and a daemon-mode incremental
+reload that recompiles only the mutated function). Integrates with the LSP for
+in-editor diagnostics.
+
 ### Introspection — `attrs_of("name")`
 Returns the array of every attribute name on a function. Because **all** attributes
 are captured (not just the behavioural ones), even attributes whose full behaviour

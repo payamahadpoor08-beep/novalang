@@ -55,11 +55,12 @@ jobs:
             [ "$a" = "$b" ] || { echo "fmt not idempotent: $f"; exit 1; }
           done
 
-      - name: Tooling smoke tests (LSP, package registry)
+      - name: Tooling smoke tests (LSP, package registry, demon compiler)
         run: |
           bash tests/lsp_smoke.sh
           bash tests/pkg_smoke.sh
           bash tests/registry_smoke.sh
+          bash tests/demon_smoke.sh
 
       - name: Self-hosting gate (Nova lexer in Nova, byte-identical vs Rust)
         run: bash tests/selfhost_smoke.sh

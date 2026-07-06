@@ -88,6 +88,7 @@ These build AST nodes but currently do nothing at runtime — the honest truth:
 | **daemon mode** (`nova daemon`) — persistent service, `load`/`reload`/`run`/`funcs`/`stats` | Run ✅ |
 | **incremental compilation** — `reload` re-parses and reuses unchanged functions, reporting exactly what changed | Run ✅ |
 | **hot reload** — `run` after `reload` executes new code without restarting the daemon | Run ✅ |
+| **demon compiler** (`nova demon <file>` + `#[demon(mode/watch/cache/hot_reload/incremental/diagnostics/optimize)]`) — background daemon that file-watches (portable mtime poll), incrementally reparses only changed functions (intelligent per-function cache), streams live checker diagnostics, and hot-reloads `main` in-process | Run ✅ — `tests/demon_smoke.sh` |
 | predictive compilation — the tiered JIT warms a hot function's whole callee closure ahead of need | Run (heuristic) |
 | **state migration** (`migrate from Old to New { ... }` + `migrate(value)`) | Run ✅ — see `docs/MIGRATION.md` |
 | **LSP** (`nova lsp`) — full IDE server: diagnostics, hover, completion, signatureHelp, goto-definition, references, documentHighlight, document/workspace symbols, rename, formatting, semanticTokens, foldingRange | Run ✅ — 11-capability suite in `tests/lsp_smoke.sh` |
