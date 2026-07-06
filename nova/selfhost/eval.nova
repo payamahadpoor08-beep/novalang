@@ -1,0 +1,2821 @@
+//! The Nova parser, written in Nova — self-hosting stage 2.
+//!
+//! A complete recursive-descent + Pratt parser that mirrors src/nova.pest and
+//! the src/parser.rs lowering, emitting the canonical S-expression AST
+//! byte-identical to the Rust reference `nova ast` (src/astdump.rs) for every
+//! real file (tests/corpus + std + examples). Gated by tests/selfhost_smoke.sh.
+//!
+//! usage: nova run selfhost/parser.nova <file.nova>
+
+// ===== character classes ====================================================
+fn is_ident_start(c) { if c == "" { return false } let o = ord(c); return o >= 65 && o <= 90 || o >= 97 && o <= 122 || c == "_" }
+fn is_ident_cont(c) { if c == "" { return false } let o = ord(c); return o >= 65 && o <= 90 || o >= 97 && o <= 122 || o >= 48 && o <= 57 || c == "_" }
+fn is_digit(c) { if c == "" { return false } let o = ord(c); return o >= 48 && o <= 57 }
+fn is_hex(c) { if c == "" { return false } let o = ord(c); return o >= 48 && o <= 57 || o >= 97 && o <= 102 || o >= 65 && o <= 70 }
+
+#[comptime]
+fn keywords() {
+    #{ "fn":1,"let":1,"mut":1,"if":1,"else":1,"for":1,"while":1,"loop":1,"break":1,
+       "continue":1,"return":1,"struct":1,"enum":1,"trait":1,"impl":1,"use":1,"mod":1,
+       "match":1,"as":1,"pub":1,"self":1,"super":1,"crate":1,"spawn":1,"select":1,
+       "await":1,"true":1,"false":1,"null":1 }
+}
+#[comptime]
+fn punct3() { ["...", "<<=", ">>=", "..=", "===", "!==", "<=>", "??=", "->>"] }
+#[comptime]
+fn punct2() {
+    ["<<", ">>", "=>", "==", "!=", ">=", "<=", "&&", "||", "**", "??", "..",
+     "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<-", "|>"]
+}
+#[comptime]
+fn modules() { #{ "math":1, "strings":1, "arrays":1, "collections":1, "io":1, "std":1 } }
+
+// ===== tokenizer: src -> [kinds, texts] =====================================
+fn tokenize(src) {
+    let mut cs = []
+    for ch in src { push(cs, ch) }
+    let n = len(cs)
+    let kws = keywords()
+    let p3s = punct3()
+    let p2s = punct2()
+    let mut kinds = []
+    let mut texts = []
+    let mut i = 0
+    while i < n {
+        let c = cs[i]
+        if c == " " || c == "\t" || c == "\r" || c == "\n" { i = i + 1; continue }
+        let c1 = if i + 1 < n { cs[i + 1] } else { "" }
+        if c == "/" && c1 == "/" { while i < n && cs[i] != "\n" { i = i + 1 } continue }
+        if c == "/" && c1 == "*" {
+            let mut depth = 1
+            i = i + 2
+            while i < n && depth > 0 {
+                let d0 = cs[i]
+                let d1 = if i + 1 < n { cs[i + 1] } else { "" }
+                if d0 == "/" && d1 == "*" { depth = depth + 1; i = i + 2 }
+                else if d0 == "*" && d1 == "/" { depth = depth - 1; i = i + 2 }
+                else { i = i + 1 }
+            }
+            continue
+        }
+        if is_ident_start(c) {
+            let start = i
+            while i < n && is_ident_cont(cs[i]) { i = i + 1 }
+            let word = substring(src, start, i)
+            let nx = if i < n { cs[i] } else { "" }
+            if word == "f" && nx == "\"" {
+                i = i + 1
+                let mut depth = 0
+                let mut inner = false
+                while i < n {
+                    let ch = cs[i]
+                    let ah = if i + 1 < n { cs[i + 1] } else { "" }
+                    if inner { if ch == "\\" { i = i + 2; continue } if ch == "\"" { inner = false } i = i + 1; continue }
+                    if ch == "\\" { i = i + 2; continue }
+                    if ch == "{" { if ah == "{" { i = i + 2; continue } depth = depth + 1; i = i + 1; continue }
+                    if ch == "}" { if depth == 0 && ah == "}" { i = i + 2; continue } if depth > 0 { depth = depth - 1 } i = i + 1; continue }
+                    if ch == "\"" { if depth == 0 { i = i + 1; break } inner = true; i = i + 1; continue }
+                    i = i + 1
+                }
+                push(kinds, "fstr"); push(texts, substring(src, start, i)); continue
+            }
+            if (word == "json" || word == "sql" || word == "re") && nx == "\"" {
+                i = i + 1
+                while i < n && cs[i] != "\"" { if cs[i] == "\\" { i = i + 1 } i = i + 1 }
+                i = i + 1
+                let stop = if i < n { i } else { n }
+                push(kinds, "tag"); push(texts, substring(src, start, stop)); continue
+            }
+            if word == "r" && (nx == "\"" || nx == "#") {
+                let mut hashes = 0
+                let mut j = i
+                while j < n && cs[j] == "#" { hashes = hashes + 1; j = j + 1 }
+                let jq = if j < n { cs[j] } else { "" }
+                if jq == "\"" {
+                    j = j + 1
+                    let mut done = false
+                    while j < n && !done {
+                        if cs[j] == "\"" {
+                            let mut k = 0
+                            while k < hashes && j + 1 + k < n && cs[j + 1 + k] == "#" { k = k + 1 }
+                            if k == hashes { j = j + 1 + hashes; done = true; continue }
+                        }
+                        j = j + 1
+                    }
+                    let stop = if j < n { j } else { n }
+                    push(kinds, "raw"); push(texts, substring(src, start, stop)); i = j; continue
+                }
+            }
+            if map_has(kws, word) { push(kinds, "kw") } else { push(kinds, "ident") }
+            push(texts, word); continue
+        }
+        if is_digit(c) {
+            let start = i
+            if c == "0" && (c1 == "x" || c1 == "b" || c1 == "o") {
+                let base = c1
+                i = i + 2
+                while i < n {
+                    let d = cs[i]
+                    let mut ok = false
+                    if base == "x" { ok = is_hex(d) || d == "_" }
+                    else if base == "b" { ok = d == "0" || d == "1" || d == "_" }
+                    else { if d == "" { ok = false } else { let o = ord(d); ok = o >= 48 && o <= 55 || d == "_" } }
+                    if !ok { break }
+                    i = i + 1
+                }
+                i = eat_int_suffix(src, cs, n, i)
+                push(kinds, "int"); push(texts, substring(src, start, i)); continue
+            }
+            while i < n && (is_digit(cs[i]) || cs[i] == "_") { i = i + 1 }
+            let mut is_float = false
+            let dot = if i < n { cs[i] } else { "" }
+            let after_dot = if i + 1 < n { cs[i + 1] } else { "" }
+            if dot == "." && is_digit(after_dot) {
+                is_float = true; i = i + 1
+                while i < n && (is_digit(cs[i]) || cs[i] == "_") { i = i + 1 }
+            }
+            let e = if i < n { cs[i] } else { "" }
+            if e == "e" || e == "E" {
+                let mut j = i + 1
+                let sgn = if j < n { cs[j] } else { "" }
+                if sgn == "+" || sgn == "-" { j = j + 1 }
+                let dj = if j < n { cs[j] } else { "" }
+                if is_digit(dj) { is_float = true; i = j; while i < n && is_digit(cs[i]) { i = i + 1 } }
+            }
+            if is_float {
+                let f = if i < n { cs[i] } else { "" }
+                if f == "f" && (substring(src, i + 1, i + 3) == "32" || substring(src, i + 1, i + 3) == "64") { i = i + 3 }
+                push(kinds, "float"); push(texts, substring(src, start, i))
+            } else {
+                i = eat_int_suffix(src, cs, n, i)
+                push(kinds, "int"); push(texts, substring(src, start, i))
+            }
+            continue
+        }
+        if c == "\"" {
+            let start = i; i = i + 1
+            while i < n && cs[i] != "\"" { if cs[i] == "\\" { i = i + 1 } i = i + 1 }
+            i = i + 1
+            let stop = if i < n { i } else { n }
+            push(kinds, "str"); push(texts, substring(src, start, stop)); continue
+        }
+        if c == "'" {
+            let c2 = if i + 2 < n { cs[i + 2] } else { "" }
+            if c1 == "\\" {
+                let start = i; i = i + 2
+                let u0 = if i < n { cs[i] } else { "" }
+                let u1 = if i + 1 < n { cs[i + 1] } else { "" }
+                if u0 == "u" && u1 == "{" { while i < n && cs[i] != "}" { i = i + 1 } i = i + 1 } else { i = i + 1 }
+                let q = if i < n { cs[i] } else { "" }
+                if q == "'" { i = i + 1 }
+                let stop = if i < n { i } else { n }
+                push(kinds, "char"); push(texts, substring(src, start, stop)); continue
+            }
+            if c2 == "'" && c1 != "'" { push(kinds, "char"); push(texts, substring(src, i, i + 3)); i = i + 3; continue }
+            if is_ident_start(c1) {
+                let start = i; i = i + 2
+                while i < n && is_ident_cont(cs[i]) { i = i + 1 }
+                push(kinds, "life"); push(texts, substring(src, start, i)); continue
+            }
+            push(kinds, "punct"); push(texts, "'"); i = i + 1; continue
+        }
+        // #{ and #( are their own primaries; keep '#' as a punct otherwise
+        if i + 3 <= n { let p3 = substring(src, i, i + 3); if contains_elem(p3s, p3) { push(kinds, "punct"); push(texts, p3); i = i + 3; continue } }
+        if i + 2 <= n { let p2 = substring(src, i, i + 2); if contains_elem(p2s, p2) { push(kinds, "punct"); push(texts, p2); i = i + 2; continue } }
+        push(kinds, "punct"); push(texts, c); i = i + 1
+    }
+    push(kinds, "eof"); push(texts, "")
+    return [kinds, texts]
+}
+fn eat_int_suffix(src, cs, n, i) {
+    let c = if i < n { cs[i] } else { "" }
+    if c == "i" || c == "u" {
+        let rest = substring(src, i + 1, i + 5)
+        if starts_with(rest, "128") { return i + 4 }
+        if starts_with(rest, "64") { return i + 3 }
+        if starts_with(rest, "32") { return i + 3 }
+        if starts_with(rest, "16") { return i + 3 }
+        if starts_with(rest, "8") { return i + 2 }
+        if starts_with(rest, "size") { return i + 5 }
+    }
+    return i
+}
+
+// ===== cursor ===============================================================
+fn pk(st, pc) { let ks = st[0]; return ks[pc[0]] }
+fn ptext(st, pc) { let ts = st[1]; return ts[pc[0]] }
+fn pk2(st, pc) { let ks = st[0]; let j = pc[0] + 1; if j < len(ks) { return ks[j] } return "eof" }
+fn ptext2(st, pc) { let ts = st[1]; let j = pc[0] + 1; if j < len(ts) { return ts[j] } return "" }
+fn adv(st, pc) { pc[0] = pc[0] + 1 }
+fn is_p(st, pc, s) { return pk(st, pc) == "punct" && ptext(st, pc) == s }
+fn is_kw(st, pc, s) { return pk(st, pc) == "kw" && ptext(st, pc) == s }
+// soft keywords (in, where, type, const, ...) lex as idents, not kw
+fn word_is(st, pc, s) { let k = pk(st, pc); return (k == "kw" || k == "ident") && ptext(st, pc) == s }
+fn expect_p(st, pc, s) { if is_p(st, pc, s) { adv(st, pc) } }
+
+// ===== int literal -> decimal string ========================================
+fn strip_int_suffix(s) {
+    let ix = find_suffix_cut(s)
+    if ix >= 0 { return substring(s, 0, ix) }
+    return s
+}
+fn is_big(dc) {
+    let n = len(dc)
+    if n > 19 { return true }
+    if n < 19 { return false }
+    return dc > "9223372036854775807"
+}
+fn parse_int_value(t) {
+    let mut body = t
+    let ix = find_suffix_cut(t)
+    if ix >= 0 { body = substring(t, 0, ix) }
+    if starts_with(body, "0x") { return str(from_base(substring(body, 2, len(body)), 16)) }
+    if starts_with(body, "0b") { return str(from_base(substring(body, 2, len(body)), 2)) }
+    if starts_with(body, "0o") { return str(from_base(substring(body, 2, len(body)), 8)) }
+    return str(from_base(body, 10))
+}
+fn find_suffix_cut(t) {
+    let n = len(t); let mut i = 0
+    while i < n { let c = substring(t, i, i + 1); if (c == "i" || c == "u") && i > 0 { return i } i = i + 1 }
+    return -1
+}
+fn from_base(s, base) {
+    let n = len(s); let mut acc = 0; let mut i = 0
+    while i < n { let c = substring(s, i, i + 1); if c == "_" { i = i + 1; continue } acc = acc * base + hex_digit(c); i = i + 1 }
+    return acc
+}
+fn hex_digit(c) {
+    let o = ord(c)
+    if o >= 48 && o <= 57 { return o - 48 }
+    if o >= 97 && o <= 102 { return o - 87 }
+    if o >= 65 && o <= 70 { return o - 55 }
+    return 0
+}
+
+// ===== S-expr split: "(head a b c)" -> [head, [args]] =======================
+fn head_and_args(s) {
+    let inner = substring(s, 1, len(s) - 1)
+    let n = len(inner)
+    let mut parts = []
+    let mut buf = ""
+    let mut depth = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut i = 0
+    while i < n {
+        let c = substring(inner, i, i + 1)
+        if in_str { buf = buf + c; if esc { esc = false } else if c == "\\" { esc = true } else if c == "\"" { in_str = false } }
+        else if c == "\"" { in_str = true; buf = buf + c }
+        else if c == "(" { depth = depth + 1; buf = buf + c }
+        else if c == ")" { depth = depth - 1; buf = buf + c }
+        else if c == " " && depth == 0 { push(parts, buf); buf = "" }
+        else { buf = buf + c }
+        i = i + 1
+    }
+    if buf != "" { push(parts, buf) }
+    let head = parts[0]
+    let mut rest = []
+    let mut j = 1
+    while j < len(parts) { push(rest, parts[j]); j = j + 1 }
+    return [head, rest]
+}
+
+// ===== type consumption + head ==============================================
+// Consume a full type_expr, returning its normalized head (type_head in parser.rs:
+// `[X]` -> "[" + head(X) + "]"; else first alphanumeric word, skipping punctuation).
+fn parse_type_head(st, pc) {
+    if is_p(st, pc, "[") {
+        adv(st, pc)
+        let inner = parse_type_head(st, pc)
+        // skip the rest up to the matching ']'
+        let mut depth = 1
+        while depth > 0 && pk(st, pc) != "eof" {
+            if is_p(st, pc, "[") { depth = depth + 1 }
+            else if is_p(st, pc, "]") { depth = depth - 1 }
+            adv(st, pc)
+        }
+        return "[" + inner + "]"
+    }
+    // head = first ident/kw word (skip leading '&', lifetimes, etc.)
+    let mut head = ""
+    while pk(st, pc) != "eof" {
+        let k = pk(st, pc)
+        if k == "ident" || k == "kw" { head = ptext(st, pc); break }
+        if is_type_end(st, pc) { break }
+        adv(st, pc)
+    }
+    // consume the remainder of the type expression up to a top-level terminator
+    skip_type_rest(st, pc)
+    return head
+}
+fn is_type_end(st, pc) {
+    if pk(st, pc) != "punct" { return false }
+    let t = ptext(st, pc)
+    return t == "," || t == ")" || t == "]" || t == "}" || t == ";" || t == "=" || t == "{"
+}
+fn skip_type_rest(st, pc) {
+    let mut depth = 0
+    let mut go = true
+    while go && pk(st, pc) != "eof" {
+        if is_p(st, pc, "[") || is_p(st, pc, "(") { depth = depth + 1; adv(st, pc) }
+        else if is_p(st, pc, "]") || is_p(st, pc, ")") {
+            if depth == 0 { go = false } else { depth = depth - 1; adv(st, pc) }
+        }
+        else if depth == 0 && (is_p(st, pc, "{") || is_p(st, pc, "}") || is_p(st, pc, ",") || is_p(st, pc, ";") || is_p(st, pc, "=") || is_p(st, pc, ":") || is_p(st, pc, "!") || word_is(st, pc, "where") || is_kw(st, pc, "if") || is_kw(st, pc, "for")) { go = false }
+        else { adv(st, pc) }
+    }
+}
+
+// ===== program / items ======================================================
+// ===== self-hosting stage 4: the evaluator ===================================
+// Tree-walks the canonical AST (reusing the stage-2 parser). Program values are
+// native Nova values (int/float/str/bool/null/array/map) so arithmetic and
+// collection ops delegate to Nova's runtime; structs/enums/closures are tagged
+// arrays with a custom display that mirrors interp.rs. Output byte-identical to
+// `nova run` on deterministic programs.
+fn main() {
+    let argv = args()
+    if len(argv) < 1 { eprint("usage: nova run selfhost/eval.nova <file.nova>"); return }
+    let path = argv[0]
+    let src = read_file(path)
+    let mut visited = []
+    let items = load_items(path, src, visited)
+    // globals: fns, consts, structs (field order), enum variant arities, methods
+    let fns = #{}
+    let consts = #{}
+    let structs = #{}
+    let enums = #{}
+    let methods = #{}
+    let refines = #{}
+    let gens = #{}
+    let migrations = #{}
+    let mut pending = []
+    let machines = #{}
+    let astate = #{}
+    let G = [fns, consts, structs, enums, methods, refines, gens, migrations, pending, machines, astate]
+    let mut trees = []
+    let mut i = 0
+    while i < len(items) {
+        let t = sexp_parse(items[i])
+        push(trees, t)
+        register(t, G)
+        i = i + 1
+    }
+    // evaluate consts (in order) into a base env, then run main / top-level
+    let genv = #{}
+    i = 0
+    while i < len(trees) {
+        let t = trees[i]
+        if type_of(t) == "array" && len(t) > 0 && t[0] == "const" { map_set(consts, t[1], eval(t[2], genv, G)) }
+        i = i + 1
+    }
+    if map_has(fns, "main") { call_fn("main", [], G); drain_pending(G) }
+    else { eprint("runtime error: no `main` function found") }
+}
+
+fn register(t, G) {
+    if type_of(t) != "array" || len(t) == 0 { return }
+    let h = t[0]
+    if h == "fn" { map_set(G[0], t[3], [params_of(t[5]), t[9], fn_attrs(t[1])]); if has_yield(t[9]) { map_set(G[6], t[3], true) } }
+    else if h == "struct" { let fs = t[2]; let mut names = []; let mut i = 0; while i < len(fs) { push(names, fs[i]); i = i + 1 } map_set(G[2], t[1], names) }
+    else if h == "enum" { let vs = t[2]; let mut i = 0; while i < len(vs) { let pair = split(vs[i], "/"); map_set(G[3], pair[0], int(pair[1])); i = i + 1 } }
+    else if h == "impl" { let ty = t[1]; let ms = t[3]; let mut i = 0; while i < len(ms) { let m = ms[i]; map_set(G[4], ty + "." + m[3], [params_of(m[5]), m[9]]); i = i + 1 } }
+    else if h == "trait" { let defs = t[3]; let mut i = 1; while i < len(defs) { let m = defs[i]; map_set(G[4], "__trait__." + m[3], [params_of(m[5]), m[9]]); i = i + 1 } }
+    else if h == "type" { if len(t) > 3 && t[3] != "-" { map_set(G[5], t[1], t[3]) } }
+    else if h == "migrate" { map_set(G[7], t[1], t[3]) }
+    else if h == "machine" { map_set(G[9], t[1], [t[2], t[3]]) }
+}
+fn params_of(pnode) { let mut out = []; let mut i = 1; while i < len(pnode) { push(out, pnode[i][0]); i = i + 1 } return out }
+fn fn_attrs(anode) { let mut out = []; if type_of(anode) != "array" { return out } let mut i = 1; while i < len(anode) { push(out, sexp_unquote(anode[i])); i = i + 1 } return out }
+// name part of an attr string like "requires(x >= 0)" -> "requires"; "memo" -> "memo"
+fn attr_name(a) { let mut i = 0; while i < len(a) { if substring(a, i, i + 1) == "(" { return substring(a, 0, i) } i = i + 1 } return a }
+fn attr_arg(a) { let mut i = 0; while i < len(a) { if substring(a, i, i + 1) == "(" { return substring(a, i + 1, len(a) - 1) } i = i + 1 } return "" }
+fn fn_has_attr(attrs, nm) { let mut i = 0; while i < len(attrs) { if attr_name(attrs[i]) == nm { return true } i = i + 1 } return false }
+fn fn_get_attr(attrs, nm) { let mut i = 0; while i < len(attrs) { if attr_name(attrs[i]) == nm { return attrs[i] } i = i + 1 } return "" }
+
+// ---- import inlining (same as the checker) --------------------------------
+fn load_items(path, src, visited) {
+    if contains_elem(visited, path) { return [] }
+    push(visited, path)
+    let st = tokenize(src)
+    push(st, #{})
+    let pc = [0]
+    let mut out = []
+    while pk(st, pc) != "eof" {
+        let it = parse_top(st, pc)
+        if it == "" { continue }
+        if starts_with(it, "(import ") {
+            let rel = sexp_unquote(sexp_parse(it)[1])
+            let ip = resolve_path(path, rel)
+            if ip != "" { let sub = load_items(ip, read_file(ip), visited); let mut k = 0; while k < len(sub) { push(out, sub[k]); k = k + 1 } }
+        } else { push(out, it) }
+    }
+    return out
+}
+fn resolve_path(fromfile, rel) {
+    let dir = dirname(fromfile)
+    let cand = if dir == "" { rel } else { dir + "/" + rel }
+    if file_exists(cand) { return cand }
+    if file_exists(rel) { return rel }
+    return ""
+}
+fn dirname(p) { let mut i = len(p) - 1; while i >= 0 { if substring(p, i, i + 1) == "/" { return substring(p, 0, i) } i = i - 1 } return "" }
+
+// ---- S-expression parser (same as the checker) ----------------------------
+fn sexp_parse(s) { let pos = [0]; return sx_node(s, pos) }
+fn sx_ws(s, pos) { while pos[0] < len(s) && substring(s, pos[0], pos[0] + 1) == " " { pos[0] = pos[0] + 1 } }
+fn sx_node(s, pos) {
+    sx_ws(s, pos)
+    let c = substring(s, pos[0], pos[0] + 1)
+    if c == "(" {
+        pos[0] = pos[0] + 1
+        let mut list = []
+        let mut go = true
+        while go { sx_ws(s, pos); let d = substring(s, pos[0], pos[0] + 1); if d == ")" { pos[0] = pos[0] + 1; go = false } else if d == "" { go = false } else { push(list, sx_node(s, pos)) } }
+        return list
+    }
+    if c == "\"" {
+        let start = pos[0]; pos[0] = pos[0] + 1
+        while pos[0] < len(s) { let d = substring(s, pos[0], pos[0] + 1); if d == "\\" { pos[0] = pos[0] + 2; continue } if d == "\"" { pos[0] = pos[0] + 1; break } pos[0] = pos[0] + 1 }
+        return substring(s, start, pos[0])
+    }
+    let start = pos[0]
+    while pos[0] < len(s) { let d = substring(s, pos[0], pos[0] + 1); if d == " " || d == "(" || d == ")" { break } pos[0] = pos[0] + 1 }
+    return substring(s, start, pos[0])
+}
+fn sexp_unquote(a) { if len(a) >= 2 && substring(a, 0, 1) == "\"" { return substring(a, 1, len(a) - 1) } return a }
+// fold decimal digits so the value auto-promotes to a big integer past i64
+fn parse_bigint(s) {
+    let mut acc = 0; let mut i = 0
+    while i < len(s) { let d = substring(s, i, i + 1); if d >= "0" && d <= "9" { acc = acc * 10 + (ord(d) - 48) } i = i + 1 }
+    return acc
+}
+
+// ---- calling ---------------------------------------------------------------
+fn call_fn(name, args, G) {
+    let def = map_get(G[0], name)
+    let attrs = if len(def) > 2 { def[2] } else { [] }
+    if len(attrs) == 0 && !map_has(G[10], "swap:" + name) { return run_fn_body(def[0], def[1], args, G) }
+    return call_fn_attr(name, def, attrs, args, G)
+}
+fn run_fn_body(params, body, args, G) {
+    let env = #{}
+    bind_params(env, params, args)
+    let r = exec_block(body, env, G)
+    if r[0] == "r" || r[0] == "b" { return r[1] }
+    return null
+}
+fn call_fn_attr(name, def, attrs, args, G) {
+    let params = def[0]
+    let body = def[1]
+    // profile: count calls
+    if fn_has_attr(attrs, "profile") { let k = "profile:" + name; map_set(G[10], k, (if map_has(G[10], k) { map_get(G[10], k) } else { 0 }) + 1) }
+    // requires: precondition contract
+    let mut ci = 0
+    while ci < len(attrs) {
+        if attr_name(attrs[ci]) == "requires" {
+            let penv = #{}; bind_params(penv, params, args)
+            if !truthy(eval_expr_str(attr_arg(attrs[ci]), penv, G)) { throw "requires contract violated in `" + name + "`" }
+        }
+        ci = ci + 1
+    }
+    // memoization
+    let memo = fn_has_attr(attrs, "memo")
+    let mkey = if memo { "memo:" + name + ":" + args_key(args) } else { "" }
+    if memo && map_has(G[10], mkey) { return map_get(G[10], mkey) }
+    // hot-swapped body wins
+    let mut result = null
+    if map_has(G[10], "swap:" + name) { result = apply(map_get(G[10], "swap:" + name), args, G) }
+    else {
+        // self_healing: retry on throw
+        let heal = fn_get_attr(attrs, "self_healing")
+        if heal != "" {
+            let att = heal_attempts(heal)
+            let mut tries = 0; let mut done = false
+            while !done {
+                tries = tries + 1
+                try { result = run_fn_body(params, body, args, G); done = true }
+                catch e { if tries >= att { throw e } }
+            }
+        } else { result = run_fn_body(params, body, args, G) }
+    }
+    // ensures: postcondition contract
+    ci = 0
+    while ci < len(attrs) {
+        if attr_name(attrs[ci]) == "ensures" {
+            let penv = #{}; bind_params(penv, params, args); map_set(penv, "result", result)
+            if !truthy(eval_expr_str(attr_arg(attrs[ci]), penv, G)) { throw "ensures contract violated in `" + name + "`" }
+        }
+        ci = ci + 1
+    }
+    // trace
+    if fn_has_attr(attrs, "trace") {
+        let mut ps = []; let mut i = 0; while i < len(args) { push(ps, display(args[i], true)); i = i + 1 }
+        print("trace: " + name + "(" + join(ps, ", ") + ") -> " + display(result, false))
+    }
+    // time_travel: record bounded history
+    let tt = fn_get_attr(attrs, "time_travel")
+    if tt != "" {
+        let k = "history:" + name
+        let hist = if map_has(G[10], k) { map_get(G[10], k) } else { [] }
+        push(hist, result)
+        let depth = heal_depth(tt)
+        while len(hist) > depth { let mut nh = []; let mut i = 1; while i < len(hist) { push(nh, hist[i]); i = i + 1 } hist = nh }
+        map_set(G[10], k, hist)
+    }
+    if memo { map_set(G[10], mkey, result) }
+    return result
+}
+fn eval_expr_str(src, env, G) {
+    let st = tokenize(src)
+    push(st, #{})
+    let pc = [0]
+    let node = sexp_parse(parse_expr(st, pc))
+    return eval(node, env, G)
+}
+fn args_key(args) { let mut ps = []; let mut i = 0; while i < len(args) { push(ps, display(args[i], true)); i = i + 1 } return join(ps, ",") }
+fn tree_str(node) {
+    if type_of(node) != "array" { return str(node) }
+    let mut ps = []; let mut i = 0
+    while i < len(node) { push(ps, tree_str(node[i])); i = i + 1 }
+    return "(" + join(ps, " ") + ")"
+}
+fn str_hash(s) {
+    let mut h = 5381; let mut i = 0
+    while i < len(s) { h = (h * 33 + ord(substring(s, i, i + 1))) % 1000000007; i = i + 1 }
+    return h
+}
+fn meta_value(arg) {
+    // strip escaping backslashes, then return the text between the first quote pair
+    let mut clean = ""; let mut j = 0
+    while j < len(arg) { let c = substring(arg, j, j + 1); if c != "\\" { clean = clean + c } j = j + 1 }
+    let mut i = 0; let mut start = -1
+    while i < len(clean) { if substring(clean, i, i + 1) == "\"" { if start < 0 { start = i + 1 } else { return substring(clean, start, i) } } i = i + 1 }
+    return clean
+}
+fn xor_cipher(s, key) {
+    if len(key) == 0 { return s }
+    let mut out = ""; let mut i = 0; let kl = len(key)
+    while i < len(s) {
+        let a = ord(substring(s, i, i + 1))
+        let m = i - (i / kl) * kl
+        let b = ord(substring(key, m, m + 1))
+        out = out + chr(a ^ b)
+        i = i + 1
+    }
+    return out
+}
+fn heal_attempts(a) { let arg = attr_arg(a); let n = extract_int_after(arg, "attempts"); if n < 1 { return 1 } return n }
+fn heal_depth(a) { let arg = attr_arg(a); let n = extract_int_after(arg, "depth"); if n < 1 { return 1 } return n }
+fn extract_int_after(s, key) {
+    let mut i = 0; let mut num = ""
+    while i < len(s) {
+        let d = substring(s, i, i + 1)
+        if d >= "0" && d <= "9" { num = num + d } else { if len(num) > 0 { return int(num) } }
+        i = i + 1
+    }
+    if len(num) > 0 { return int(num) }
+    return 0
+}
+fn bind_params(env, params, args) {
+    let mut i = 0
+    while i < len(params) { let v = if i < len(args) { args[i] } else { null } map_set(env, params[i], v); i = i + 1 }
+}
+fn has_yield(node) {
+    if type_of(node) != "array" || len(node) == 0 { return false }
+    if node[0] == "yield" { return true }
+    if node[0] == "lam" || node[0] == "spawn" { return false }
+    let mut i = 1
+    while i < len(node) { if has_yield(node[i]) { return true } i = i + 1 }
+    return false
+}
+fn is_gen(v) { return type_of(v) == "array" && len(v) > 0 && v[0] == "__nv_gen__" }
+fn run_task(task, G) {
+    let st = task[3]
+    if !st[0] { st[0] = true; let r = exec_block(task[1], task[2], G); st[1] = if r[0] == "r" || r[0] == "b" { r[1] } else { null } }
+    return st[1]
+}
+// drive pending tasks (FIFO) until `ch` has data or no unrun task remains
+fn drive_pending(ch, G) {
+    let pend = G[8]
+    let mut guard = 0
+    while (type_of(ch) != "array" || len(ch[1]) == 0) && guard < len(pend) * 2 + 8 {
+        let mut ran_one = false
+        let mut i = 0
+        while i < len(pend) { let t = pend[i]; if !t[3][0] { run_task(t, G); ran_one = true; i = len(pend) } i = i + 1 }
+        if !ran_one { return }
+        guard = guard + 1
+    }
+}
+fn drain_pending(G) {
+    let pend = G[8]
+    let mut i = 0
+    while i < len(pend) { if !pend[i][3][0] { run_task(pend[i], G) } i = i + 1 }
+}
+fn pending_ran(G) { let pend = G[8]; let mut c = 0; let mut i = 0; while i < len(pend) { if pend[i][3][0] { c = c + 1 } i = i + 1 } return c }
+fn drain_one_pending(G) { let pend = G[8]; let mut i = 0; while i < len(pend) { if !pend[i][3][0] { run_task(pend[i], G); return } i = i + 1 } }
+// collect up to `limit` yielded values by replaying the generator body
+fn gen_collect(gen, limit, G) {
+    if limit <= 0 { return [] }
+    let sink = []
+    let env = #{}
+    map_set(env, "__ys__", sink)
+    map_set(env, "__yl__", limit)
+    let def = map_get(G[0], gen[1])
+    bind_params(env, def[0], gen[2])
+    try { exec_block(def[1], env, G) } catch e { if e != "__gen_stop__" { throw e } }
+    return sink
+}
+// [ "ok" v ] for the k-th (0-indexed) yield, or [ "end" ] if exhausted
+fn gen_nth(gen, k, G) {
+    let sink = gen_collect(gen, k + 1, G)
+    if len(sink) > k { return ["ok", sink[k]] }
+    return ["end"]
+}
+fn call_closure(clo, args, G) {
+    // clo = ["__nv_clo__", params, body, env]
+    let params = clo[1]
+    let body = clo[2]
+    let env = clo[3]
+    let local = env_child(env)
+    bind_params(local, params, args)
+    if type_of(body) == "array" && body[0] == "bx" { return eval(body[1], local, G) }
+    let r = exec_block(body[1], local, G)
+    if r[0] == "r" || r[0] == "b" { return r[1] }
+    return null
+}
+// a child env that inherits (shares) the parent map by reference-copy of keys
+fn env_child(parent) {
+    let e = #{}
+    let ks = map_keys(parent)
+    let mut i = 0
+    while i < len(ks) { map_set(e, ks[i], map_get(parent, ks[i])); i = i + 1 }
+    return e
+}
+
+// ---- statement execution: returns [flow, value] ----------------------------
+// flow: "n" normal, "r" return, "b" break, "c" continue, "t" throw
+fn exec_block(doNode, env, G) {
+    let mut i = 1
+    let mut defers = []
+    let mut result = ["n", null]
+    while i < len(doNode) {
+        let raw = unwrap_at(doNode[i])
+        if type_of(raw) == "array" && len(raw) > 0 && raw[0] == "defer" {
+            push(defers, raw[1])
+        } else {
+            let r = exec_stmt(doNode[i], env, G)
+            if r[0] != "n" { result = r; i = len(doNode) }
+        }
+        i = i + 1
+    }
+    let mut d = len(defers) - 1
+    while d >= 0 { exec_block(defers[d], env, G); d = d - 1 }
+    return result
+}
+fn unwrap_at(s) { if type_of(s) == "array" && len(s) > 0 && s[0] == "@" { return s[3] } return s }
+fn exec_stmt(stmt, env, G) {
+    let s = unwrap_at(stmt)
+    if type_of(s) != "array" || len(s) == 0 { return ["n", null] }
+    let h = s[0]
+    if h == "let" {
+        let lv = eval(s[3], env, G)
+        if len(s) > 2 && s[2] != "-" && map_has(G[5], s[2]) {
+            let ce = env_child(env); map_set(ce, "it", lv)
+            if !truthy(eval(map_get(G[5], s[2]), ce, G)) { throw "refinement `" + s[2] + "` violated by value " + display(lv, false) }
+        }
+        map_set(env, s[1], lv); return ["n", null]
+    }
+    if h == "set" { map_set(env, s[1], eval(s[2], env, G)); return ["n", null] }
+    if h == "iset" { let base = eval(s[1], env, G); let idx = eval(s[2], env, G); let v = eval(s[3], env, G); assign_index(base, idx, v); return ["n", null] }
+    if h == "fset" { let base = eval(s[1], env, G); set_field(base, s[2], eval(s[3], env, G)); return ["n", null] }
+    if h == "ex" { eval(s[1], env, G); return ["n", null] }
+    if h == "ret" { if len(s) > 1 { return ["r", eval(s[1], env, G)] } return ["r", null] }
+    if h == "brk" { if len(s) > 1 { return ["b", eval(s[1], env, G)] } return ["b", null] }
+    if h == "cont" { return ["c", null] }
+    if h == "throw" { throw eval(s[1], env, G) }
+    if h == "if" {
+        if truthy(eval(s[1], env, G)) { return exec_block(s[2], env, G) }
+        if len(s) > 3 { return exec_block(s[3], env, G) }
+        return ["n", null]
+    }
+    if h == "while" {
+        while truthy(eval(s[1], env, G)) {
+            let r = exec_block(s[2], env, G)
+            if r[0] == "r" || r[0] == "t" { return r }
+            if r[0] == "b" { break }
+        }
+        return ["n", null]
+    }
+    if h == "for" {
+        let lo = eval(s[2], env, G); let hi = eval(s[3], env, G)
+        let incl = s[4] == "ie"
+        let mut x = lo
+        while (incl && x <= hi) || (!incl && x < hi) {
+            map_set(env, s[1], x)
+            let r = exec_block(s[5], env, G)
+            if r[0] == "r" || r[0] == "t" { return r }
+            if r[0] == "b" { break }
+            x = x + 1
+        }
+        return ["n", null]
+    }
+    if h == "foreach" {
+        let coll = eval(s[2], env, G)
+        if is_gen(coll) {
+            let mut k = 0
+            let mut nx = gen_nth(coll, k, G)
+            while nx[0] == "ok" {
+                map_set(env, s[1], nx[1])
+                let r = exec_block(s[3], env, G)
+                if r[0] == "r" || r[0] == "t" { return r }
+                if r[0] == "b" { break }
+                k = k + 1
+                nx = gen_nth(coll, k, G)
+            }
+            return ["n", null]
+        }
+        let items = iter_items(coll)
+        let mut i = 0
+        while i < len(items) {
+            map_set(env, s[1], items[i])
+            let r = exec_block(s[3], env, G)
+            if r[0] == "r" || r[0] == "t" { return r }
+            if r[0] == "b" { break }
+            i = i + 1
+        }
+        return ["n", null]
+    }
+    if h == "try" {
+        let mut res = ["n", null]
+        let mut threw = false
+        let mut tval = null
+        try { res = exec_block(s[1], env, G) } catch e { threw = true; tval = e }
+        if threw {
+            let mut k = 2
+            while k < len(s) { let part = s[k]; if type_of(part) == "array" && part[0] == "catch" { if part[1] != "-" { map_set(env, part[1], tval) } res = exec_block(part[2], env, G) } k = k + 1 }
+        }
+        let mut k = 2
+        while k < len(s) { let part = s[k]; if type_of(part) == "array" && part[0] == "finally" { let fr = exec_block(part[1], env, G); if fr[0] != "n" { return fr } } k = k + 1 }
+        return res
+    }
+    if h == "defer" { return exec_block(s[1], env, G) }
+    if h == "yield" {
+        if map_has(env, "__ys__") {
+            let sink = map_get(env, "__ys__")
+            push(sink, if len(s) > 1 { eval(s[1], env, G) } else { null })
+            if len(sink) >= map_get(env, "__yl__") { throw "__gen_stop__" }
+        }
+        return ["n", null]
+    }
+    // bare expression statement fallthrough
+    eval(s, env, G)
+    return ["n", null]
+}
+fn assign_index(base, idx, v) { if type_of(base) == "map" { map_set(base, idx, v) } else { base[idx] = v } }
+fn set_field(st, field, v) { let fs = st[2]; let mut i = 0; while i < len(fs) { if fs[i][0] == field { fs[i][1] = v; return } i = i + 1 } push(fs, [field, v]) }
+
+// ---- expression evaluation -------------------------------------------------
+fn eval(node, env, G) {
+    if type_of(node) != "array" { return null }
+    let h = node[0]
+    if h == "i" { return int(node[1]) }
+    if h == "f" { return float(node[1]) }
+    if h == "bigint" { return parse_bigint(node[1]) }
+    if h == "s" { return unescape_str(node[1]) }
+    if h == "b" { return node[1] == "true" }
+    if h == "null" { return null }
+    if h == "v" { return lookup(node[1], env, G) }
+    if h == "arr" { let mut a = []; let mut i = 1; while i < len(node) { push(a, eval(node[i], env, G)); i = i + 1 } return a }
+    if h == "map" { let m = #{}; let mut i = 1; while i < len(node) { map_set(m, eval(node[i][1], env, G), eval(node[i][2], env, G)); i = i + 1 } return m }
+    if h == "set" { let m = #{}; let mut i = 1; while i < len(node) { map_set(m, eval(node[i], env, G), null); i = i + 1 } return m }
+    if h == "idx" { return do_index(eval(node[1], env, G), eval(node[2], env, G)) }
+    if h == "fld" { return get_field(eval(node[1], env, G), node[2]) }
+    if h == "sfld" { let b = eval(node[1], env, G); if b == null { return null } return get_field(b, node[2]) }
+    if h == "slit" {
+        let nm = node[1]; let fs = node[2]; let tmp = #{}
+        let mut i = 0; while i < len(fs) { map_set(tmp, fs[i][0], eval(fs[i][1], env, G)); i = i + 1 }
+        let mut pairs = []
+        if map_has(G[2], nm) { let defn = map_get(G[2], nm); let mut j = 0; while j < len(defn) { let fn2 = defn[j]; let v = if map_has(tmp, fn2) { map_get(tmp, fn2) } else { null } push(pairs, [fn2, v]); j = j + 1 } }
+        else { let mut j = 0; while j < len(fs) { push(pairs, [fs[j][0], map_get(tmp, fs[j][0])]); j = j + 1 } }
+        return ["__nv_struct__", nm, pairs]
+    }
+    if h == "c" { return do_call(node[1], eval_args(node, 2, env, G), env, G) }
+    if h == "cv" { let f = eval(node[1], env, G); return apply(f, eval_args(node, 2, env, G), G) }
+    if h == "m" { return do_method(eval(node[1], env, G), node[2], eval_args(node, 3, env, G), env, G) }
+    if h == "lam" { return ["__nv_clo__", lam_params(node[1]), node[2], env_child(env)] }
+    if h == "neg" { let v = eval(node[1], env, G); return 0 - v }
+    if h == "not" { return !truthy(eval(node[1], env, G)) }
+    if h == "bnot" { return 0 - eval(node[1], env, G) - 1 }
+    if h == "&&" { if !truthy(eval(node[1], env, G)) { return false } return truthy(eval(node[2], env, G)) }
+    if h == "||" { if truthy(eval(node[1], env, G)) { return true } return truthy(eval(node[2], env, G)) }
+    if h == "ife" { if truthy(eval(node[1], env, G)) { return eval(node[2], env, G) } return eval(node[3], env, G) }
+    if h == "block" {
+        let be = env_child(env)
+        let mut r = ["n", null]; let mut threw = false
+        try { r = exec_block(node[1], be, G) } catch e { threw = true }
+        if !threw && r[0] == "r" { return r[1] }
+        if len(node) > 2 && node[2] != "-" { return eval(node[2], be, G) }
+        return null
+    }
+    if h == "range" { let lo = if node[1] == "-" { 0 } else { eval(node[1], env, G) }; let hi = if node[2] == "-" { null } else { eval(node[2], env, G) }; return ["__nv_range__", lo, hi, node[3] == "ie"] }
+    if h == "sendc" { let ch = eval(node[1], env, G); let v = eval(node[2], env, G); if type_of(ch) == "array" && len(ch) > 1 && ch[0] == "__nv_chan__" { push(ch[1], v) } return ch }
+    if h == "spawn" { let task = ["__nv_task__", node[1], env_child(env), [false, null]]; push(G[8], task); return task }
+    if h == "select" {
+        let mut attempt = 0
+        while attempt < len(G[8]) * 2 + 2 {
+            let mut i = 1
+            while i < len(node) {
+                let arm = node[i]; let ch = eval(arm[1], env, G)
+                if type_of(ch) == "array" && len(ch) > 1 && ch[0] == "__nv_chan__" && len(ch[1]) > 0 {
+                    let v = builtin("recv", [ch], G)
+                    let ce = env_child(env); map_set(ce, "_recv", v)
+                    return eval(arm[3], ce, G)
+                }
+                i = i + 1
+            }
+            let before = pending_ran(G)
+            drain_one_pending(G)
+            if pending_ran(G) == before { attempt = len(G[8]) * 2 + 2 }
+            attempt = attempt + 1
+        }
+        return null
+    }
+    if h == "await" { let v = eval(node[1], env, G); if type_of(v) == "array" && len(v) > 1 && v[0] == "__nv_task__" { return run_task(v, G) } if type_of(v) == "array" && len(v) > 1 && v[0] == "__nv_future__" { return v[1] } return v }
+    if h == "fstr" { return eval_fstr(node, env, G) }
+    if h == "match" { return eval_match(node, env, G) }
+    if h == "comp" {
+        let items = iter_items(eval(node[3], env, G)); let mut out = []; let mut i = 0
+        while i < len(items) {
+            let ce = env_child(env); map_set(ce, node[2], items[i])
+            if node[4] == "-" || truthy(eval(node[4], ce, G)) { push(out, eval(node[1], ce, G)) }
+            i = i + 1
+        }
+        return out
+    }
+    // binary operators
+    return eval_binop(h, node, env, G)
+}
+fn eval_args(node, start, env, G) { let mut a = []; let mut i = start; while i < len(node) { push(a, eval(node[i], env, G)); i = i + 1 } return a }
+fn lam_params(p) { let mut out = []; let mut i = 0; while i < len(p) { push(out, p[i]); i = i + 1 } return out }
+
+fn eval_binop(op, node, env, G) {
+    let a = eval(node[1], env, G)
+    let b = eval(node[2], env, G)
+    if op == "+" { return a + b }
+    if op == "-" { return a - b }
+    if op == "*" { return a * b }
+    if op == "/" { return a / b }
+    if op == "%" { return a % b }
+    if op == "**" { return a ** b }
+    if op == "==" { return a == b }
+    if op == "!=" { return a != b }
+    if op == "<" { return a < b }
+    if op == "<=" { return a <= b }
+    if op == ">" { return a > b }
+    if op == ">=" { return a >= b }
+    if op == "band" { return a & b }
+    if op == "bor" { return a | b }
+    if op == "bxor" { return a ^ b }
+    if op == "shl" { return a << b }
+    if op == "shr" { return a >> b }
+    return null
+}
+
+fn lookup(name, env, G) {
+    if map_has(env, name) { return map_get(env, name) }
+    if name == "pi" { return 3.141592653589793 }
+    if name == "e" { return 2.718281828459045 }
+    if name == "tau" { return 6.283185307179586 }
+    if name == "phi" { return 1.618033988749895 }
+    if map_has(G[1], name) { return map_get(G[1], name) }
+    if map_has(G[0], name) { return ["__nv_fnref__", name] }
+    if map_has(G[3], name) { return make_enum(name, []) }   // unit variant
+    return null
+}
+fn make_enum(variant, args) { return ["__nv_enum__", variant, args] }
+
+fn last_seg(name) {
+    let mut cut = -1; let mut i = 0
+    while i < len(name) { if substring(name, i, i + 1) == "." { cut = i } i = i + 1 }
+    if cut < 0 { return name }
+    return substring(name, cut + 1, len(name))
+}
+fn do_call(name, args, env, G) {
+    if map_has(env, name) { let v = map_get(env, name); if callable(v) { return apply(v, args, G) } }
+    if map_has(G[6], name) { return ["__nv_gen__", name, args, [0]] }
+    if map_has(G[9], name) { let def = map_get(G[9], name); return ["__nv_machine__", name, [def[0]]] }
+    if map_has(G[0], name) { return call_fn(name, args, G) }
+    if map_has(G[2], name) { return construct_struct(name, args, G) }
+    if map_has(G[3], name) { return make_enum(name, args) }
+    let bare = last_seg(name)
+    if bare != name {
+        if map_has(G[0], bare) { return call_fn(bare, args, G) }
+        if map_has(G[2], bare) { return construct_struct(bare, args, G) }
+        if map_has(G[3], bare) { return make_enum(bare, args) }
+        return builtin(bare, args, G)
+    }
+    return builtin(name, args, G)
+}
+fn callable(v) { return type_of(v) == "array" && len(v) > 0 && (v[0] == "__nv_clo__" || v[0] == "__nv_fnref__") }
+fn construct_struct(name, args, G) {
+    let fields = map_get(G[2], name)
+    let mut pairs = []
+    let mut i = 0
+    while i < len(fields) { let val = if i < len(args) { args[i] } else { null } push(pairs, [fields[i], val]); i = i + 1 }
+    return ["__nv_struct__", name, pairs]
+}
+fn apply(f, args, G) {
+    if type_of(f) == "array" && len(f) > 0 {
+        if f[0] == "__nv_clo__" { return call_closure(f, args, G) }
+        if f[0] == "__nv_fnref__" { return do_call(f[1], args, env_empty(), G) }
+    }
+    return null
+}
+fn env_empty() { return #{} }
+fn do_method(recv, name, args, env, G) {
+    let full = [recv]; let mut i = 0; while i < len(args) { push(full, args[i]); i = i + 1 }
+    if type_of(recv) == "array" && len(recv) > 0 && recv[0] == "__nv_task__" {
+        if name == "await" || name == "join" { return run_task(recv, G) }
+    }
+    if is_gen(recv) {
+        if name == "take" { return gen_collect(recv, args[0], G) }
+        if name == "next" {
+            let pos = recv[3]; let r = gen_nth(recv, pos[0], G); pos[0] = pos[0] + 1
+            if r[0] == "ok" { return r[1] } return null
+        }
+        if name == "collect" || name == "to_array" { let out = []; let mut k = 0; let mut r = gen_nth(recv, k, G); while r[0] == "ok" { push(out, r[1]); k = k + 1; r = gen_nth(recv, k, G) } return out }
+    }
+    if is_struct(recv) {
+        let key = recv[1] + "." + name
+        if map_has(G[4], key) { return call_method(key, full, G) }
+        if map_has(G[4], "__trait__." + name) { return call_method("__trait__." + name, full, G) }
+    }
+    return builtin(name, full, G)
+}
+fn call_method(key, args, G) {
+    let def = map_get(G[4], key)
+    let params = def[0]
+    let body = def[1]
+    let env = #{}
+    map_set(env, "self", args[0])
+    let mut i = 1
+    while i < len(params) { let v = if i < len(args) { args[i] } else { null } map_set(env, params[i], v); i = i + 1 }
+    let r = exec_block(body, env, G)
+    if r[0] == "r" { return r[1] }
+    return null
+}
+
+fn is_struct(v) { return type_of(v) == "array" && len(v) >= 1 && v[0] == "__nv_struct__" }
+fn is_enum(v) { return type_of(v) == "array" && len(v) >= 1 && v[0] == "__nv_enum__" }
+fn get_field(v, field) {
+    if is_struct(v) { let fs = v[2]; let mut i = 0; while i < len(fs) { if fs[i][0] == field { return fs[i][1] } i = i + 1 } return null }
+    return null
+}
+fn do_index(base, idx) {
+    if type_of(idx) == "array" && len(idx) > 0 && idx[0] == "__nv_range__" { return do_slice(base, idx) }
+    if type_of(base) == "map" { return map_get(base, idx) }
+    if type_of(base) == "string" { return substring(base, idx, idx + 1) }
+    return base[idx]
+}
+fn do_slice(base, rng) {
+    let n = len(base)
+    let mut start = 0
+    if rng[1] != null { if rng[1] < 0 { start = max(n + rng[1], 0) } else { start = min(rng[1], n) } }
+    let mut end = n
+    if rng[2] != null {
+        let mut x = rng[2]
+        if x < 0 { x = n + x }
+        if rng[3] { x = x + 1 }
+        if x < 0 { x = 0 }
+        if x > n { x = n }
+        end = x
+    }
+    if end < start { end = start }
+    if type_of(base) == "string" { return substring(base, start, end) }
+    let mut out = []; let mut i = start; while i < end { push(out, base[i]); i = i + 1 } return out
+}
+fn iter_items(coll) {
+    if type_of(coll) == "array" {
+        if len(coll) > 0 && coll[0] == "__nv_range__" { let mut out = []; let e0 = if coll[2] == null { 0 } else { coll[2] }; let hi = if coll[3] { e0 + 1 } else { e0 }; let mut i = coll[1]; while i < hi { push(out, i); i = i + 1 } return out }
+        return coll
+    }
+    if type_of(coll) == "string" { let mut out = []; let mut i = 0; while i < len(coll) { push(out, substring(coll, i, i + 1)); i = i + 1 } return out }
+    return coll
+}
+fn truthy(v) { if v == null { return false } if v == false { return false } return true }
+
+fn eval_fstr(node, env, G) {
+    let mut out = ""
+    let mut i = 1
+    while i < len(node) {
+        let part = node[i]
+        if part[0] == "lit" { out = out + unescape_str(part[1]) }
+        else { out = out + display(eval(part[1], env, G), false) }
+        i = i + 1
+    }
+    return out
+}
+fn eval_match(node, env, G) {
+    let v = eval(node[1], env, G)
+    let mut k = 2
+    while k < len(node) {
+        let arm = node[k]
+        let binds = #{}
+        if match_pat(arm[1], v, binds) {
+            let local = env_child(env)
+            let ks = map_keys(binds)
+            let mut j = 0
+            while j < len(ks) { map_set(local, ks[j], map_get(binds, ks[j])); j = j + 1 }
+            if arm[2] == "-" || truthy(eval(arm[2], local, G)) { return eval(arm[3], local, G) }
+        }
+        k = k + 1
+    }
+    return null
+}
+fn match_pat(pat, v, binds) {
+    if type_of(pat) != "array" { return false }
+    let h = pat[0]
+    if h == "pany" { return true }
+    if h == "pbind" { map_set(binds, pat[1], v); return true }
+    if h == "pi" { return v == int(pat[1]) }
+    if h == "ps" { return v == unescape_str(pat[1]) }
+    if h == "pb" { return v == (pat[1] == "true") }
+    if h == "pnull" { return v == null }
+    if h == "por" { let mut i = 1; while i < len(pat) { if match_pat(pat[i], v, binds) { return true } i = i + 1 } return false }
+    if h == "prange" { return v >= int(pat[1]) && (if pat[3] == "ie" { v <= int(pat[2]) } else { v < int(pat[2]) }) }
+    if h == "penum" {
+        if !is_enum(v) { return false }
+        if v[1] != pat[1] { return false }
+        let sub = v[2]; let mut i = 2; let mut si = 0
+        while i < len(pat) { if si >= len(sub) || !match_pat(pat[i], sub[si], binds) { return false } i = i + 1; si = si + 1 }
+        return true
+    }
+    if h == "pstruct" {
+        if !is_struct(v) { return false }
+        if v[1] != pat[1] { return false }
+        let fields = pat[2]; let mut i = 0
+        while i < len(fields) {
+            let fpair = fields[i]; let fname = fpair[0]; let fsub = fpair[1]
+            if !match_pat(fsub, get_field(v, fname), binds) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if h == "ptuple" {
+        if type_of(v) != "array" { return false }
+        let pats = slice_from(pat, 1)
+        if len(pats) > len(v) { return false }
+        let mut i = 0; while i < len(pats) { if !match_pat(pats[i], v[i], binds) { return false } i = i + 1 }
+        return true
+    }
+    if h == "pslice" {
+        if type_of(v) != "array" { return false }
+        let pre = pat[1]; let rest = pat[2]; let suf = pat[3]
+        let has_rest = type_of(rest) == "array" && len(rest) > 0 && rest[0] == "rest"
+        if !has_rest {
+            if len(v) != len(pre) { return false }
+            let mut i = 0; while i < len(pre) { if !match_pat(pre[i], v[i], binds) { return false } i = i + 1 }
+            return true
+        }
+        if len(v) < len(pre) + len(suf) { return false }
+        let mut i = 0; while i < len(pre) { if !match_pat(pre[i], v[i], binds) { return false } i = i + 1 }
+        let mut j = 0; while j < len(suf) { if !match_pat(suf[j], v[len(v) - len(suf) + j], binds) { return false } j = j + 1 }
+        if len(rest) > 1 {
+            let mut mid = []; let mut m = len(pre); while m < len(v) - len(suf) { push(mid, v[m]); m = m + 1 }
+            map_set(binds, rest[1], mid)
+        }
+        return true
+    }
+    return false
+}
+fn slice_from(a, s) { let mut out = []; let mut i = s; while i < len(a) { push(out, a[i]); i = i + 1 } return out }
+
+// ---- string unescape (s "...") -> value ------------------------------------
+fn unescape_str(tok) {
+    let inner = substring(tok, 1, len(tok) - 1)
+    let n = len(inner)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = substring(inner, i, i + 1)
+        if c == "\\" && i + 1 < n {
+            let d = substring(inner, i + 1, i + 2)
+            if d == "n" { out = out + "\n" } else if d == "t" { out = out + "\t" } else if d == "r" { out = out + "\r" } else if d == "\\" { out = out + "\\" } else if d == "\"" { out = out + "\"" } else if d == "0" { out = out + chr(0) } else { out = out + d }
+            i = i + 2
+        } else { out = out + c; i = i + 1 }
+    }
+    return out
+}
+
+// ---- display (mirrors interp.rs Value::Display) ----------------------------
+fn sort_strs(xs) {
+    let mut a = []; let mut k = 0; while k < len(xs) { push(a, xs[k]); k = k + 1 }
+    let mut i = 1
+    while i < len(a) {
+        let key = a[i]; let mut j = i - 1
+        while j >= 0 && key < a[j] { a[j + 1] = a[j]; j = j - 1 }
+        a[j + 1] = key; i = i + 1
+    }
+    return a
+}
+fn display(v, nested) {
+    let ty = type_of(v)
+    if ty == "null" { return "null" }
+    if ty == "bool" { return if v { "true" } else { "false" } }
+    if ty == "int" { return str(v) }
+    if ty == "float" { return str(v) }
+    if ty == "string" { if nested { return "\"" + v + "\"" } return v }
+    if ty == "array" {
+        if len(v) > 0 && v[0] == "__nv_range__" {
+            let mut out = []; let e0 = if v[2] == null { 0 } else { v[2] }; let hi = if v[3] { e0 + 1 } else { e0 }; let mut ri = v[1]; while ri < hi { push(out, ri); ri = ri + 1 }
+            return display(out, nested)
+        }
+        if is_struct(v) {
+            let fs = v[2]; let mut names = []; let mut i = 0
+            while i < len(fs) { push(names, fs[i][0]); i = i + 1 }
+            let sorted = sort_strs(names); let mut parts = []; i = 0
+            while i < len(sorted) { let nm = sorted[i]; push(parts, nm + ": " + display(get_field(v, nm), true)); i = i + 1 }
+            return v[1] + " { " + join(parts, ", ") + " }"
+        }
+        if is_enum(v) { if len(v[2]) == 0 { return v[1] } let mut parts = []; let mut i = 0; while i < len(v[2]) { push(parts, display(v[2][i], true)); i = i + 1 } return v[1] + "(" + join(parts, ", ") + ")" }
+        if len(v) > 0 && v[0] == "__nv_clo__" { return "<closure>" }
+        let mut parts = []; let mut i = 0; while i < len(v) { push(parts, display(v[i], true)); i = i + 1 } return "[" + join(parts, ", ") + "]"
+    }
+    if ty == "map" { let ks = map_keys(v); let mut parts = []; let mut i = 0; while i < len(ks) { push(parts, display(ks[i], true) + ": " + display(map_get(v, ks[i]), true)); i = i + 1 } return "{" + join(parts, ", ") + "}" }
+    return str(v)
+}
+
+// ---- builtins --------------------------------------------------------------
+fn builtin(name, args, G) {
+    if name == "print" { print(display(arg(args, 0), false)); return null }
+    if name == "len" { let v = arg(args, 0); if type_of(v) == "map" { return map_len(v) } return len(v) }
+    if name == "push" { push(args[0], args[1]); return null }
+    if name == "pop" { return pop(args[0]) }
+    if name == "str" { return display(arg(args, 0), false) }
+    if name == "int" { return int(arg(args, 0)) }
+    if name == "float" { return float(arg(args, 0)) }
+    if name == "abs" { return abs(arg(args, 0)) }
+    if name == "sqrt" { return sqrt(arg(args, 0)) }
+    if name == "pi" { return 3.141592653589793 }
+    if name == "e" { return 2.718281828459045 }
+    if name == "tau" { return 6.283185307179586 }
+    if name == "phi" { return 1.618033988749895 }
+    if name == "migrate" {
+        let old = args[0]
+        if is_struct(old) && map_has(G[7], old[1]) {
+            let body = map_get(G[7], old[1])
+            let env = #{}; map_set(env, "old", old)
+            let fs = old[2]; let mut i = 0; while i < len(fs) { map_set(env, fs[i][0], fs[i][1]); i = i + 1 }
+            let r = exec_block(body, env, G)
+            if r[0] == "r" || r[0] == "b" { return r[1] }
+            return null
+        }
+        return old
+    }
+    if name == "hot_swap" { map_set(G[10], "swap:" + args[0], args[1]); return null }
+    if name == "integrity_of" { if map_has(G[0], args[0]) { let d = map_get(G[0], args[0]); return str_hash(tree_str(d[1]) + args[0]) } return 0 }
+    if name == "profile_of" { let k = "profile:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return 0 }
+    if name == "attrs_of" { if map_has(G[0], args[0]) { let d = map_get(G[0], args[0]); if len(d) > 2 { return d[2] } } return [] }
+    if name == "history_of" { let k = "history:" + args[0]; if map_has(G[10], k) { return map_get(G[10], k) } return [] }
+    if name == "meta_of" {
+        if map_has(G[0], args[0]) { let d = map_get(G[0], args[0]); if len(d) > 2 { let a = fn_get_attr(d[2], args[1]); if a != "" { return meta_value(attr_arg(a)) } } }
+        return null
+    }
+    if name == "encrypt" { return xor_cipher(args[0], args[1]) }
+    if name == "decrypt" { return xor_cipher(args[0], args[1]) }
+    if name == "is_debugged" { return false }
+    if name == "chan" { return ["__nv_chan__", []] }
+    if name == "recv" { let ch = args[0]; if type_of(ch) == "array" && len(ch) > 1 && ch[0] == "__nv_chan__" { if len(ch[1]) == 0 { drive_pending(ch, G) } let q = ch[1]; if len(q) == 0 { return null } let v = q[0]; let mut nq = []; let mut i = 1; while i < len(q) { push(nq, q[i]); i = i + 1 } ch[1] = nq; return v } return null }
+    if name == "close" { return null }
+    if name == "send" || name == "send_to" {
+        let ch = args[0]
+        if type_of(ch) == "array" && len(ch) > 1 && ch[0] == "__nv_machine__" {
+            let def = map_get(G[9], ch[1]); let trans = def[1]; let cur = ch[2][0]; let ev = args[1]
+            let mut i = 0
+            while i < len(trans) { let tr = trans[i]; if tr[0] == cur && unescape_str(tr[2]) == ev { ch[2][0] = tr[1]; return tr[1] } i = i + 1 }
+            throw "invalid transition: " + ch[1] + " cannot handle '" + ev + "' in state " + cur
+        }
+        if type_of(ch) == "array" && len(ch) > 1 && ch[0] == "__nv_chan__" { push(ch[1], args[1]) } return null
+    }
+    if name == "range" { if len(args) >= 2 { return ["__nv_range__", args[0], args[1], false] } return ["__nv_range__", 0, args[0], false] }
+    if name == "array" { if len(args) >= 2 { let mut a = []; let mut i = 0; while i < args[0] { push(a, args[1]); i = i + 1 } return a } if len(args) == 1 { let mut a = []; let mut i = 0; while i < args[0] { push(a, null); i = i + 1 } return a } return [] }
+    if name == "abs" { return abs(args[0]) }
+    if name == "upper" { return upper(args[0]) }
+    if name == "lower" { return lower(args[0]) }
+    if name == "trim" { return trim(args[0]) }
+    if name == "split" { return split(args[0], args[1]) }
+    if name == "join" { let a = args[0]; let mut parts = []; let mut i = 0; while i < len(a) { push(parts, display(a[i], false)); i = i + 1 } return join(parts, args[1]) }
+    if name == "substring" { if len(args) >= 3 { return substring(args[0], args[1], args[2]) } return substring(args[0], args[1], len(args[0])) }
+    if name == "contains" { if type_of(args[0]) == "array" { let mut i = 0; while i < len(args[0]) { if args[0][i] == args[1] { return true } i = i + 1 } return false } return contains(args[0], args[1]) }
+    if name == "replace" { return replace(args[0], args[1], args[2]) }
+    if name == "starts_with" { return starts_with(args[0], args[1]) }
+    if name == "ends_with" { return ends_with(args[0], args[1]) }
+    if name == "ord" { return ord(args[0]) }
+    if name == "chr" { return chr(args[0]) }
+    if name == "map_get" { if len(args) >= 3 && !map_has(args[0], args[1]) { return args[2] } return map_get(args[0], args[1]) }
+    if name == "map_set" { map_set(args[0], args[1], args[2]); return null }
+    if name == "map_has" { return map_has(args[0], args[1]) }
+    if name == "map_keys" { return map_keys(args[0]) }
+    if name == "map_values" { return map_values(args[0]) }
+    if name == "map_len" { return map_len(args[0]) }
+    if name == "dict" { return #{} }
+    if name == "reverse" { return reverse(args[0]) }
+    if name == "sort" { return sort(args[0]) }
+    if name == "sum" { return sum(args[0]) }
+    if name == "min" { return min(args[0], args[1]) }
+    if name == "max" { return max(args[0], args[1]) }
+    if name == "type_of" { return type_name(arg(args, 0)) }
+    if name == "map" { let a = iter_items(args[0]); let f = args[1]; let mut out = []; let mut i = 0; while i < len(a) { push(out, apply(f, [a[i]], G)); i = i + 1 } return out }
+    if name == "filter" { let a = iter_items(args[0]); let f = args[1]; let mut out = []; let mut i = 0; while i < len(a) { if truthy(apply(f, [a[i]], G)) { push(out, a[i]) } i = i + 1 } return out }
+    if name == "reduce" { let a = iter_items(args[0]); let f = args[1]; let mut acc = args[2]; let mut i = 0; while i < len(a) { acc = apply(f, [acc, a[i]], G); i = i + 1 } return acc }
+    if name == "assert" { if !truthy(args[0]) { eprint("assertion failed"); exit(1) } return null }
+    if name == "assert_eq" { if args[0] != args[1] { eprint("assert_eq failed"); exit(1) } return null }
+    if name == "eprint" { eprint(display(arg(args, 0), false)); return null }
+    if name == "input" { return input() }
+    if name == "to_int" { return to_int(arg(args, 0)) }
+    if name == "to_float" { return to_float(arg(args, 0)) }
+    if name == "floor" { return floor(args[0]) }
+    if name == "ceil" { return ceil(args[0]) }
+    if name == "round" { return round(args[0]) }
+    if name == "trunc" { return trunc(args[0]) }
+    if name == "sign" { return sign(args[0]) }
+    if name == "cbrt" { return cbrt(args[0]) }
+    if name == "pow" { return pow(args[0], args[1]) }
+    if name == "log" { if len(args) >= 2 { return log(args[0], args[1]) } return ln(args[0]) }
+    if name == "ln" { return ln(args[0]) }
+    if name == "log2" { return log2(args[0]) }
+    if name == "log10" { return log10(args[0]) }
+    if name == "exp" { return exp(args[0]) }
+    if name == "sin" { return sin(args[0]) }
+    if name == "cos" { return cos(args[0]) }
+    if name == "tan" { return tan(args[0]) }
+    if name == "atan2" { return atan2(args[0], args[1]) }
+    if name == "hypot" { return hypot(args[0], args[1]) }
+    if name == "gcd" { return gcd(args[0], args[1]) }
+    if name == "lcm" { return lcm(args[0], args[1]) }
+    if name == "factorial" { return factorial(args[0]) }
+    if name == "clamp" { return clamp(args[0], args[1], args[2]) }
+    if name == "lerp" { return lerp(args[0], args[1], args[2]) }
+    if name == "min_of" { return min_of(args[0]) }
+    if name == "max_of" { return max_of(args[0]) }
+    if name == "pad_left" { return pad_left(args[0], args[1], args[2]) }
+    if name == "pad_right" { return pad_right(args[0], args[1], args[2]) }
+    if name == "repeat" { return repeat(args[0], args[1]) }
+    if name == "reverse_str" { return reverse_str(args[0]) }
+    if name == "capitalize" { return capitalize(args[0]) }
+    if name == "title" { return title(args[0]) }
+    if name == "trim_start" { return trim_start(args[0]) }
+    if name == "trim_end" { return trim_end(args[0]) }
+    if name == "find" { return find(args[0], args[1]) }
+    if name == "position" { return position(args[0], args[1]) }
+    if name == "count" { return count(args[0]) }
+    if name == "levenshtein" { return levenshtein(args[0], args[1]) }
+    if name == "concat" { return concat(args[0], args[1]) }
+    if name == "zip" { return zip(args[0], args[1]) }
+    if name == "enumerate" { return enumerate(args[0]) }
+    if name == "first" { return first(args[0]) }
+    if name == "last" { return last(args[0]) }
+    if name == "take" { return take(args[0], args[1]) }
+    if name == "skip" { return skip(args[0], args[1]) }
+    if name == "slice" { return slice(args[0], args[1], args[2]) }
+    if name == "chunk" { return chunk(args[0], args[1]) }
+    if name == "unique" { return unique(args[0]) }
+    if name == "flatten" { return flatten(args[0]) }
+    if name == "all_true" { return all_true(args[0]) }
+    if name == "any_true" { return any_true(args[0]) }
+    if name == "contains_elem" { return contains_elem(args[0], args[1]) }
+    if name == "array_fill" { return array_fill(args[0], args[1]) }
+    if name == "json_parse" { return json_parse(args[0]) }
+    if name == "json_stringify" { return json_stringify(args[0]) }
+    if name == "json_pretty" { return json_pretty(args[0]) }
+    if name == "read_file" { return read_file(args[0]) }
+    if name == "write_file" { return write_file(args[0], args[1]) }
+    if name == "append_file" { return append_file(args[0], args[1]) }
+    if name == "file_exists" { return file_exists(args[0]) }
+    if name == "remove_file" { return remove_file(args[0]) }
+    if name == "read_line" { return read_line() }
+    if name == "list_dir" { return list_dir(args[0]) }
+    if name == "mkdir" { return mkdir(args[0]) }
+    if name == "cwd" { return cwd() }
+    if name == "chdir" { return chdir(args[0]) }
+    if name == "exec" { if len(args) >= 2 { return exec(args[0], args[1]) } return exec(args[0]) }
+    if name == "env" { return env(args[0]) }
+    if name == "setenv" { setenv(args[0], args[1]); return null }
+    if name == "seed" { seed(args[0]); return null }
+    if name == "random" { return random() }
+    if name == "rand_int" { return rand_int(args[0], args[1]) }
+    if name == "rand_float" { return rand_float(args[0], args[1]) }
+    if name == "rand_bool" { return rand_bool() }
+    if name == "choice" { return choice(args[0]) }
+    if name == "shuffle" { return shuffle(args[0]) }
+    if name == "now" { return now() }
+    if name == "now_millis" { return now_millis() }
+    if name == "now_nanos" { return now_nanos() }
+    if name == "now_ms" { return now_ms() }
+    if name == "sleep_ms" { sleep_ms(args[0]); return null }
+    if name == "assert_ne" { if args[0] == args[1] { eprint("assert_ne failed"); exit(1) } return null }
+    if name == "assert_true" { if !truthy(args[0]) { eprint("assert failed"); exit(1) } return null }
+    if name == "assert_false" { if truthy(args[0]) { eprint("assert failed"); exit(1) } return null }
+    if name == "assert_gt" { if !(args[0] > args[1]) { eprint("assert failed"); exit(1) } return null }
+    if name == "assert_lt" { if !(args[0] < args[1]) { eprint("assert failed"); exit(1) } return null }
+    if name == "assert_contains" { if !builtin("contains", args, G) { eprint("assert failed"); exit(1) } return null }
+    if name == "map_del" { map_del(args[0], args[1]); return null }
+    if name == "exit" { exit(args[0]); return null }
+    if name == "args" { return [] }
+    if name == "state_of" { let m = args[0]; if type_of(m) == "array" && len(m) > 2 && m[0] == "__nv_machine__" { return m[2][0] } return state_of(args[0]) }
+    // unknown builtin -> null (iterate to add coverage)
+    return null
+}
+fn arg(args, i) { if i < len(args) { return args[i] } return null }
+fn type_name(v) {
+    if is_struct(v) { return v[1] }
+    if is_enum(v) { return "enum" }
+    let t = type_of(v)
+    if t == "array" { return "array" }
+    return t
+}
+
+// top_level = attribute* visibility? (use_decl | item) | top_stmt
+fn parse_top(st, pc) {
+    let attrs = parse_attrs(st, pc)
+    skip_visibility(st, pc)
+    return parse_item(st, pc, attrs)
+}
+
+fn parse_item(st, pc, attrs) {
+    if is_kw(st, pc, "fn") { return parse_func(st, pc, attrs) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "async" && pk2(st, pc) == "kw" && ptext2(st, pc) == "fn" { return parse_func(st, pc, attrs) }
+    if is_kw(st, pc, "struct") { return parse_struct(st, pc) }
+    if is_kw(st, pc, "enum") || (pk(st, pc) == "ident" && ptext(st, pc) == "union") { return parse_enum(st, pc) }
+    if is_kw(st, pc, "trait") { return parse_trait(st, pc) }
+    if is_kw(st, pc, "impl") { return parse_impl(st, pc) }
+    if is_kw(st, pc, "use") { return parse_use(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "const" { return parse_const(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "static" { return parse_static(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "type" { return parse_type_alias(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "test" { return parse_test(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "machine" { return parse_machine(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "migrate" { return parse_migrate(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "macro" { return parse_macro(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "data" { return parse_data(st, pc) }
+    if is_kw(st, pc, "extern") || (pk(st, pc) == "ident" && ptext(st, pc) == "extern") { return parse_extern(st, pc) }
+    // fallback: treat as a top statement (expression)
+    let s = parse_stmt(st, pc)
+    return s
+}
+
+// --- attributes: return "(attrs "raw1" "raw2")" ; raw reconstructed from tokens
+fn parse_attrs(st, pc) {
+    let mut raws = []
+    while is_p(st, pc, "#") {
+        adv(st, pc)
+        if is_p(st, pc, "!") { adv(st, pc) }
+        expect_p(st, pc, "[")
+        // collect raw token text until the matching ']'
+        let mut depth = 1
+        let mut toks = []
+        while depth > 0 && pk(st, pc) != "eof" {
+            if is_p(st, pc, "[") { depth = depth + 1 }
+            else if is_p(st, pc, "]") { depth = depth - 1; if depth == 0 { adv(st, pc); break } }
+            push(toks, render_tok(st, pc))
+            adv(st, pc)
+        }
+        push(raws, quote(reconstruct(toks)))
+    }
+    return raws
+}
+// render a token to source-ish text
+fn render_tok(st, pc) { let k = pk(st, pc); let t = ptext(st, pc); return t }
+// reconstruct attribute raw text: join words with spaces around none — best-effort
+#[comptime]
+fn attr_ops() { #{ ">=":1,"<=":1,"==":1,"!=":1,">":1,"<":1,"+":1,"-":1,"*":1,"/":1,"%":1,"&&":1,"||":1,"**":1 } }
+fn reconstruct(toks) {
+    let ops = attr_ops()
+    let mut out = ""
+    let mut i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if map_has(ops, t) { out = out + " " + t + " " }
+        else if t == ":" || t == "," { out = out + t + " " }
+        else { out = out + t }
+        i = i + 1
+    }
+    // collapse any double spaces and trim
+    while contains(out, "  ") { out = replace(out, "  ", " ") }
+    return trim(out)
+}
+fn quote(s) {
+    let a = replace(s, "\\", "\\\\")
+    let b = replace(a, "\"", "\\\"")
+    let c = replace(b, "\n", "\\n")
+    let d = replace(c, "\t", "\\t")
+    return "\"" + replace(d, "\r", "\\r") + "\""
+}
+fn skip_visibility(st, pc) {
+    if pk(st, pc) == "kw" && ptext(st, pc) == "pub" {
+        adv(st, pc)
+        if is_p(st, pc, "(") { let mut d = 1; adv(st, pc); while d > 0 && pk(st, pc) != "eof" { if is_p(st, pc, "(") { d = d + 1 } else if is_p(st, pc, ")") { d = d - 1 } adv(st, pc) } }
+    }
+}
+
+fn attrs_s(attrs) { return "(attrs " + join(attrs, " ") + ")" }
+
+// func_decl = async? fn ident generic_params? ( params? ) ret_type? effects? where? (block | => expr ;?)
+fn parse_func(st, pc, attrs) {
+    let mut is_async = "sync"
+    if pk(st, pc) == "ident" && ptext(st, pc) == "async" { is_async = "async"; adv(st, pc) }
+    adv(st, pc) // fn
+    let name = ptext(st, pc); adv(st, pc)
+    let gens = parse_generics(st, pc)
+    let ps = parse_params(st, pc)
+    let mut ret = "-"
+    if is_p(st, pc, "->") { adv(st, pc); ret = parse_type_head(st, pc) }
+    let eff = parse_effects(st, pc)
+    let wh = parse_where(st, pc, gens[1])
+    let body = parse_fn_body(st, pc)
+    return "(fn " + attrs_s(attrs) + " " + is_async + " " + name + " (gen " + join(gens[0], " ") + ") (params " + join(ps, " ") + ") (ret " + ret + ") " + eff + " (where " + join(wh, " ") + ") " + body + ")"
+}
+
+// generic_params = [ generic_param, ... ] ; returns [names, [(name,[bounds])...] as strings]
+fn parse_generics(st, pc) {
+    let mut names = []
+    let mut bounds = []
+    if !is_p(st, pc, "[") { return [names, bounds] }
+    adv(st, pc)
+    while !is_p(st, pc, "]") && pk(st, pc) != "eof" {
+        let nm = ptext(st, pc); adv(st, pc)
+        if is_p(st, pc, "[") { // HKT [_]
+            let mut d = 1; adv(st, pc); while d > 0 && pk(st, pc) != "eof" { if is_p(st, pc, "[") { d = d + 1 } else if is_p(st, pc, "]") { d = d - 1 } adv(st, pc) }
+        }
+        push(names, nm)
+        if is_p(st, pc, ":") {
+            adv(st, pc)
+            let bs = parse_bounds(st, pc)
+            push(bounds, "(" + nm + " " + join(bs, " ") + ")")
+        }
+        if is_p(st, pc, "=") { adv(st, pc); parse_type_head(st, pc) }
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "]")
+    return [names, bounds]
+}
+// bounds = bound (+ bound)* ; bound = type_path ([ type ])? | lifetime
+fn parse_bounds(st, pc) {
+    let mut out = []
+    let mut go = true
+    while go {
+        let nm = ptext(st, pc); adv(st, pc)
+        if is_p(st, pc, "[") { let mut d = 1; adv(st, pc); while d > 0 && pk(st, pc) != "eof" { if is_p(st, pc, "[") { d = d + 1 } else if is_p(st, pc, "]") { d = d - 1 } adv(st, pc) } }
+        push(out, nm)
+        if is_p(st, pc, "+") { adv(st, pc) } else { go = false }
+    }
+    return out
+}
+fn parse_effects(st, pc) {
+    // effects_clause = ! [ effect, ... ]
+    if !(is_p(st, pc, "!") && pk2(st, pc) == "punct" && ptext2(st, pc) == "[") {
+        // note: "!" then "[" may be tokenized separately
+        if !is_p(st, pc, "!") { return "(eff none)" }
+    }
+    if !is_p(st, pc, "!") { return "(eff none)" }
+    adv(st, pc) // !
+    expect_p(st, pc, "[")
+    let mut effs = []
+    while !is_p(st, pc, "]") && pk(st, pc) != "eof" {
+        push(effs, ptext(st, pc)); adv(st, pc)
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "]")
+    if len(effs) == 0 { return "(eff pure)" }
+    return "(eff " + join(effs, " ") + ")"
+}
+// where_clause merges with generic bounds (bounds first, then where items)
+fn parse_where(st, pc, gen_bounds) {
+    let mut out = []
+    let mut i = 0
+    while i < len(gen_bounds) { push(out, gen_bounds[i]); i = i + 1 }
+    if word_is(st, pc, "where") {
+        adv(st, pc)
+        let mut go = true
+        while go {
+            let ty = parse_type_head(st, pc)
+            expect_p(st, pc, ":")
+            let bs = parse_bounds(st, pc)
+            push(out, "(" + ty + " " + join(bs, " ") + ")")
+            if is_p(st, pc, ",") { adv(st, pc) } else { go = false }
+        }
+    }
+    return out
+}
+
+// params = ( param, ... ) ; param -> "(name type mode)"
+fn parse_params(st, pc) {
+    expect_p(st, pc, "(")
+    let mut out = []
+    while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+        parse_attrs(st, pc)
+        let mut mode = "-"
+        // self param
+        if is_p(st, pc, "&") { adv(st, pc); if pk(st, pc) == "life" { adv(st, pc) } }
+        if is_kw(st, pc, "mut") { adv(st, pc) }
+        if pk(st, pc) == "ident" && ptext(st, pc) == "ref" { adv(st, pc) }
+        let nm = ptext(st, pc); adv(st, pc)
+        let mut ty = "-"
+        if is_p(st, pc, ":") {
+            adv(st, pc)
+            if pk(st, pc) == "ident" && (ptext(st, pc) == "linear" || ptext(st, pc) == "affine" || ptext(st, pc) == "shared") { mode = ptext(st, pc); adv(st, pc) }
+            ty = parse_type_head(st, pc)
+        }
+        if is_p(st, pc, "=") { adv(st, pc); parse_expr(st, pc) }
+        push(out, "(" + nm + " " + ty + " " + mode + ")")
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, ")")
+    return out
+}
+
+// fn body: block OR "=> expr" ; trailing expr becomes implicit return
+fn parse_fn_body(st, pc) {
+    if is_p(st, pc, "=>") {
+        adv(st, pc)
+        let e = parse_expr(st, pc)
+        if is_p(st, pc, ";") { adv(st, pc) }
+        return "(do (ret " + e + "))"
+    }
+    let b = parse_block_raw(st, pc)   // [stmts, tail]
+    return finish_fn_block(b)
+}
+fn do_block(list) { if len(list) == 0 { return "(do)" } return "(do " + join(list, " ") + ")" }
+
+// fn/lambda/spawn body: the LAST expr-statement becomes an implicit return
+// (make_trailing_implicit_return runs after lowering, so a trailing `;` on the
+// last expression does not matter).
+fn finish_fn_block(b) {
+    let stmts = b[0]
+    let tail = b[1]
+    let mut all = []
+    let mut i = 0
+    while i < len(stmts) { push(all, stmts[i]); i = i + 1 }
+    if tail != "" { push(all, "(ex " + tail + ")") }
+    if len(all) > 0 {
+        let last = all[len(all) - 1]
+        let lh = head_and_args(last)
+        if lh[0] == "ex" { all[len(all) - 1] = "(ret " + lh[1][0] + ")" }
+        else if lh[0] == "if" { all[len(all) - 1] = trailing_ret_if(last) }
+    }
+    return do_block(all)
+}
+// plain statement block (for/while/loop/defer/try/if-branch): NO implicit return
+fn plain_block_from(b) {
+    let stmts = b[0]
+    let tail = b[1]
+    let mut all = []
+    let mut i = 0
+    while i < len(stmts) { push(all, stmts[i]); i = i + 1 }
+    if tail != "" { push(all, "(ex " + tail + ")") }
+    return do_block(all)
+}
+// if the stmt is an (if C THEN) / (if C THEN ELS), convert trailing (ex E) inside branches to (ret E)
+fn trailing_ret_if(s) {
+    let ha = head_and_args(s)
+    if ha[0] != "if" { return s }
+    let a = ha[1]
+    if len(a) == 2 { return "(if " + a[0] + " " + block_ret(a[1]) + ")" }
+    if len(a) == 3 { return "(if " + a[0] + " " + block_ret(a[1]) + " " + block_ret(a[2]) + ")" }
+    return s
+}
+// given a "(do ...)" string, convert its trailing (ex E) to (ret E), recursing into if
+fn block_ret(dostr) {
+    let ha = head_and_args(dostr)
+    if ha[0] != "do" { return dostr }
+    let stmts = ha[1]
+    if len(stmts) == 0 { return dostr }
+    let last = stmts[len(stmts) - 1]
+    let lh = head_and_args(last)
+    let mut newlast = last
+    if lh[0] == "ex" { newlast = "(ret " + lh[1][0] + ")" }
+    else if lh[0] == "if" { newlast = trailing_ret_if(last) }
+    let mut out = []
+    let mut i = 0
+    while i < len(stmts) - 1 { push(out, stmts[i]); i = i + 1 }
+    push(out, newlast)
+    return do_block(out)
+}
+
+// parse a raw block { stmt* expr? } -> [ [stmt strings], tailExpr-or-"" ]
+fn parse_block_raw(st, pc) {
+    expect_p(st, pc, "{")
+    let mut stmts = []
+    let mut tail = ""
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        let r = parse_stmt_or_tail(st, pc)
+        // r = [kind, text]; kind "stmt" or "tail"
+        if r[0] == "tail" { tail = r[1]; break }
+        push(stmts, r[1])
+    }
+    expect_p(st, pc, "}")
+    return [stmts, tail]
+}
+
+fn parse_block_do(st, pc) {
+    let b = parse_block_raw(st, pc)
+    return plain_block_from(b)
+}
+
+// ===== statements ===========================================================
+// returns ["stmt", text] or ["tail", exprtext] (trailing no-semicolon expr)
+fn parse_stmt_or_tail(st, pc) {
+    let s = parse_stmt2(st, pc)
+    return s
+}
+
+fn parse_stmt(st, pc) {
+    let r = parse_stmt2(st, pc)
+    return r[1]
+}
+
+fn parse_stmt2(st, pc) {
+    // let
+    if is_kw(st, pc, "let") {
+        adv(st, pc)
+        if is_kw(st, pc, "mut") { adv(st, pc) }
+        parse_attrs(st, pc)
+        let nm = ptext(st, pc); adv(st, pc)
+        let mut ty = "-"
+        if is_p(st, pc, ":") { adv(st, pc); ty = parse_type_head(st, pc) }
+        let mut val = "(null)"
+        if is_p(st, pc, "=") { adv(st, pc); val = parse_expr(st, pc) }
+        if is_p(st, pc, ";") { adv(st, pc) }
+        return ["stmt", "(let " + nm + " " + ty + " " + val + ")"]
+    }
+    // defer (statement)
+    if pk(st, pc) == "ident" && ptext(st, pc) == "defer" {
+        adv(st, pc)
+        let b = if is_p(st, pc, "{") { parse_block_do(st, pc) } else { "(do (ex " + parse_expr(st, pc) + "))" }
+        if is_p(st, pc, ";") { adv(st, pc) }
+        return ["stmt", "(defer " + b + ")"]
+    }
+    // yield stmt
+    if pk(st, pc) == "ident" && ptext(st, pc) == "yield" {
+        adv(st, pc)
+        if is_p(st, pc, ";") || is_p(st, pc, "}") { if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(yield)"] }
+        let e = parse_expr(st, pc)
+        if is_p(st, pc, ";") { adv(st, pc) }
+        return ["stmt", "(yield " + e + ")"]
+    }
+    // control-flow statements that are expr_with_block (if/match/while/for/loop/try/block)
+    if is_kw(st, pc, "if") { return ["stmt", parse_if_stmt(st, pc)] }
+    if is_kw(st, pc, "while") { adv(st, pc); let c = parse_cond(st, pc); let b = parse_block_do(st, pc); return ["stmt", "(while " + c + " " + b + ")"] }
+    if is_kw(st, pc, "loop") { adv(st, pc); let b = parse_block_do(st, pc); return ["stmt", "(while (b true) " + b + ")"] }
+    if is_kw(st, pc, "for") { return ["stmt", parse_for_stmt(st, pc)] }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "try" { return ["stmt", parse_try(st, pc)] }
+    // return / break / continue / throw as statements (flow_expr)
+    if is_kw(st, pc, "return") {
+        adv(st, pc)
+        if stmt_end(st, pc) { if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(ret)"] }
+        let e = parse_expr(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(ret " + e + ")"]
+    }
+    if is_kw(st, pc, "break") {
+        adv(st, pc)
+        if stmt_end(st, pc) { if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(brk)"] }
+        let e = parse_expr(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(brk " + e + ")"]
+    }
+    if is_kw(st, pc, "continue") { adv(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(cont)"] }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "throw" {
+        adv(st, pc)
+        if stmt_end(st, pc) { if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(throw (null))"] }
+        let e = parse_expr(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", "(throw " + e + ")"]
+    }
+    // expression / assignment statement
+    let e = parse_expr(st, pc)
+    // assignment: = or compound
+    if is_p(st, pc, "=") { adv(st, pc); let rhs = parse_expr(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return ["stmt", assign_form(e, rhs)] }
+    if is_compound(st, pc) {
+        let op = ptext(st, pc); adv(st, pc)
+        let rhs = parse_expr(st, pc); if is_p(st, pc, ";") { adv(st, pc) }
+        let binop = substring(op, 0, len(op) - 1)
+        let combined = "(" + binop_head(binop) + " " + e + " " + rhs + ")"
+        return ["stmt", assign_form(e, combined)]
+    }
+    // trailing expr (no semicolon) vs expr-stmt (semicolon)
+    if is_p(st, pc, ";") { adv(st, pc); return ["stmt", "(ex " + e + ")"] }
+    if is_p(st, pc, "}") { return ["tail", e] }
+    // no semicolon and not end-of-block: an expr statement (e.g. expr_with_block)
+    return ["stmt", "(ex " + e + ")"]
+}
+fn stmt_end(st, pc) { return is_p(st, pc, ";") || is_p(st, pc, "}") }
+fn is_compound(st, pc) {
+    if pk(st, pc) != "punct" { return false }
+    let t = ptext(st, pc)
+    return t == "+=" || t == "-=" || t == "*=" || t == "/=" || t == "%=" || t == "&=" || t == "|=" || t == "^=" || t == "<<=" || t == ">>="
+}
+fn assign_form(lhs, rhs) {
+    let ha = head_and_args(lhs)
+    let h = ha[0]
+    let a = ha[1]
+    if h == "v" { return "(set " + a[0] + " " + rhs + ")" }
+    if h == "idx" { return "(iset " + a[0] + " " + a[1] + " " + rhs + ")" }
+    if h == "fld" { return "(fset " + a[0] + " " + a[1] + " " + rhs + ")" }
+    return "(set " + lhs + " " + rhs + ")"
+}
+
+fn parse_if_stmt(st, pc) {
+    adv(st, pc) // if
+    let c = parse_cond(st, pc)
+    let then = parse_block_do(st, pc)
+    if is_kw(st, pc, "else") {
+        adv(st, pc)
+        if is_kw(st, pc, "if") { let nested = parse_if_stmt(st, pc); return "(if " + c + " " + then + " (do " + nested + "))" }
+        let els = parse_block_do(st, pc)
+        return "(if " + c + " " + then + " " + els + ")"
+    }
+    return "(if " + c + " " + then + ")"
+}
+fn parse_for_stmt(st, pc) {
+    adv(st, pc) // for
+    let var = ptext(st, pc); adv(st, pc)
+    if word_is(st, pc, "in") { adv(st, pc) }
+    let start = parse_or(st, pc)
+    if is_p(st, pc, "..") || is_p(st, pc, "..=") {
+        let incl = if is_p(st, pc, "..=") { "ie" } else { "in" }
+        adv(st, pc)
+        let end = parse_or(st, pc)
+        let b = parse_block_do(st, pc)
+        return "(for " + var + " " + start + " " + end + " " + incl + " " + b + ")"
+    }
+    let b = parse_block_do(st, pc)
+    return "(foreach " + var + " " + start + " " + b + ")"
+}
+fn parse_try(st, pc) {
+    adv(st, pc) // try
+    let body = parse_block_do(st, pc)
+    let mut cat = ""
+    if pk(st, pc) == "ident" && ptext(st, pc) == "catch" {
+        adv(st, pc)
+        let mut v = "-"
+        if pk(st, pc) == "ident" { v = ptext(st, pc); adv(st, pc) }
+        let cb = parse_block_do(st, pc)
+        cat = " (catch " + v + " " + cb + ")"
+    }
+    let mut fin = ""
+    if pk(st, pc) == "ident" && ptext(st, pc) == "finally" { adv(st, pc); let fb = parse_block_do(st, pc); fin = " (finally " + fb + ")" }
+    return "(try " + body + cat + fin + ")"
+}
+
+// cond = ns_assign_expr (no struct literals). We reuse the same expr parser but
+// forbid struct literals via a flag stored in pc[1].
+fn parse_cond(st, pc) {
+    set_nostruct(pc, 1)
+    let e = parse_expr(st, pc)
+    set_nostruct(pc, 0)
+    return e
+}
+fn set_nostruct(pc, v) { if len(pc) < 2 { push(pc, v) } else { pc[1] = v } }
+fn nostruct(pc) { if len(pc) < 2 { return 0 } return pc[1] }
+fn next_hyg(pc) { while len(pc) < 3 { push(pc, 0) } let n = pc[2]; pc[2] = n + 1; return n }
+
+// ===== expression tower =====================================================
+fn parse_expr(st, pc) { if nostruct(pc) == 0 { return parse_stream(st, pc) } return parse_pipeline(st, pc) }
+fn parse_stream(st, pc) {
+    let mut l = parse_pipeline(st, pc)
+    while is_p(st, pc, "<-") || is_p(st, pc, "->>") {
+        let op = ptext(st, pc); adv(st, pc)
+        let r = parse_pipeline(st, pc)
+        if op == "<-" { l = "(sendc " + l + " " + r + ")" }
+        else {
+            let n = next_hyg(pc)
+            let sink = "__strm_sink_" + str(n)
+            let x = "__strm_x_" + str(n)
+            l = "(block (do (let " + sink + " - " + r + ") (foreach " + x + " " + l + " (do (ex (sendc (v " + sink + ") (v " + x + ")))))) (v " + sink + "))"
+        }
+    }
+    return l
+}
+fn parse_pipeline(st, pc) {
+    let mut acc = parse_ternary(st, pc)
+    while is_p(st, pc, "|>") {
+        adv(st, pc)
+        let staged = parse_ternary(st, pc)
+        acc = pipe_apply(staged, acc)
+    }
+    return acc
+}
+fn pipe_apply(staged, acc) {
+    let ha = head_and_args(staged)
+    let h = ha[0]
+    let a = ha[1]
+    if h == "c" {
+        let mut parts = []
+        let mut i = 1
+        while i < len(a) + 1 { i = i + 1 }
+        // rebuild: (c name args... acc)
+        let mut out = "(c " + a[0]
+        let mut j = 1
+        while j < len(a) { out = out + " " + a[j]; j = j + 1 }
+        return out + " " + acc + ")"
+    }
+    if h == "m" {
+        let mut out = "(m " + a[0] + " " + a[1]
+        let mut j = 2
+        while j < len(a) { out = out + " " + a[j]; j = j + 1 }
+        return out + " " + acc + ")"
+    }
+    if h == "v" { return "(c " + a[0] + " " + acc + ")" }
+    return "(cv " + staged + " " + acc + ")"
+}
+fn parse_ternary(st, pc) {
+    let mut acc = parse_range(st, pc)
+    while is_p(st, pc, "??") {
+        adv(st, pc)
+        let rhs = parse_range(st, pc)
+        acc = "(ife (!= " + acc + " (null)) " + acc + " " + rhs + ")"
+    }
+    return acc
+}
+fn parse_range(st, pc) {
+    // range_expr = or_expr ((..|..=) or_expr?)? | (..|..=) or_expr?
+    if is_p(st, pc, "..") || is_p(st, pc, "..=") {
+        let incl = if is_p(st, pc, "..=") { "ie" } else { "ex" }
+        adv(st, pc)
+        let hi = if range_stop(st, pc) { "-" } else { parse_or(st, pc) }
+        return "(range - " + hi + " " + incl + ")"
+    }
+    let lo = parse_or(st, pc)
+    if is_p(st, pc, "..") || is_p(st, pc, "..=") {
+        let incl = if is_p(st, pc, "..=") { "ie" } else { "ex" }
+        adv(st, pc)
+        let hi = if range_stop(st, pc) { "-" } else { parse_or(st, pc) }
+        return "(range " + lo + " " + hi + " " + incl + ")"
+    }
+    return lo
+}
+fn range_stop(st, pc) {
+    return is_p(st, pc, "]") || is_p(st, pc, ")") || is_p(st, pc, "}") || is_p(st, pc, ",") || is_p(st, pc, ";") || is_p(st, pc, "{")
+}
+fn parse_or(st, pc) { let mut l = parse_and(st, pc); while is_p(st, pc, "||") { adv(st, pc); let r = parse_and(st, pc); l = "(|| " + l + " " + r + ")" } return l }
+fn parse_and(st, pc) { let mut l = parse_eq(st, pc); while is_p(st, pc, "&&") { adv(st, pc); let r = parse_eq(st, pc); l = "(&& " + l + " " + r + ")" } return l }
+fn eq_head(op) { if op == "===" { return "==" } if op == "!==" { return "!=" } return op }
+fn parse_eq(st, pc) {
+    let mut l = parse_rel(st, pc)
+    while is_p(st, pc, "==") || is_p(st, pc, "!=") || is_p(st, pc, "===") || is_p(st, pc, "!==") {
+        let op = ptext(st, pc); adv(st, pc)
+        let h = eq_head(op)
+        let r = parse_rel(st, pc)
+        l = "(" + h + " " + l + " " + r + ")"
+    }
+    return l
+}
+fn parse_rel(st, pc) {
+    let mut l = parse_bitor(st, pc)
+    while is_p(st, pc, "<") || is_p(st, pc, "<=") || is_p(st, pc, ">") || is_p(st, pc, ">=") || word_is(st, pc, "in") {
+        let op = if word_is(st, pc, "in") { "in" } else { ptext(st, pc) }
+        adv(st, pc)
+        let r = parse_bitor(st, pc)
+        l = "(" + op + " " + l + " " + r + ")"
+    }
+    return l
+}
+fn parse_bitor(st, pc) { let mut l = parse_bitxor(st, pc); while is_p(st, pc, "|") { adv(st, pc); let r = parse_bitxor(st, pc); l = "(bor " + l + " " + r + ")" } return l }
+fn parse_bitxor(st, pc) { let mut l = parse_bitand(st, pc); while is_p(st, pc, "^") { adv(st, pc); let r = parse_bitand(st, pc); l = "(bxor " + l + " " + r + ")" } return l }
+fn parse_bitand(st, pc) { let mut l = parse_shift(st, pc); while is_p(st, pc, "&") { adv(st, pc); let r = parse_shift(st, pc); l = "(band " + l + " " + r + ")" } return l }
+fn parse_shift(st, pc) {
+    let mut l = parse_add(st, pc)
+    while is_p(st, pc, "<<") || is_p(st, pc, ">>") {
+        let h = if is_p(st, pc, "<<") { "shl" } else { "shr" }
+        adv(st, pc); let r = parse_add(st, pc); l = "(" + h + " " + l + " " + r + ")"
+    }
+    return l
+}
+fn parse_add(st, pc) { let mut l = parse_mul(st, pc); while is_p(st, pc, "+") || is_p(st, pc, "-") { let op = ptext(st, pc); adv(st, pc); let r = parse_mul(st, pc); l = "(" + op + " " + l + " " + r + ")" } return l }
+fn parse_mul(st, pc) { let mut l = parse_cast(st, pc); while is_p(st, pc, "*") || is_p(st, pc, "/") || is_p(st, pc, "%") { let op = ptext(st, pc); adv(st, pc); let r = parse_cast(st, pc); l = "(" + op + " " + l + " " + r + ")" } return l }
+fn parse_cast(st, pc) {
+    let mut e = parse_pow(st, pc)
+    while is_kw(st, pc, "as") {
+        adv(st, pc)
+        let ty = parse_type_head(st, pc)
+        let callee = cast_callee(ty)
+        if callee != "" { e = "(c " + callee + " " + e + ")" }
+    }
+    return e
+}
+fn cast_callee(ty) {
+    if ty == "Int" || ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" { return "int" }
+    if ty == "Float" || ty == "f32" || ty == "f64" { return "float" }
+    if ty == "Str" || ty == "String" { return "str" }
+    return ""
+}
+fn parse_pow(st, pc) {
+    let l = parse_unary(st, pc)
+    if is_p(st, pc, "**") { adv(st, pc); let r = parse_pow(st, pc); return "(** " + l + " " + r + ")" }
+    return l
+}
+// unary_expr = prefix_op* primary ; postfix binds tighter (applied to primary first)
+fn parse_unary(st, pc) {
+    let mut ops = []
+    while true {
+        if is_p(st, pc, "-") { push(ops, "-"); adv(st, pc) }
+        else if is_p(st, pc, "!") { push(ops, "!"); adv(st, pc) }
+        else if is_p(st, pc, "~") { push(ops, "~"); adv(st, pc) }
+        else if is_p(st, pc, "+") { push(ops, "+"); adv(st, pc) }
+        else if is_kw(st, pc, "await") { push(ops, "await"); adv(st, pc) }
+        else { break }
+    }
+    let base = parse_postfix(st, pc)
+    // apply prefix ops in reverse
+    let mut e = base
+    let mut i = len(ops) - 1
+    while i >= 0 {
+        let op = ops[i]
+        if op == "await" { e = "(await " + e + ")" }
+        else if op == "-" { e = "(neg " + e + ")" }
+        else if op == "!" { e = "(not " + e + ")" }
+        else if op == "~" { e = "(bnot " + e + ")" }
+        // "+" is a no-op
+        i = i - 1
+    }
+    return e
+}
+fn parse_postfix(st, pc) {
+    let mut e = parse_primary(st, pc)
+    let mut go = true
+    while go {
+        if is_p(st, pc, "(") {
+            let a = parse_args(st, pc)
+            e = call_form(e, a)
+        } else if is_p(st, pc, "[") {
+            adv(st, pc)
+            let saved = nostruct(pc); set_nostruct(pc, 0)
+            let idx = parse_expr(st, pc)
+            set_nostruct(pc, saved)
+            expect_p(st, pc, "]")
+            e = "(idx " + e + " " + idx + ")"
+        } else if is_p(st, pc, ".") && (pk2(st, pc) == "ident" || pk2(st, pc) == "int" || (pk2(st, pc) == "kw" && (ptext2(st, pc) == "await"))) {
+            adv(st, pc)
+            if is_kw(st, pc, "await") { adv(st, pc); e = "(await " + e + ")"; }
+            else {
+                let name = ptext(st, pc); adv(st, pc)
+                if is_p(st, pc, "(") { let a = parse_args(st, pc); e = method_form(e, name, a) }
+                else { e = "(fld " + e + " " + name + ")" }
+            }
+        } else if is_p(st, pc, "?") && pk2(st, pc) == "punct" && ptext2(st, pc) == "." {
+            adv(st, pc); adv(st, pc)
+            let name = ptext(st, pc); adv(st, pc)
+            e = "(sfld " + e + " " + name + ")"
+        } else { go = false }
+    }
+    return e
+}
+// call on ident -> (c name ...); on module.field -> (c module.field ...); else (cv ...)
+fn call_form(e, argstr) {
+    let ha = head_and_args(e)
+    if ha[0] == "v" { return "(c " + ha[1][0] + argstr + ")" }
+    return "(cv " + e + argstr + ")"
+}
+fn method_form(base, name, argstr) {
+    // module.method(...) where base is (v module) and module is a stdlib module -> (c module.name ...)
+    let ha = head_and_args(base)
+    if ha[0] == "v" {
+        let mods = modules()
+        if map_has(mods, ha[1][0]) { return "(c " + ha[1][0] + "." + name + argstr + ")" }
+    }
+    return "(m " + base + " " + name + argstr + ")"
+}
+// parse "( args )" -> " a1 a2" (arg = ident: expr | expr; named part dropped)
+fn parse_args(st, pc) {
+    expect_p(st, pc, "(")
+    let saved = nostruct(pc); set_nostruct(pc, 0)
+    let mut out = ""
+    while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+        // named arg: ident ":" — skip the name
+        if pk(st, pc) == "ident" && pk2(st, pc) == "punct" && ptext2(st, pc) == ":" { adv(st, pc); adv(st, pc) }
+        let a = parse_expr(st, pc)
+        out = out + " " + a
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, ")")
+    set_nostruct(pc, saved)
+    return out
+}
+
+// ===== primary ==============================================================
+fn paren_is_lambda(st, pc) {
+    let ks = st[0]; let ts = st[1]
+    let mut i = pc[0]
+    let mut depth = 0
+    let mut go = true
+    while i < len(ks) && go {
+        if ks[i] == "punct" && ts[i] == "(" { depth = depth + 1 }
+        else if ks[i] == "punct" && ts[i] == ")" { depth = depth - 1; if depth == 0 { go = false } }
+        i = i + 1
+    }
+    return i < len(ks) && ks[i] == "punct" && ts[i] == "=>"
+}
+fn parse_lam_params_paren(st, pc) {
+    expect_p(st, pc, "(")
+    let mut names = []
+    while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+        if is_kw(st, pc, "mut") { adv(st, pc) }
+        if pk(st, pc) == "ident" && ptext(st, pc) == "ref" { adv(st, pc) }
+        push(names, ptext(st, pc)); adv(st, pc)
+        if is_p(st, pc, ":") { adv(st, pc); parse_type_head(st, pc) }
+        if is_p(st, pc, "=") { adv(st, pc); parse_expr(st, pc) }
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, ")")
+    return names
+}
+fn lambda_body(st, pc, names) {
+    if is_p(st, pc, "{") {
+        let b = parse_block_raw(st, pc)
+        return "(lam (" + join(names, " ") + ") (bb " + finish_fn_block(b) + "))"
+    }
+    let e = parse_expr(st, pc)
+    return "(lam (" + join(names, " ") + ") (bx " + e + "))"
+}
+fn parse_primary(st, pc) {
+    let k = pk(st, pc)
+    let t = ptext(st, pc)
+    // lambdas (disallowed in no-struct / condition context, per ns_primary_expr)
+    if nostruct(pc) == 0 {
+        if k == "ident" && ptext2(st, pc) == "=>" && pk2(st, pc) == "punct" { adv(st, pc); adv(st, pc); return lambda_body(st, pc, [t]) }
+        if is_p(st, pc, "(") && paren_is_lambda(st, pc) { let names = parse_lam_params_paren(st, pc); expect_p(st, pc, "=>"); return lambda_body(st, pc, names) }
+        if is_p(st, pc, "|") { adv(st, pc); let mut names = []; while !is_p(st, pc, "|") && pk(st, pc) != "eof" { if is_kw(st, pc, "mut") { adv(st, pc) } push(names, ptext(st, pc)); adv(st, pc); if is_p(st, pc, ":") { adv(st, pc); parse_type_head(st, pc) } if is_p(st, pc, ",") { adv(st, pc) } } expect_p(st, pc, "|"); expect_p(st, pc, "=>"); return lambda_body(st, pc, names) }
+    }
+    if k == "int" {
+        adv(st, pc)
+        let cleaned = replace(t, "_", "")
+        if !starts_with(cleaned, "0x") && !starts_with(cleaned, "0b") && !starts_with(cleaned, "0o") {
+            let dc = strip_int_suffix(cleaned)
+            if is_big(dc) { return "(bigint " + dc + ")" }
+        }
+        return "(i " + parse_int_value(t) + ")"
+    }
+    if k == "float" { adv(st, pc); return "(f " + float_repr(t) + ")" }
+    if k == "str" { adv(st, pc); return "(s " + t + ")" }
+    if k == "fstr" { adv(st, pc); return parse_fstr(t) }
+    if k == "kw" {
+        if t == "true" { adv(st, pc); return "(b true)" }
+        if t == "false" { adv(st, pc); return "(b false)" }
+        if t == "null" { adv(st, pc); return "(null)" }
+        if t == "self" { adv(st, pc); return primary_path(st, pc, "(v self)") }
+        if t == "spawn" { return parse_spawn(st, pc) }
+        if t == "await" { adv(st, pc); let e = parse_unary(st, pc); return "(await " + e + ")" }
+        if t == "match" { return parse_match(st, pc) }
+        if t == "if" { return parse_if_expr(st, pc) }
+        if t == "select" { return parse_select(st, pc) }
+    }
+    if k == "ident" {
+        if t == "match" { return parse_match(st, pc) }
+        adv(st, pc)
+        // macro call: name ! ( ... )
+        if is_p(st, pc, "!") && (ptext2(st, pc) == "(" || ptext2(st, pc) == "{" || ptext2(st, pc) == "[") { return expand_macro(st, pc, t) }
+        // struct literal: Ident "{" ... "}" (only when struct-literals allowed)
+        if is_p(st, pc, "{") && nostruct(pc) == 0 && starts_upper(t) { return parse_struct_lit(st, pc, t) }
+        return primary_path(st, pc, "(v " + t + ")")
+    }
+    // map literal #{ ... }
+    if is_p(st, pc, "#") && pk2(st, pc) == "punct" && ptext2(st, pc) == "{" { return parse_map(st, pc) }
+    if is_p(st, pc, "#") && pk2(st, pc) == "punct" && ptext2(st, pc) == "(" { return parse_set(st, pc) }
+    // grouped / tuple
+    if is_p(st, pc, "(") {
+        adv(st, pc)
+        let saved = nostruct(pc); set_nostruct(pc, 0)
+        let first = parse_expr(st, pc)
+        // tuple: (e, e, ...) -> lowering keeps first element
+        while is_p(st, pc, ",") { adv(st, pc); if is_p(st, pc, ")") { break } parse_expr(st, pc) }
+        set_nostruct(pc, saved)
+        expect_p(st, pc, ")")
+        return first
+    }
+    // array / comprehension
+    if is_p(st, pc, "[") { return parse_array(st, pc) }
+    // block expr
+    if is_p(st, pc, "{") { return parse_block_expr(st, pc) }
+    // flow as expr shouldn't reach here in Nova Core
+    // unknown
+    adv(st, pc)
+    return "(null)"
+}
+fn starts_upper(t) { if len(t) == 0 { return false } let o = ord(substring(t, 0, 1)); return o >= 65 && o <= 90 }
+// after an ident/self primary, a dotted path a.b.c becomes nested fields — but the
+// postfix loop already handles ".field", so primary_path just returns base.
+fn primary_path(st, pc, base) { return base }
+
+fn parse_struct_lit(st, pc, name) {
+    adv(st, pc) // {
+    let mut fields = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        if is_p(st, pc, "..") { adv(st, pc); parse_expr(st, pc); if is_p(st, pc, ",") { adv(st, pc) } continue }
+        let fname = ptext(st, pc); adv(st, pc)
+        let mut fe = "(v " + fname + ")"
+        if is_p(st, pc, ":") { adv(st, pc); fe = parse_expr(st, pc) }
+        push(fields, "(" + fname + " " + fe + ")")
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(slit " + name + " (" + join(fields, " ") + "))"
+}
+fn parse_map(st, pc) {
+    adv(st, pc); adv(st, pc) // # {
+    let mut ps = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        let saved = nostruct(pc); set_nostruct(pc, 0)
+        let kk = parse_expr(st, pc)
+        expect_p(st, pc, ":")
+        let vv = parse_expr(st, pc)
+        set_nostruct(pc, saved)
+        push(ps, "(kv " + kk + " " + vv + ")")
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(map " + join(ps, " ") + ")"
+}
+fn parse_set(st, pc) {
+    adv(st, pc); adv(st, pc) // # (
+    let mut es = []
+    while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+        let saved = nostruct(pc); set_nostruct(pc, 0)
+        push(es, parse_expr(st, pc))
+        set_nostruct(pc, saved)
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, ")")
+    return "(set " + join(es, " ") + ")"
+}
+fn parse_array(st, pc) {
+    adv(st, pc) // [
+    let saved = nostruct(pc); set_nostruct(pc, 0)
+    if is_p(st, pc, "]") { adv(st, pc); set_nostruct(pc, saved); return "(arr)" }
+    let first = parse_expr(st, pc)
+    // fill form [v; n]
+    if is_p(st, pc, ";") { adv(st, pc); let cnt = parse_expr(st, pc); expect_p(st, pc, "]"); set_nostruct(pc, saved); return "(c array_fill " + first + " " + cnt + ")" }
+    // comprehension [ expr (for pat in expr | if expr)+ ]
+    if is_kw(st, pc, "for") { let r = parse_comp(st, pc, first); set_nostruct(pc, saved); return r }
+    let mut elems = [first]
+    while is_p(st, pc, ",") { adv(st, pc); if is_p(st, pc, "]") { break } push(elems, parse_expr(st, pc)) }
+    expect_p(st, pc, "]")
+    set_nostruct(pc, saved)
+    return "(arr " + join(elems, " ") + ")"
+}
+fn parse_comp(st, pc, body) {
+    // first clause: for pat in expr ; then optional if expr (only first for+if kept in ast)
+    adv(st, pc) // for
+    let var = ptext(st, pc); adv(st, pc)
+    if word_is(st, pc, "in") { adv(st, pc) }
+    let iter = parse_expr(st, pc)
+    let mut cond = "-"
+    if is_kw(st, pc, "if") { adv(st, pc); cond = parse_expr(st, pc) }
+    // consume any extra clauses
+    while is_kw(st, pc, "for") || is_kw(st, pc, "if") { adv(st, pc); if !is_p(st, pc, "]") { parse_expr(st, pc) } }
+    expect_p(st, pc, "]")
+    return "(comp " + body + " " + var + " " + iter + " " + cond + ")"
+}
+fn parse_block_expr(st, pc) {
+    let b = parse_block_raw(st, pc)
+    let stmts = b[0]
+    let tail = b[1]
+    let t = if tail == "" { "-" } else { tail }
+    return "(block " + do_block(stmts) + " " + t + ")"
+}
+fn parse_spawn(st, pc) {
+    adv(st, pc) // spawn
+    let b = parse_block_raw(st, pc)
+    return "(spawn " + finish_fn_block(b) + ")"
+}
+fn parse_if_expr(st, pc) {
+    adv(st, pc) // if
+    let c = parse_cond(st, pc)
+    let then = parse_block_expr_value(st, pc)
+    adv_else(st, pc)
+    let els = if is_kw(st, pc, "if") { parse_if_expr(st, pc) } else { parse_block_expr_value(st, pc) }
+    return "(ife " + c + " " + then + " " + els + ")"
+}
+fn adv_else(st, pc) { if is_kw(st, pc, "else") { adv(st, pc) } }
+// if-expression branches are blocks whose value is the trailing expr
+fn parse_block_expr_value(st, pc) {
+    let b = parse_block_raw(st, pc)
+    let stmts = b[0]
+    let tail = b[1]
+    let t = if tail == "" { "-" } else { tail }
+    return "(block " + do_block(stmts) + " " + t + ")"
+}
+fn parse_select(st, pc) {
+    adv(st, pc) // select
+    expect_p(st, pc, "{")
+    let mut arms = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        if pk(st, pc) == "ident" && ptext(st, pc) == "chan" { adv(st, pc) }
+        let ch = read_path_expr(st, pc)
+        expect_p(st, pc, "=>")
+        let body = parse_expr(st, pc)
+        push(arms, "(sarm " + ch + " - " + body + ")")
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(select " + join(arms, " ") + ")"
+}
+// a dotted expr_path as a value: a.b.c -> nested fields
+fn read_path_expr(st, pc) {
+    let mut e = "(v " + ptext(st, pc) + ")"
+    adv(st, pc)
+    while is_p(st, pc, ".") { adv(st, pc); let f = ptext(st, pc); adv(st, pc); e = "(fld " + e + " " + f + ")" }
+    return e
+}
+fn parse_match(st, pc) {
+    adv(st, pc) // match
+    let scrut = parse_cond(st, pc)
+    expect_p(st, pc, "{")
+    let mut arms = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        let pat = parse_pattern(st, pc)
+        let mut guard = "-"
+        if is_kw(st, pc, "if") { adv(st, pc); guard = parse_cond(st, pc) }
+        expect_p(st, pc, "=>")
+        let body = parse_expr(st, pc)
+        push(arms, "(arm " + pat + " " + guard + " " + body + ")")
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(match " + scrut + " " + join(arms, " ") + ")"
+}
+
+// ===== patterns =============================================================
+fn parse_pattern(st, pc) {
+    let mut alts = [parse_pattern_range(st, pc)]
+    while is_p(st, pc, "|") { adv(st, pc); push(alts, parse_pattern_range(st, pc)) }
+    if len(alts) == 1 { return alts[0] }
+    return "(por " + join(alts, " ") + ")"
+}
+fn parse_pattern_range(st, pc) {
+    let a = parse_pattern_atom(st, pc)
+    if is_p(st, pc, "..") || is_p(st, pc, "..=") {
+        let incl = if is_p(st, pc, "..=") { "ie" } else { "ex" }
+        adv(st, pc)
+        let b = parse_pattern_atom(st, pc)
+        // pattern range uses literal ints
+        let lo = pat_int(a)
+        let hi = pat_int(b)
+        return "(prange " + lo + " " + hi + " " + incl + ")"
+    }
+    return a
+}
+fn pat_int(p) { let ha = head_and_args(p); if ha[0] == "pi" { return ha[1][0] } return "0" }
+fn parse_pattern_atom(st, pc) {
+    if is_p(st, pc, "_") { adv(st, pc); return "(pany)" }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "_" { adv(st, pc); return "(pany)" }
+    // negative literal
+    if is_p(st, pc, "-") { adv(st, pc); let t = ptext(st, pc); adv(st, pc); return "(pi -" + parse_int_value(t) + ")" }
+    let k = pk(st, pc)
+    let t = ptext(st, pc)
+    if k == "int" { adv(st, pc); return "(pi " + parse_int_value(t) + ")" }
+    if k == "float" { adv(st, pc); return "(pf " + float_repr(t) + ")" }
+    if k == "str" { adv(st, pc); return "(ps " + t + ")" }
+    if k == "kw" && t == "true" { adv(st, pc); return "(pb true)" }
+    if k == "kw" && t == "false" { adv(st, pc); return "(pb false)" }
+    if k == "kw" && t == "null" { adv(st, pc); return "(pnull)" }
+    // tuple pattern
+    if is_p(st, pc, "(") {
+        adv(st, pc)
+        let mut ps = []
+        while !is_p(st, pc, ")") && pk(st, pc) != "eof" { push(ps, parse_pattern(st, pc)); if is_p(st, pc, ",") { adv(st, pc) } }
+        expect_p(st, pc, ")")
+        return "(ptuple " + join(ps, " ") + ")"
+    }
+    // slice pattern
+    if is_p(st, pc, "[") {
+        adv(st, pc)
+        let mut pre = []
+        let mut suf = []
+        let mut rest = "-"
+        let mut seen_rest = false
+        while !is_p(st, pc, "]") && pk(st, pc) != "eof" {
+            if is_p(st, pc, "...") { adv(st, pc); let mut nm = ""; if pk(st, pc) == "ident" { nm = ptext(st, pc); adv(st, pc) } rest = if nm == "" { "(rest)" } else { "(rest " + nm + ")" } seen_rest = true }
+            else { let p = parse_pattern(st, pc); if seen_rest { push(suf, p) } else { push(pre, p) } }
+            if is_p(st, pc, ",") { adv(st, pc) }
+        }
+        expect_p(st, pc, "]")
+        return "(pslice (" + join(pre, " ") + ") " + rest + " (" + join(suf, " ") + "))"
+    }
+    // ident-led: binding, enum, or struct pattern
+    if k == "ident" || (k == "kw" && t == "self") {
+        adv(st, pc)
+        if is_p(st, pc, "(") {
+            adv(st, pc)
+            let mut subs = []
+            while !is_p(st, pc, ")") && pk(st, pc) != "eof" { push(subs, parse_pattern(st, pc)); if is_p(st, pc, ",") { adv(st, pc) } }
+            expect_p(st, pc, ")")
+            return "(penum " + t + " " + join(subs, " ") + ")"
+        }
+        if is_p(st, pc, "{") {
+            adv(st, pc)
+            let mut fs = []
+            while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+                if is_p(st, pc, "...") { adv(st, pc); if is_p(st, pc, ",") { adv(st, pc) } continue }
+                let fn2 = ptext(st, pc); adv(st, pc)
+                let mut fp = "(pbind " + fn2 + ")"
+                if is_p(st, pc, ":") { adv(st, pc); fp = parse_pattern(st, pc) }
+                push(fs, "(" + fn2 + " " + fp + ")")
+                if is_p(st, pc, ",") { adv(st, pc) }
+            }
+            expect_p(st, pc, "}")
+            return "(pstruct " + t + " (" + join(fs, " ") + "))"
+        }
+        // binding with @ subpattern
+        if is_p(st, pc, "@") { adv(st, pc); parse_pattern(st, pc) }
+        if starts_upper(t) { return "(penum " + t + ")" }
+        return "(pbind " + t + ")"
+    }
+    adv(st, pc)
+    return "(pany)"
+}
+
+// ===== f-strings ============================================================
+// token text is like  f"lit{expr}lit"  ; produce (fstr (lit "..") (hole EXPR) ..)
+fn parse_fstr(t) {
+    // strip f" ... "
+    let body = substring(t, 2, len(t) - 1)
+    let n = len(body)
+    let mut parts = []
+    let mut lit = ""
+    let mut i = 0
+    while i < n {
+        let c = substring(body, i, i + 1)
+        let c2 = if i + 1 < n { substring(body, i + 1, i + 2) } else { "" }
+        if c == "{" && c2 == "{" { lit = lit + "{"; i = i + 2; continue }
+        if c == "}" && c2 == "}" { lit = lit + "}"; i = i + 2; continue }
+        if c == "{" {
+            if lit != "" { push(parts, "(lit " + quote(lit) + ")"); lit = "" }
+            // collect until matching }
+            let mut depth = 1
+            let mut ex = ""
+            i = i + 1
+            while i < n && depth > 0 {
+                let d = substring(body, i, i + 1)
+                if d == "{" { depth = depth + 1 }
+                else if d == "}" { depth = depth - 1; if depth == 0 { i = i + 1; break } }
+                ex = ex + d
+                i = i + 1
+            }
+            // strip a format spec after a top-level ':'
+            let ex2 = strip_fmt_spec(ex)
+            let sub = tokenize(ex2)
+            let spc = [0]
+            let e = parse_expr(sub, spc)
+            push(parts, "(hole " + e + ")")
+            continue
+        }
+        lit = lit + c
+        i = i + 1
+    }
+    if lit != "" { push(parts, "(lit " + quote(lit) + ")") }
+    return "(fstr " + join(parts, " ") + ")"
+}
+fn strip_fmt_spec(ex) {
+    // remove a trailing ":spec" at paren/bracket depth 0
+    let n = len(ex)
+    let mut depth = 0
+    let mut i = 0
+    while i < n {
+        let c = substring(ex, i, i + 1)
+        if c == "(" || c == "[" || c == "{" { depth = depth + 1 }
+        else if c == ")" || c == "]" || c == "}" { depth = depth - 1 }
+        else if c == ":" && depth == 0 { return substring(ex, 0, i) }
+        i = i + 1
+    }
+    return ex
+}
+fn float_repr(t) {
+    // strip f32/f64 suffix and underscores; Nova str(float) matches Rust Display
+    let mut s = t
+    if len(s) >= 3 {
+        let suf = substring(s, len(s) - 3, len(s))
+        if suf == "f32" || suf == "f64" { s = substring(s, 0, len(s) - 3) }
+    }
+    return str(float(replace(s, "_", "")))
+}
+
+// ===== remaining items ======================================================
+// token joiner reproducing canonical source spacing for macro bodies/args
+fn macro_join(toks) {
+    let mut out = ""
+    let mut i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        let mut sb = true
+        if i == 0 { sb = false }
+        else if toks[i - 1] == "$" { sb = false }
+        else if t == ";" || t == "," { sb = false }
+        else if toks[i - 1] == "(" || toks[i - 1] == "[" { sb = false }
+        else if t == ")" || t == "]" { sb = false }
+        if sb { out = out + " " }
+        out = out + t
+        i = i + 1
+    }
+    return out
+}
+// collect a balanced-delimited run of token texts (excludes the outer delimiters)
+fn collect_balanced(st, pc, open, close) {
+    expect_p(st, pc, open)
+    let mut toks = []
+    let mut depth = 1
+    while depth > 0 && pk(st, pc) != "eof" {
+        if is_p(st, pc, open) { depth = depth + 1 }
+        else if is_p(st, pc, close) { depth = depth - 1; if depth == 0 { adv(st, pc); break } }
+        push(toks, ptext(st, pc)); adv(st, pc)
+    }
+    return toks
+}
+fn parse_macro(st, pc) {
+    adv(st, pc) // macro
+    let name = ptext(st, pc); adv(st, pc)
+    expect_p(st, pc, "{")
+    // first macro_rule: matcher => body  (subsequent rules ignored, like the ref)
+    let mtoks = collect_balanced(st, pc, "(", ")")
+    // params: $ident placeholders in order
+    let mut params = []
+    let mut i = 0
+    while i < len(mtoks) { if mtoks[i] == "$" && i + 1 < len(mtoks) { push(params, mtoks[i + 1]) } i = i + 1 }
+    expect_p(st, pc, "=>")
+    let mut btoks = []
+    if is_p(st, pc, "{") { btoks = collect_balanced(st, pc, "{", "}") }
+    else { btoks = collect_balanced(st, pc, "(", ")") }
+    let body = macro_join(btoks)
+    // consume remaining rules + closing brace of the macro decl
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" { adv(st, pc) }
+    expect_p(st, pc, "}")
+    let tbl = st[2]
+    map_set(tbl, name, [params, body])
+    return "(macro " + name + " (" + join(params, " ") + ") " + quote(body) + ")"
+}
+// expand `name! ( args )` -> canonical expression string
+fn expand_macro(st, pc, name) {
+    adv(st, pc) // !
+    let mut argtoks = []
+    if is_p(st, pc, "(") { argtoks = collect_balanced(st, pc, "(", ")") }
+    else if is_p(st, pc, "{") { argtoks = collect_balanced(st, pc, "{", "}") }
+    else { argtoks = collect_balanced(st, pc, "[", "]") }
+    let args = split_macro_args(argtoks)
+    let tbl = st[2]
+    let def = map_get(tbl, name)
+    let params = def[0]
+    let body = def[1]
+    // hygiene: rename the body's own let-bindings to name_hygN
+    let bt = tokenize(body)
+    let btk = bt[0]
+    let btx = bt[1]
+    let mut locals = []
+    let mut i = 0
+    while i < len(btx) {
+        if btx[i] == "let" {
+            let mut m = i + 1
+            if m < len(btx) && btx[m] == "mut" { m = m + 1 }
+            if m < len(btx) { let nm = btx[m]; if !contains_elem(params, nm) && !contains_elem(locals, nm) { push(locals, nm) } }
+        }
+        i = i + 1
+    }
+    let mut ren = -1
+    if len(locals) > 0 { ren = next_hyg(pc) }
+    // build the expanded source: substitute $param -> (arg), rename locals
+    let mut expanded = ""
+    i = 0
+    while i < len(btx) {
+        if btx[i] == "$" && i + 1 < len(btx) {
+            let pnm = btx[i + 1]
+            let idx = index_of_str(params, pnm)
+            if idx >= 0 { expanded = expanded + " (" + args[idx] + ")"; i = i + 2; continue }
+        }
+        let mut tok = btx[i]
+        if ren >= 0 && contains_elem(locals, tok) { tok = tok + "_hyg" + str(ren) }
+        expanded = expanded + " " + tok
+        i = i + 1
+    }
+    return parse_expanded(st, expanded)
+}
+fn split_macro_args(toks) {
+    let mut out = []
+    let mut cur = []
+    let mut depth = 0
+    let mut i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if t == "(" || t == "[" || t == "{" { depth = depth + 1; push(cur, t) }
+        else if t == ")" || t == "]" || t == "}" { depth = depth - 1; push(cur, t) }
+        else if t == "," && depth == 0 { push(out, macro_join(cur)); cur = [] }
+        else { push(cur, t) }
+        i = i + 1
+    }
+    if len(cur) > 0 { push(out, macro_join(cur)) }
+    return out
+}
+fn index_of_str(xs, s) { let mut i = 0; while i < len(xs) { if xs[i] == s { return i } i = i + 1 } return -1 }
+// parse an expanded macro body string as a canonical expression
+fn parse_expanded(st, expanded) {
+    let wrapped = "fn __m__() { " + expanded + " }"
+    let sub = tokenize(wrapped)
+    push(sub, st[2])
+    let spc = [0]
+    let fnstr = parse_top(sub, spc)
+    let fha = head_and_args(fnstr)
+    let fa = fha[1]
+    let doblk = fa[len(fa) - 1]     // (do ...)
+    let dha = head_and_args(doblk)
+    let stmts = dha[1]
+    if len(stmts) == 0 { return "(null)" }
+    let last = stmts[len(stmts) - 1]
+    let lh = head_and_args(last)
+    let e = if lh[0] == "ret" { lh[1][0] } else { last }
+    if len(stmts) == 1 { return e }
+    let mut rest = []
+    let mut i = 0
+    while i < len(stmts) - 1 { push(rest, stmts[i]); i = i + 1 }
+    return "(block " + do_block(rest) + " " + e + ")"
+}
+fn parse_extern(st, pc) {
+    adv(st, pc) // extern
+    if pk(st, pc) == "str" { adv(st, pc) }
+    expect_p(st, pc, "{")
+    let mut fns = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        parse_attrs(st, pc)
+        if is_kw(st, pc, "fn") { adv(st, pc) } else if pk(st, pc) == "ident" && ptext(st, pc) == "fn" { adv(st, pc) }
+        let nm = ptext(st, pc); adv(st, pc)
+        expect_p(st, pc, "(")
+        let mut arity = 0
+        let mut variadic = "false"
+        while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+            if is_p(st, pc, "...") { variadic = "true"; adv(st, pc) }
+            else {
+                arity = arity + 1
+                while !is_p(st, pc, ",") && !is_p(st, pc, ")") && pk(st, pc) != "eof" { adv(st, pc) }
+            }
+            if is_p(st, pc, ",") { adv(st, pc) }
+        }
+        expect_p(st, pc, ")")
+        if is_p(st, pc, "->") { adv(st, pc); parse_type_head(st, pc) }
+        if is_p(st, pc, ";") { adv(st, pc) }
+        push(fns, "(" + nm + " " + str(arity) + " " + variadic + ")")
+    }
+    expect_p(st, pc, "}")
+    return "(extern (" + join(fns, " ") + "))"
+}
+fn parse_data(st, pc) {
+    adv(st, pc) // data
+    let name = ptext(st, pc); adv(st, pc)
+    parse_generics(st, pc)
+    expect_p(st, pc, "(")
+    let mut fields = []
+    while !is_p(st, pc, ")") && pk(st, pc) != "eof" {
+        if is_kw(st, pc, "mut") { adv(st, pc) }
+        push(fields, ptext(st, pc)); adv(st, pc)
+        if is_p(st, pc, ":") { adv(st, pc); parse_type_head(st, pc) }
+        if is_p(st, pc, "=") { adv(st, pc); parse_expr(st, pc) }
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, ")")
+    if is_p(st, pc, ";") { adv(st, pc) }
+    return "(struct " + name + " (" + join(fields, " ") + "))"
+}
+fn parse_struct(st, pc) {
+    adv(st, pc) // struct
+    let name = ptext(st, pc); adv(st, pc)
+    parse_generics(st, pc)
+    if word_is(st, pc, "where") { parse_where(st, pc, []) }
+    // tuple struct  ( types ) ;  |  brace { field: type, }  |  ;
+    if is_p(st, pc, "(") { skip_balanced(st, pc, "(", ")"); if is_p(st, pc, ";") { adv(st, pc) } return "(struct " + name + " ())" }
+    if is_p(st, pc, ";") { adv(st, pc); return "(struct " + name + " ())" }
+    expect_p(st, pc, "{")
+    let mut fields = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        parse_attrs(st, pc); skip_visibility(st, pc)
+        if is_kw(st, pc, "mut") { adv(st, pc) }
+        let fname = ptext(st, pc); adv(st, pc)
+        expect_p(st, pc, ":")
+        parse_type_head(st, pc)
+        push(fields, fname)
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(struct " + name + " (" + join(fields, " ") + "))"
+}
+fn parse_enum(st, pc) {
+    adv(st, pc) // enum | union
+    let name = ptext(st, pc); adv(st, pc)
+    parse_generics(st, pc)
+    if word_is(st, pc, "where") { parse_where(st, pc, []) }
+    expect_p(st, pc, "{")
+    let mut variants = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        parse_attrs(st, pc)
+        let vn = ptext(st, pc); adv(st, pc)
+        let mut arity = 0
+        if is_p(st, pc, "(") {
+            adv(st, pc)
+            while !is_p(st, pc, ")") && pk(st, pc) != "eof" { arity = arity + 1; parse_type_head(st, pc); if is_p(st, pc, ",") { adv(st, pc) } }
+            expect_p(st, pc, ")")
+        } else if is_p(st, pc, "{") {
+            adv(st, pc)
+            while !is_p(st, pc, "}") && pk(st, pc) != "eof" { arity = arity + 1; adv(st, pc); expect_p(st, pc, ":"); parse_type_head(st, pc); if is_p(st, pc, ",") { adv(st, pc) } }
+            expect_p(st, pc, "}")
+        }
+        if is_kw(st, pc, "if") { adv(st, pc); parse_expr(st, pc) }
+        push(variants, vn + "/" + str(arity))
+        if is_p(st, pc, ",") { adv(st, pc) }
+    }
+    expect_p(st, pc, "}")
+    return "(enum " + name + " (" + join(variants, " ") + "))"
+}
+fn strip_params(ps) {
+    let mut out = []
+    let mut i = 0
+    while i < len(ps) { let ha = head_and_args(ps[i]); push(out, "(" + ha[0] + " - -)"); i = i + 1 }
+    return out
+}
+fn parse_trait(st, pc) {
+    adv(st, pc) // trait
+    let name = ptext(st, pc); adv(st, pc)
+    parse_generics(st, pc)
+    if is_p(st, pc, ":") { adv(st, pc); parse_bounds(st, pc) }
+    if word_is(st, pc, "where") { parse_where(st, pc, []) }
+    expect_p(st, pc, "{")
+    let mut req = []
+    let mut defs = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        parse_attrs(st, pc)
+        if pk(st, pc) == "ident" && ptext(st, pc) == "const" { while !is_p(st, pc, ";") && pk(st, pc) != "eof" { adv(st, pc) } if is_p(st, pc, ";") { adv(st, pc) } continue }
+        if pk(st, pc) == "ident" && ptext(st, pc) == "type" { while !is_p(st, pc, ";") && pk(st, pc) != "eof" { adv(st, pc) } if is_p(st, pc, ";") { adv(st, pc) } continue }
+        // method_sig (async? fn name (...) ret? eff? where?) then block or ;
+        let mut is_async = "sync"
+        if pk(st, pc) == "ident" && ptext(st, pc) == "async" { is_async = "async"; adv(st, pc) }
+        adv(st, pc) // fn
+        let mn = ptext(st, pc); adv(st, pc)
+        let gens = parse_generics(st, pc)
+        let ps = parse_params(st, pc)
+        let mut ret = "-"
+        if is_p(st, pc, "->") { adv(st, pc); ret = parse_type_head(st, pc) }
+        let eff = parse_effects(st, pc)
+        let wh = parse_where(st, pc, gens[1])
+        if is_p(st, pc, "{") {
+            let body = parse_fn_body(st, pc)
+            push(defs, "(fn (attrs ) sync " + mn + " (gen ) (params " + join(strip_params(ps), " ") + ") (ret -) (eff none) (where ) " + body + ")")
+        } else {
+            push(req, mn)
+            if is_p(st, pc, ";") { adv(st, pc) }
+        }
+    }
+    expect_p(st, pc, "}")
+    return "(trait " + name + " (req " + join(req, " ") + ") (def " + join(defs, " ") + "))"
+}
+fn parse_impl(st, pc) {
+    adv(st, pc) // impl
+    parse_generics(st, pc)
+    let a = parse_type_head(st, pc)
+    let mut type_name = a
+    let mut trait_name = "-"
+    if is_kw(st, pc, "for") { adv(st, pc); trait_name = a; type_name = parse_type_head(st, pc) }
+    if word_is(st, pc, "where") { parse_where(st, pc, []) }
+    expect_p(st, pc, "{")
+    let mut methods = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        let attrs = parse_attrs(st, pc)
+        skip_visibility(st, pc)
+        if pk(st, pc) == "ident" && ptext(st, pc) == "const" { while !is_p(st, pc, ";") && pk(st, pc) != "eof" { adv(st, pc) } if is_p(st, pc, ";") { adv(st, pc) } continue }
+        if pk(st, pc) == "ident" && ptext(st, pc) == "type" { while !is_p(st, pc, ";") && pk(st, pc) != "eof" { adv(st, pc) } if is_p(st, pc, ";") { adv(st, pc) } continue }
+        push(methods, parse_func(st, pc, attrs))
+    }
+    expect_p(st, pc, "}")
+    return "(impl " + type_name + " " + trait_name + " (" + join(methods, " ") + "))"
+}
+fn parse_use(st, pc) {
+    adv(st, pc) // use
+    // use string_lit ;   -> import
+    if pk(st, pc) == "str" { let s = ptext(st, pc); adv(st, pc); if is_p(st, pc, ";") { adv(st, pc) } return "(import " + s + ")" }
+    // use_prefix (. * | . { names } | as alias)
+    let mut prefix = ptext(st, pc); adv(st, pc)
+    let mut names = []
+    let mut wild = "named"
+    let mut alias = "-"
+    let mut go = true
+    while go {
+        if is_p(st, pc, ".") {
+            adv(st, pc)
+            if is_p(st, pc, "*") { adv(st, pc); wild = "glob"; go = false }
+            else if is_p(st, pc, "{") {
+                adv(st, pc)
+                while !is_p(st, pc, "}") && pk(st, pc) != "eof" { push(names, ptext(st, pc)); adv(st, pc); if is_p(st, pc, ",") { adv(st, pc) } }
+                expect_p(st, pc, "}")
+                go = false
+            } else { prefix = prefix + "." + ptext(st, pc); adv(st, pc) }
+        } else { go = false }
+    }
+    if is_kw(st, pc, "as") { adv(st, pc); alias = ptext(st, pc); adv(st, pc) }
+    if is_p(st, pc, ";") { adv(st, pc) }
+    return "(use " + prefix + " " + alias + " " + wild + " (" + join(names, " ") + "))"
+}
+fn parse_const(st, pc) {
+    adv(st, pc) // const
+    let name = ptext(st, pc); adv(st, pc)
+    if is_p(st, pc, ":") { adv(st, pc); parse_type_head(st, pc) }
+    expect_p(st, pc, "=")
+    let e = parse_expr(st, pc)
+    if is_p(st, pc, ";") { adv(st, pc) }
+    return "(const " + name + " " + e + ")"
+}
+fn parse_static(st, pc) {
+    adv(st, pc) // static
+    if is_kw(st, pc, "mut") { adv(st, pc) }
+    let name = ptext(st, pc); adv(st, pc)
+    if is_p(st, pc, ":") { adv(st, pc); parse_type_head(st, pc) }
+    expect_p(st, pc, "=")
+    let e = parse_expr(st, pc)
+    if is_p(st, pc, ";") { adv(st, pc) }
+    // static isn't a distinct dump node here; emit as const-like? Rust maps to ? — treat as const
+    return "(const " + name + " " + e + ")"
+}
+fn parse_type_alias(st, pc) {
+    adv(st, pc) // type
+    let name = ptext(st, pc); adv(st, pc)
+    parse_generics(st, pc)
+    if word_is(st, pc, "where") { parse_where(st, pc, []) }
+    expect_p(st, pc, "=")
+    let target = read_alias_target(st, pc)
+    let mut refn = "-"
+    if is_kw(st, pc, "if") { adv(st, pc); refn = parse_expr(st, pc) }
+    if pk(st, pc) == "ident" && ptext(st, pc) == "schema" { adv(st, pc); if pk(st, pc) == "str" || pk(st, pc) == "raw" { adv(st, pc) } }
+    // a type alias is only an item when terminated by `;` (else the grammar drops it)
+    if is_p(st, pc, ";") { adv(st, pc); return "(type " + name + " " + target + " " + refn + ")" }
+    return ""
+}
+// read an alias target's head without greedily consuming past it
+fn read_alias_target(st, pc) {
+    if is_p(st, pc, "[") {
+        adv(st, pc)
+        let inner = read_alias_target(st, pc)
+        let mut d = 1
+        while d > 0 && pk(st, pc) != "eof" { if is_p(st, pc, "[") { d = d + 1 } else if is_p(st, pc, "]") { d = d - 1 } adv(st, pc) }
+        return "[" + inner + "]"
+    }
+    let head = ptext(st, pc); adv(st, pc)
+    // consume a balanced generic-arg list [..] if present (keeps head only)
+    if is_p(st, pc, "[") { let mut d = 1; adv(st, pc); while d > 0 && pk(st, pc) != "eof" { if is_p(st, pc, "[") { d = d + 1 } else if is_p(st, pc, "]") { d = d - 1 } adv(st, pc) } }
+    return head
+}
+fn parse_test(st, pc) {
+    adv(st, pc) // test
+    let nm = ptext(st, pc); adv(st, pc)
+    let b = parse_block_do(st, pc)
+    return "(test " + nm + " " + b + ")"
+}
+fn parse_machine(st, pc) {
+    adv(st, pc) // machine
+    let name = ptext(st, pc); adv(st, pc)
+    expect_p(st, pc, "{")
+    // initial ident
+    let mut initial = ""
+    if pk(st, pc) == "ident" && ptext(st, pc) == "initial" { adv(st, pc); initial = ptext(st, pc); adv(st, pc) }
+    let mut trans = []
+    while !is_p(st, pc, "}") && pk(st, pc) != "eof" {
+        let from = ptext(st, pc); adv(st, pc)
+        if is_p(st, pc, "->") { adv(st, pc) }
+        let to = ptext(st, pc); adv(st, pc)
+        if pk(st, pc) == "ident" && ptext(st, pc) == "on" { adv(st, pc) }
+        let ev = ptext(st, pc); adv(st, pc)
+        push(trans, "(" + from + " " + to + " " + ev + ")")
+    }
+    expect_p(st, pc, "}")
+    return "(machine " + name + " " + initial + " (" + join(trans, " ") + "))"
+}
+fn parse_migrate(st, pc) {
+    adv(st, pc) // migrate
+    if pk(st, pc) == "ident" && ptext(st, pc) == "from" { adv(st, pc) }
+    let from = read_path(st, pc)
+    if pk(st, pc) == "ident" && ptext(st, pc) == "to" { adv(st, pc) }
+    let to = read_path(st, pc)
+    let b = parse_block_raw(st, pc)
+    return "(migrate " + from + " " + to + " " + finish_fn_block(b) + ")"
+}
+// read a dotted type path head (first segment) without greedy type consumption
+fn read_path(st, pc) {
+    let head = ptext(st, pc); adv(st, pc)
+    while is_p(st, pc, ".") { adv(st, pc); adv(st, pc) }
+    return head
+}
+
+fn skip_balanced(st, pc, open, close) {
+    if !is_p(st, pc, open) { return 0 }
+    let mut d = 0
+    while pk(st, pc) != "eof" {
+        if is_p(st, pc, open) { d = d + 1 }
+        else if is_p(st, pc, close) { d = d - 1; if d == 0 { adv(st, pc); break } }
+        adv(st, pc)
+    }
+    return 0
+}
+fn binop_head(op) {
+    if op == "&" { return "band" }
+    if op == "|" { return "bor" }
+    if op == "^" { return "bxor" }
+    if op == "<<" { return "shl" }
+    if op == ">>" { return "shr" }
+    return op
+}
