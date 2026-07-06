@@ -1,0 +1,27 @@
+// Method dispatch in a hot loop — exercises the nested-map + Rc<Func> method
+// resolution (no per-call key allocation, no body-AST deep clone). Must stay
+// byte-identical across run/vm/jit tiers.
+struct Counter { n: Int }
+impl Counter {
+  fn bump(self, k) { self.n + k }
+  fn scale(self, k) { self.n * k + k - 1 }
+  fn label(self) { "count=" + str(self.n) }
+}
+
+trait Describe { fn describe(self) { "a thing" } }
+struct Widget { id: Int }
+impl Describe for Widget {}   // uses the trait default method
+
+fn main() {
+  let c = Counter { n: 7 }
+  let mut acc = 0
+  let mut i = 0
+  while i < 1000 {
+    acc = acc + c.bump(2) + c.scale(3)
+    i = i + 1
+  }
+  print(acc)                  // 1000 * (9 + 23) = 32000
+  print(c.label())            // count=7
+  let w = Widget { id: 1 }
+  print(w.describe())         // a thing (trait default)
+}
