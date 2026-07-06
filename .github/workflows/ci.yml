@@ -64,3 +64,6 @@ jobs:
 
       - name: Self-hosting gate (Nova lexer in Nova, byte-identical vs Rust)
         run: bash tests/selfhost_smoke.sh
+
+      - name: Bootstrap fixpoint (stage 5 — Nova front-end under the Nova evaluator)
+        run: bash selfhost/bootstrap.sh

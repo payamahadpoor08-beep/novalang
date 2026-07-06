@@ -352,7 +352,12 @@ fn main() {
     let mut pending = []
     let machines = #{}
     let astate = #{}
-    let G = [fns, consts, structs, enums, methods, refines, gens, migrations, pending, machines, astate]
+    // the interpreted program's own CLI args = everything after its script path,
+    // so a Nova program run under eval.nova (e.g. the Nova lexer/parser/checker)
+    // sees its file argument — this closes the bootstrap fixpoint.
+    let mut subargs = []
+    let mut ai = 1; while ai < len(argv) { push(subargs, argv[ai]); ai = ai + 1 }
+    let G = [fns, consts, structs, enums, methods, refines, gens, migrations, pending, machines, astate, subargs]
     let mut trees = []
     let mut i = 0
     while i < len(items) {
@@ -1354,7 +1359,7 @@ fn builtin(name, args, G) {
     if name == "assert_contains" { if !builtin("contains", args, G) { eprint("assert failed"); exit(1) } return null }
     if name == "map_del" { map_del(args[0], args[1]); return null }
     if name == "exit" { exit(args[0]); return null }
-    if name == "args" { return [] }
+    if name == "args" { if len(G) > 11 { return G[11] } return [] }
     if name == "state_of" { let m = args[0]; if type_of(m) == "array" && len(m) > 2 && m[0] == "__nv_machine__" { return m[2][0] } return state_of(args[0]) }
     // unknown builtin -> null (iterate to add coverage)
     return null

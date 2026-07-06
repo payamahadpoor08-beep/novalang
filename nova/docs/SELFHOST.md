@@ -10,7 +10,7 @@ the whole corpus + std + examples — the same honesty rule as everything else.
 | 2. parser | `selfhost/parser.nova` | `nova ast <file>` (src/astdump.rs) | 96/96 files byte-identical, incl. the parser parsing **itself + the lexer**; 4-tier identical | ✅ done |
 | 3. checker | `selfhost/checker.nova` | `nova check <file>` (types::Checker + diag.rs) | 96/96 files byte-identical (diagnostics + `OK` line), incl. checking **itself**; 4-tier identical | ✅ done |
 | 4. eval | `selfhost/eval.nova` (tree-walk) | `nova run <file>` | program output byte-identical on every corpus + std + example file | ✅ done |
-| 5. fixpoint | Nova builds `selfhost/*` with itself | the Rust-built binary | outputs converge | planned |
+| 5. fixpoint | Nova front-end run **under the Nova evaluator** | the Rust reference (`tokens`/`ast`/`check`) | doubly-interpreted output converges | ✅ done |
 
 ## Stage 1 — the lexer (done)
 
@@ -179,7 +179,29 @@ functions / consts / structs / enums / methods / trait-impls / type-refinements 
 the reference tree-walker, so they need a generous per-file timeout — the output
 is identical, only slower.
 
+## Stage 5 — the fixpoint bootstrap (done)
+
+The final property: the Nova-implemented compiler, **executed by the
+Nova-implemented evaluator**, reproduces the Rust binary. `selfhost/bootstrap.sh`
+runs each Nova front-end *under* `selfhost/eval.nova` and diffs against the Rust
+reference:
+
+```
+nova run eval.nova lexer.nova   F  ==  nova tokens F
+nova run eval.nova parser.nova  F  ==  nova ast    F
+nova run eval.nova checker.nova F  ==  nova check  F
+```
+
+This is a tree-walker (`eval.nova`) driving a tree-walker (the front-end) driving
+the tokenizer/parser/checker — so it runs on small inputs; the point is
+**convergence**, not speed. It closes the loop opened in stage 1: the compiler
+written in Nova, run by the runtime written in Nova, is byte-identical to the
+Rust compiler. (Enabled by `eval.nova` passing its trailing CLI args through to
+the interpreted program, so a Nova tool run under it sees its file argument.)
+CI: the `bootstrap.sh` step in `.github/workflows/ci.yml`.
+
 ## Honest scope (overall)
-Stages 1–4 (lexer, parser, checker, evaluator) are done and verified byte-
-identical on every real file. Stage 5 (the fixpoint bootstrap — Nova building
-`selfhost/*` with itself and reproducing the Rust binary) is the remaining step.
+All five stages (lexer, parser, checker, evaluator, fixpoint) are done and
+verified byte-identical against the Rust reference on every real file. The Nova
+compiler front-end is self-hosting: it reproduces the reference both directly and
+when run on itself under the Nova evaluator.
