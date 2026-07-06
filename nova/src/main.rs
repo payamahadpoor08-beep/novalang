@@ -13,6 +13,7 @@ mod obfuscate;
 mod lsp;
 mod registry;
 mod tokens;
+mod astdump;
 
 use std::io::{self, Write, BufRead};
 use std::process::exit;
@@ -282,6 +283,16 @@ fn main() {
             let path = require_path(&args);
             let src = read(&path);
             print!("{}", tokens::dump(&src));
+        }
+        "ast" => {
+            // the canonical AST dump — the self-hosting stage-2 reference
+            // (selfhost/parser.nova must produce byte-identical output)
+            let path = require_path(&args);
+            let src = read(&path);
+            match parser::parse_program(&src) {
+                Ok(p) => print!("{}", astdump::dump(&p)),
+                Err(e) => { eprintln!("{}", e); exit(1); }
+            }
         }
         "fmt" => {
             // `nova fmt <file>` prints to stdout; `nova fmt -w <file>` rewrites in place

@@ -6,8 +6,8 @@ the whole corpus + std + examples — the same honesty rule as everything else.
 
 | stage | artifact | reference | gate | status |
 |---|---|---|---|---|
-| 1. lexer | `selfhost/lexer.nova` | `nova tokens <file>` (src/tokens.rs) | `tests/selfhost_smoke.sh` — 94 files byte-identical, incl. the lexer lexing **itself**; 4-tier identical | ✅ done |
-| 2. parser | `selfhost/parser.nova` → canonical AST dump | a Rust AST dumper | every corpus+std file equal | ⏳ next |
+| 1. lexer | `selfhost/lexer.nova` | `nova tokens <file>` (src/tokens.rs) | `tests/selfhost_smoke.sh` — 95/95 files byte-identical, incl. the lexer lexing **itself**; 4-tier identical | ✅ done |
+| 2. parser | `selfhost/parser.nova` | `nova ast <file>` (src/astdump.rs) | 95/95 files byte-identical, incl. the parser parsing **itself + the lexer**; 4-tier identical | ✅ done |
 | 3. checker | `selfhost/checker.nova` | `nova check` diagnostics | same messages | planned |
 | 4. eval | `selfhost/eval.nova` (tree-walk) | `nova run` | same program output | planned |
 | 5. fixpoint | Nova builds `selfhost/*` with itself | the Rust-built binary | outputs converge | planned |
@@ -53,6 +53,51 @@ helpers.
 2. The lexer is a Nova program, so the 4-tier discipline applies to it too:
    `run` / `vm` / `vm --no-jit` / `vm --jit` outputs must all agree.
 
-### Honest scope
-Stage 1 is the lexer only. The parser/checker/eval stages are real, separate
-efforts (tracked above) — nothing beyond the lexer is claimed self-hosted yet.
+## Stage 2 — the parser (done)
+
+`selfhost/parser.nova` is a complete recursive-descent + Pratt parser that
+mirrors `src/nova.pest` **and** the `src/parser.rs` lowering, emitting a
+canonical S-expression AST byte-identical to the Rust reference `nova ast`
+(`src/astdump.rs`) for **every** real file — no curated subset.
+
+### The canonical AST dump (`nova ast`)
+`src/astdump.rs` walks the real pest-produced AST and prints a **total**
+S-expression (every `ast.rs` node has a form — no escapes), one top-level item
+per line, unwrapping the transparent `At` position wrapper. Because the dump is
+total, nothing can hide behind an unhandled node.
+
+### What the Nova parser reproduces
+The full language and, crucially, the lowering's exact desugarings — not just
+the grammar:
+- items: `fn` (async, generics + bounds, params with self/mut/ref/`linear`/
+  `affine` modes + defaults, `-> T`, `![E]` effects, `where`, `=> expr`),
+  `struct`/`data`/`enum`/`union`, `trait` (+ default-method signature stripping,
+  exactly as the lowering drops it), `impl … for …`, `const`/`static`, `type`
+  aliases (dropped without a `;`, matching the grammar) + refinements, `extern`
+  (+ variadic `...`), `machine`, `migrate`, `test`, `use` trees.
+- the full precedence tower + the real desugarings: `a as Int` → `int(a)`,
+  `a |> f(x)` → `f(x, a)`, `a ?? b` → `if a != null …`, `x += 1` →
+  `x = x + 1`, tuples → first element, `[v; n]` → `array_fill`, `module.f(x)` →
+  qualified call, struct-literal `..spread` dropped, `?.` safe field.
+- patterns (or / range / tuple / slice+rest / struct / enum / capitalised-unit),
+  `match` guards, comprehensions, f-strings (interpolation-aware), map/set
+  literals, closures (`x =>`, `(a,b) =>`, `|a| =>`), `spawn`/`await`/`select`,
+  `ch <- v` and `src ->> sink` stream desugaring (shared hygiene counter),
+  **big-integer literals**, and **macros** — declaration collection plus
+  `name!(args)` **expansion with `$param` substitution and `let`-binding
+  hygiene** (`tmp` → `tmp_hyg0`), reproducing the reference expansion.
+- Rust-`Display`-parity float formatting and the implicit trailing-return rule
+  (the last expression-statement of a fn/lambda/spawn body becomes the return,
+  even with a trailing `;`).
+
+### The gate
+`tests/selfhost_smoke.sh` (in CI): `nova ast f` == `nova run selfhost/parser.nova
+f` for **all 95** files (corpus + std + examples + the lexer and parser
+themselves), and the parser is 4-tier identical (interp / vm / --no-jit / --jit).
+The parser parses **itself and the lexer** byte-identically — the real
+self-hosting property.
+
+## Honest scope
+Stages 1–2 (lexer, parser) are done and verified on every real file. The
+checker/eval/fixpoint stages are real, separate efforts (tracked above) —
+nothing beyond the parser is claimed self-hosted yet.
