@@ -2,16 +2,12 @@
 #
 # Nova is not yet in the upstream github/linguist database, so GitHub cannot
 # render the literal label "Nova" — an unknown `linguist-language=Nova` is
-# ignored and the repo shows as "Other". Until our upstream contribution lands
-# (see linguist/ for the ready-to-submit kit), we use Nova's closest known
-# relative — Rust — as an INTERIM highlighting/stats stand-in so the repo reads
-# as source code instead of "Other". This is a temporary label, not a claim that
-# Nova is Rust; Nova's syntax is deliberately Rust-like, so highlighting is close.
-#
-# To switch back to the honest "Other-until-upstream" behaviour, replace the two
-# `linguist-language=Rust` lines below with `linguist-language=Nova`.
-*.nova linguist-language=Rust linguist-detectable=true
-selfhost/*.nova linguist-language=Rust
+# ignored, and there is NO per-repo way to define a brand-new language. The only
+# real fix is the upstream contribution in linguist/ (adoption-gated, outside
+# this repo). We deliberately do NOT mislabel `.nova` as another language (an
+# earlier interim mapped it to Rust, which hid Nova entirely) — better honest
+# than wrong.
+*.nova linguist-language=Nova linguist-detectable=true
 
 # Generated / vendored / non-source trees don't count toward the language stats.
 nova/target/**        linguist-generated=true
