@@ -30,10 +30,12 @@ pub const HARD_KEYWORDS: [&str; 29] = [
     "await", "true", "false", "null",
 ];
 
-const PUNCT3: [&str; 7] = ["<<=", ">>=", "..=", "===", "!==", "<=>", "??="];
-const PUNCT2: [&str; 20] = [
+// 3-char operators, maximal-munch before 2-char. `->>` (stream) and `>>>`
+// (unsigned shift) are in the grammar's `stream_op`/`shift_op` rules.
+const PUNCT3: [&str; 9] = ["<<=", ">>=", "..=", "===", "!==", "<=>", "??=", "->>", ">>>"];
+const PUNCT2: [&str; 22] = [
     "<<", ">>", "=>", "==", "!=", ">=", "<=", "&&", "||", "**", "??", "..",
-    "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=",
+    "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=", "<-", "|>",
 ];
 // note: `&=` and `|=` are 2-char too but must lose to `&&`/`||` prefixes never
 // arising ambiguously; keep them in the table after the logical ops.
@@ -319,5 +321,15 @@ mod tests {
     #[test] fn punct_maximal_munch() {
         assert_eq!(kinds("a<<=b ..= <=> x??=y a**b"),
                    ["ident:a", "punct:<<=", "ident:b", "punct:..=", "punct:<=>", "ident:x", "punct:??=", "ident:y", "ident:a", "punct:**", "ident:b", "eof"]);
+    }
+    #[test] fn punct_stream_shift_pipeline_ops() {
+        // grammar operators that must munch as single tokens: `->>` stream,
+        // `>>>` unsigned shift, `<-` channel send, `|>` pipeline.
+        assert_eq!(kinds("a->>b a>>>b a<-b a|>b"),
+                   ["ident:a", "punct:->>", "ident:b", "ident:a", "punct:>>>", "ident:b",
+                    "ident:a", "punct:<-", "ident:b", "ident:a", "punct:|>", "ident:b", "eof"]);
+        // still split correctly around them
+        assert_eq!(kinds("a-> b"), ["ident:a", "punct:->", "ident:b", "eof"]);
+        assert_eq!(kinds("a>> b"), ["ident:a", "punct:>>", "ident:b", "eof"]);
     }
 }

@@ -20,13 +20,16 @@ fn keywords() {
     }
 }
 
+// 3-char operators (maximal munch before 2-char): `->>` (stream) and `>>>`
+// (unsigned shift) come straight from the grammar's stream_op/shift_op rules.
 #[comptime]
-fn punct3() { ["<<=", ">>=", "..=", "===", "!==", "<=>", "??="] }
+fn punct3() { ["<<=", ">>=", "..=", "===", "!==", "<=>", "??=", "->>", ">>>"] }
 
+// 2-char operators, incl. `<-` (channel send) and `|>` (pipeline).
 #[comptime]
 fn punct2() {
     ["<<", ">>", "=>", "==", "!=", ">=", "<=", "&&", "||", "**", "??", "..",
-     "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|="]
+     "->", ":=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<-", "|>"]
 }
 
 #[intent("character classes over code points, mirroring the Rust reference")]
