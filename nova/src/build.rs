@@ -73,7 +73,12 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
     // uses -marm (A32) for stable output.
     if arm { cmd.arg("-O2").arg("-static"); }
     else if arm32 { cmd.arg("-O2").arg("-static").arg("-marm"); }
-    else { cmd.arg("-O3").arg("-flto"); }
+    // Native host build: tune for this machine. `-march=native` lets the C
+    // compiler use the host's full instruction set (wider vectors, etc.) and
+    // `-fno-math-errno` frees float ops from errno side effects. Portable
+    // targets (arm/arm32/wasm) keep generic codegen. Kept off the oracle path's
+    // correctness — the AOT build is still byte-verified against `nova run`.
+    else { cmd.arg("-O3").arg("-flto").arg("-march=native").arg("-fno-math-errno"); }
     if matches!(backend, crate::aot::Backend::Llvm) { cmd.arg("-Wno-override-module"); }
     if llvm_boxed { cmd.arg("-Dstatic="); }
     for f in extra_flags { cmd.arg(f); }

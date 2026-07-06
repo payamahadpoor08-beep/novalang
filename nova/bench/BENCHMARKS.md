@@ -28,19 +28,26 @@ interpreter — the correctness oracle, deliberately simple, not meant to be fas
 ## sieve of Eratosthenes to 2,000,000 — array/loop throughput
 | language | ms |
 |---|---:|
+| C (gcc -O2) | 10 |
 | Rust (rustc -O) | 10 |
-| C (gcc -O2) | 11 |
 | C++ (g++ -O2) | 11 |
-| Go | 11 |
-| **Nova aot (native)** | **30** |
-| Python 3 | 41 |
-| JavaScript (node) | 64 |
-| **Nova vm (JIT)** | **75** |
-| Java | 79 |
-| TypeScript | 125 |
-| Lua 5.4 | 223 |
-| Ruby | 273 |
-| Nova run (interp) | 2148 |
+| **Nova aot (native)** | **11** |
+| Go | 12 |
+| Python 3 | 43 |
+| JavaScript (node) | 69 |
+| Java | 83 |
+| **Nova vm (JIT)** | **85** |
+| TypeScript | 130 |
+| Lua 5.4 | 237 |
+| Ruby | 381 |
+| Nova run (interp) | 2135 |
+
+> Nova AOT on the sieve went **30 ms → 11 ms** (tied with C++, ahead of Go) once
+> the native backend learned to emit a **flat `uint8_t` buffer** (one `malloc` +
+> `memset`) for a `[]`-plus-fill-loop array whose values are byte-range,
+> replacing the dynamic 8-byte-per-element `int64` array + realloc storm — the
+> same memory layout C uses. Byte-identical output; the AOT oracle gate still
+> verifies every native build against `nova run`.
 
 ## mandelbrot 600×600, 200 iters — mixed int/float math
 | language | ms |
@@ -60,10 +67,10 @@ interpreter — the correctness oracle, deliberately simple, not meant to be fas
 | Nova run (interp) | 12938 |
 
 ## What this honestly shows
-- **Nova AOT (native) is in the top tier** — within a hair of C / C++ / Rust / Go
-  on `fib` and `mandel` (75 ms vs C's 73 ms on mandelbrot is native-parity), and
-  well clear of every managed/dynamic language. On `sieve` it trails the
-  systems languages (30 ms vs ~11 ms) but still beats Java/Node/TS/Lua/Ruby.
+- **Nova AOT (native) matches C across all three kernels** — `fib` 11 vs 10 ms,
+  `mandel` 75 vs 73 ms, and now `sieve` **11 vs 11 ms** (tied with C++, ahead of
+  Go) after the flat-buffer array optimization. Native-parity, not "close," and
+  well clear of every managed/dynamic language.
 - **Nova VM (JIT) beats every mainstream dynamic language** — faster than
   Node/JS, TypeScript, Python, Ruby and Lua on `fib` and `mandel`, and
   competitive with Java. This is the tier you run day-to-day, with zero build

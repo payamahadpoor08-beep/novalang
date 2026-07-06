@@ -68,7 +68,7 @@ pub fn analyze(prog: &Program) -> Option<AotProgram<'_>> {
     let mut main_body = main.body.clone();
     fix_main_tail(&mut main_body);
     let mut scopes = vec![HashSet::new()];
-    let main_arrays = main_body_arrays(&main_body);
+    let main_arrays = aot_main_arrays(&main_body);
     if !main_body.iter().all(|s| main_stmt_ok(s, &ints_ext, &main_arrays, &mut scopes)) { return None; }
     Some(AotProgram { int_fns, float_fns, num_fns, main_body })
 }
@@ -135,6 +135,9 @@ fn stmt_ok(s: &Stmt, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &
                 let ok = match strip_ats(value) {
                     Expr::Array(els) => els.iter().all(|e| int_expr_ok(e, ints, arrays, scopes)),
                     Expr::Ident(src) => arrays.contains(src),
+                    // flat native buffer: `array(n, fill)`
+                    Expr::Call { callee, args } if callee == "array" && args.len() == 2 =>
+                        int_expr_ok(&args[0], ints, arrays, scopes) && int_expr_ok(&args[1], ints, arrays, scopes),
                     _ => false,
                 };
                 if !ok || scopes.iter().any(|sc| sc.contains(name)) { return false; }
@@ -151,6 +154,8 @@ fn stmt_ok(s: &Stmt, ints: &HashSet<String>, arrays: &HashSet<String>, scopes: &
                 let ok = match strip_ats(value) {
                     Expr::Array(els) => els.iter().all(|e| int_expr_ok(e, ints, arrays, scopes)),
                     Expr::Ident(src) => arrays.contains(src),
+                    Expr::Call { callee, args } if callee == "array" && args.len() == 2 =>
+                        int_expr_ok(&args[0], ints, arrays, scopes) && int_expr_ok(&args[1], ints, arrays, scopes),
                     _ => false,
                 };
                 if !ok { return false; }
@@ -242,10 +247,144 @@ fn main_body_arrays(body: &[Stmt]) -> HashSet<String> {
     crate::jit::array_vars(&synth)
 }
 
+// ---- flat native arrays: `s = []` + a fill loop -> a plain C buffer ---------
+// A local created as `s = []` and filled by a `for _ in 0..N { push(s, LIT) }`
+// loop, thereafter only index-read/index-written (never pushed/popped/len'd/
+// aliased again), becomes a flat native buffer of size N instead of the dynamic
+// int64 `NIA`: one `malloc` + `memset` replaces the `nia_new()` + N× realloc
+// `nia_push` storm. If every stored value AND the fill are integer literals in
+// [0,255] the buffer is `uint8_t` (C `char[]`-parity memory bandwidth);
+// otherwise `i64`. Independent of `jit::array_vars`, so the JIT is untouched;
+// the array is already one the classifier accepts (created via `[]`).
+#[derive(Clone)]
+struct FlatInfo { byte: bool, size: Expr, fill: Expr }
+
+// is this ForRange the fill loop `for _ in 0..N { push(name, LIT) }` for `name`?
+// returns (N, LIT) if so.
+fn fill_loop_of(s: &Stmt, name: &str) -> Option<(Expr, Expr)> {
+    if let Stmt::ForRange { start, end, inclusive, body, .. } = s {
+        if !*inclusive && matches!(strip_ats(start), Expr::Int(0)) && body.len() == 1 {
+            if let Stmt::Expr(e) = &body[0] {
+                if let Expr::Call { callee, args } = strip_ats(e) {
+                    if callee == "push" && args.len() == 2 {
+                        if let (Expr::Ident(s2), Expr::Int(_)) = (strip_ats(&args[0]), strip_ats(&args[1])) {
+                            if s2 == name { return Some((end.clone(), args[1].clone())); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn flat_arrays(body: &[Stmt]) -> std::collections::HashMap<String, FlatInfo> {
+    use std::collections::HashMap;
+    let mut cand: HashMap<String, FlatInfo> = HashMap::new();
+    collect_flat(body, &mut cand);
+    if cand.is_empty() { return cand; }
+    let names: HashSet<String> = cand.keys().cloned().collect();
+    let mut disq: HashSet<String> = HashSet::new();
+    flat_check(body, &names, &mut cand, &mut disq);
+    cand.retain(|k, _| !disq.contains(k));
+    cand
+}
+
+// find `s = []` paired with a later fill loop in the same block.
+fn collect_flat(body: &[Stmt], out: &mut std::collections::HashMap<String, FlatInfo>) {
+    for (i, s) in body.iter().enumerate() {
+        if let Stmt::Let { name, value, .. } | Stmt::Assign { name, value } = s {
+            if matches!(strip_ats(value), Expr::Array(e) if e.is_empty()) {
+                for t in &body[i + 1..] {
+                    if let Some((size, fill)) = fill_loop_of(t, name) {
+                        let byte = matches!(strip_ats(&fill), Expr::Int(k) if *k >= 0 && *k <= 255);
+                        out.insert(name.clone(), FlatInfo { byte, size, fill });
+                        break;
+                    }
+                }
+            }
+        }
+        match s {
+            Stmt::If { then, els, .. } => { collect_flat(then, out); if let Some(e) = els { collect_flat(e, out); } }
+            Stmt::While { body, .. } | Stmt::ForRange { body, .. } | Stmt::ForEach { body, .. } => collect_flat(body, out),
+            _ => {}
+        }
+    }
+}
+
+// walk the body; disqualify a candidate on any use a flat buffer can't do, and
+// downgrade its byte width on a non-byte index-store. The recognized fill loop
+// is skipped (its `push` is the intended fill, not a disqualifier).
+fn flat_check(body: &[Stmt], names: &HashSet<String>, cand: &mut std::collections::HashMap<String, FlatInfo>, disq: &mut HashSet<String>) {
+    for s in body {
+        if let Stmt::ForRange { .. } = s {
+            if names.iter().any(|n| fill_loop_of(s, n).is_some()) { continue; }
+        }
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                let is_empty_arr = matches!(strip_ats(value), Expr::Array(e) if e.is_empty());
+                if names.contains(name) && !is_empty_arr { disq.insert(name.clone()); }
+                flat_use_scan(value, names, disq);
+            }
+            Stmt::IndexAssign { base, index, value } => {
+                if let Some(n) = arr_ident(base) {
+                    if names.contains(n) && !matches!(strip_ats(value), Expr::Int(k) if *k >= 0 && *k <= 255) {
+                        if let Some(fi) = cand.get_mut(n) { fi.byte = false; }
+                    }
+                }
+                flat_use_scan(index, names, disq);
+                flat_use_scan(value, names, disq);
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => flat_use_scan(e, names, disq),
+            Stmt::If { cond, then, els } => {
+                flat_use_scan(cond, names, disq);
+                flat_check(then, names, cand, disq);
+                if let Some(e) = els { flat_check(e, names, cand, disq); }
+            }
+            Stmt::While { cond, body } => { flat_use_scan(cond, names, disq); flat_check(body, names, cand, disq); }
+            Stmt::ForRange { start, end, body, .. } => { flat_use_scan(start, names, disq); flat_use_scan(end, names, disq); flat_check(body, names, cand, disq); }
+            Stmt::ForEach { iter, body, .. } => { flat_use_scan(iter, names, disq); flat_check(body, names, cand, disq); }
+            _ => {}
+        }
+    }
+}
+
+// disqualify a candidate on any bare use / call-arg / alias (index reads are ok).
+fn flat_use_scan(e: &Expr, names: &HashSet<String>, disq: &mut HashSet<String>) {
+    match strip_ats(e) {
+        Expr::Index { base, index } => {
+            if arr_ident(base).is_none() { flat_use_scan(base, names, disq); }
+            flat_use_scan(index, names, disq);
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                if let Some(n) = arr_ident(a) { if names.contains(n) { disq.insert(n.to_string()); } }
+                flat_use_scan(a, names, disq);
+            }
+        }
+        Expr::Ident(n) => { if names.contains(n) { disq.insert(n.clone()); } }
+        Expr::Binary { lhs, rhs, .. } => { flat_use_scan(lhs, names, disq); flat_use_scan(rhs, names, disq); }
+        Expr::Unary { expr, .. } => flat_use_scan(expr, names, disq),
+        _ => {}
+    }
+}
+
+// the AOT array set = the JIT's dynamic-array vars PLUS flat `array(n,fill)` locals
+fn aot_arrays_of(f: &Func) -> HashSet<String> {
+    let mut a = crate::jit::array_vars(f);
+    a.extend(flat_arrays(&f.body).into_keys());
+    a
+}
+fn aot_main_arrays(body: &[Stmt]) -> HashSet<String> {
+    let mut a = main_body_arrays(body);
+    a.extend(flat_arrays(body).into_keys());
+    a
+}
+
 fn fn_body_ok(f: &Func, ints: &HashSet<String>) -> bool {
     let mut scopes = vec![HashSet::new()];
     for p in &f.params { scopes.last_mut().unwrap().insert(p.clone()); }
-    let arrays = crate::jit::array_vars(f);
+    let arrays = aot_arrays_of(f);
     f.body.iter().all(|s| fn_stmt_ok(s, ints, &arrays, &mut scopes))
 }
 
@@ -335,8 +474,11 @@ fn float_body_no_shadow(body: &[Stmt], scopes: &mut Vec<HashSet<String>>) -> boo
 struct CEmit<'p> {
     a: &'p AotProgram<'p>,
     out: String,
-    // the array vars of the function currently being emitted (declared as NIA*)
+    // the array vars of the function currently being emitted (dynamic NIA* or,
+    // for the flat subset below, a plain native buffer)
     cur_arrays: HashSet<String>,
+    // flat native-buffer arrays (`[]` + fill loop): name -> width + size + fill
+    flat: std::collections::HashMap<String, FlatInfo>,
 }
 
 fn mangle(n: &str) -> String { format!("nv_{}", n) }
@@ -359,17 +501,28 @@ static i64 nia_len(NIA* a){ return a->n; }\n\
 static i64 nia_pop(NIA* a){ return a->d[--a->n]; }\n\n";
 
 impl<'p> CEmit<'p> {
-    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new(), cur_arrays: HashSet::new() } }
+    fn new(a: &'p AotProgram<'p>) -> Self { CEmit { a, out: String::new(), cur_arrays: HashSet::new(), flat: std::collections::HashMap::new() } }
+    fn is_flat(&self, n: &str) -> bool { self.flat.contains_key(n) }
 
-    // any int fn (or main) that uses local arrays?
+    // any int fn (or main) that uses local dynamic (NIA) arrays?
     fn uses_arrays(&self) -> bool {
         self.a.int_fns.iter().any(|f| !crate::jit::array_vars(f).is_empty())
             || !main_body_arrays(&self.a.main_body).is_empty()
+    }
+    // any function using a flat native-buffer array (`array(n,fill)`)?
+    fn uses_flat(&self) -> bool {
+        self.a.int_fns.iter().any(|f| !flat_arrays(&f.body).is_empty())
+            || !flat_arrays(&self.a.main_body).is_empty()
     }
 
     fn emit(mut self) -> String {
         self.out.push_str("#include <stdio.h>\n#include <stdint.h>\ntypedef int64_t i64;\n\n");
         if self.uses_arrays() { self.out.push_str(NIA_PRELUDE); }
+        // flat buffers need malloc/memset; NIA_PRELUDE already pulls <stdlib.h>
+        if self.uses_flat() {
+            if !self.uses_arrays() { self.out.push_str("#include <stdlib.h>\n"); }
+            self.out.push_str("#include <string.h>\n\n");
+        }
         for f in &self.a.int_fns { self.proto(f, "i64"); }
         for f in &self.a.float_fns { self.proto(f, "double"); }
         for f in self.a.num_fns.clone() {
@@ -508,16 +661,24 @@ impl<'p> CEmit<'p> {
         let _ = writeln!(self.out, "static {} {}({});", ty, mangle(&f.name), ps.join(", "));
     }
 
+    // C declaration for a flat array pointer, by element width
+    fn flat_decl(&self, v: &str) -> String {
+        let ty = if self.flat[v].byte { "uint8_t*" } else { "i64*" };
+        format!("  {} {} = 0;", ty, mangle(v))
+    }
+
     fn func(&mut self, f: &Func, is_float: bool) {
         let ty = if is_float { "double" } else { "i64" };
-        self.cur_arrays = if is_float { HashSet::new() } else { crate::jit::array_vars(f) };
+        self.flat = if is_float { std::collections::HashMap::new() } else { flat_arrays(&f.body) };
+        self.cur_arrays = if is_float { HashSet::new() } else { aot_arrays_of(f) };
         let ps: Vec<String> = f.params.iter().map(|p| format!("{} {}", ty, mangle(p))).collect();
         let _ = writeln!(self.out, "static {} {}({}) {{", ty, mangle(&f.name), ps.join(", "));
         let mut vars: Vec<String> = Vec::new();
         collect_vars(&f.body, &mut vars);
         for v in &vars {
             if !f.params.contains(v) {
-                if self.cur_arrays.contains(v) {
+                if self.is_flat(v) { let d = self.flat_decl(v); let _ = writeln!(self.out, "{}", d); }
+                else if self.cur_arrays.contains(v) {
                     let _ = writeln!(self.out, "  NIA* {} = 0;", mangle(v));
                 } else {
                     let _ = writeln!(self.out, "  {} {} = 0;", ty, mangle(v));
@@ -527,20 +688,24 @@ impl<'p> CEmit<'p> {
         for s in &f.body { self.stmt(s, 1, is_float); }
         let _ = writeln!(self.out, "  return 0;\n}}\n");
         self.cur_arrays = HashSet::new();
+        self.flat = std::collections::HashMap::new();
     }
 
     fn main(&mut self) {
-        self.cur_arrays = main_body_arrays(&self.a.main_body);
+        self.flat = flat_arrays(&self.a.main_body);
+        self.cur_arrays = aot_main_arrays(&self.a.main_body);
         self.out.push_str("int main(void) {\n");
         let mut vars: Vec<String> = Vec::new();
         collect_vars(&self.a.main_body, &mut vars);
         for v in &vars {
-            if self.cur_arrays.contains(v) { let _ = writeln!(self.out, "  NIA* {} = 0;", mangle(v)); }
+            if self.is_flat(v) { let d = self.flat_decl(v); let _ = writeln!(self.out, "{}", d); }
+            else if self.cur_arrays.contains(v) { let _ = writeln!(self.out, "  NIA* {} = 0;", mangle(v)); }
             else { let _ = writeln!(self.out, "  i64 {} = 0;", mangle(v)); }
         }
         for s in &self.a.main_body.clone() { self.stmt(s, 1, false); }
         self.out.push_str("  return 0;\n}\n");
         self.cur_arrays = HashSet::new();
+        self.flat = std::collections::HashMap::new();
     }
 
     fn stmt(&mut self, s: &Stmt, d: usize, fl: bool) {
@@ -572,6 +737,25 @@ impl<'p> CEmit<'p> {
                 let v = self.expr(inner, fl);
                 let _ = writeln!(self.out, "{}(void)({});", ind, v);
             }
+            // flat native buffer creation: `name = []`, allocated + filled here
+            // from the recognized fill loop's size/fill (the loop itself is skipped)
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value }
+                if self.is_flat(name) && matches!(strip_ats(value), Expr::Array(e) if e.is_empty()) =>
+            {
+                let info = self.flat[name].clone();
+                let n = self.expr(&info.size, fl);
+                let fill = self.expr(&info.fill, fl);
+                let m = mangle(name);
+                if info.byte {
+                    // uint8_t buffer: one malloc + memset (byte fill)
+                    let _ = writeln!(self.out, "{}{} = (uint8_t*)malloc((size_t)({}));", ind, m, n);
+                    let _ = writeln!(self.out, "{}memset({}, (int)({}), (size_t)({}));", ind, m, fill, n);
+                } else {
+                    // i64 buffer: malloc + a fill loop (fill may be any i64)
+                    let _ = writeln!(self.out, "{}{} = (i64*)malloc((size_t)({})*sizeof(i64));", ind, m, n);
+                    let _ = writeln!(self.out, "{}for(i64 _fi=0;_fi<({});_fi++) {}[_fi]=({});", ind, n, m, fill);
+                }
+            }
             Stmt::Let { name, value, .. } | Stmt::Assign { name, value } if self.cur_arrays.contains(name) => {
                 match strip_ats(value) {
                     Expr::Array(els) => {
@@ -594,7 +778,11 @@ impl<'p> CEmit<'p> {
                 let name = arr_ident(base).unwrap();
                 let i = self.expr(index, fl);
                 let v = self.expr(value, fl);
-                let _ = writeln!(self.out, "{}nia_set({}, {}, {});", ind, mangle(name), i, v);
+                if self.is_flat(name) {
+                    let _ = writeln!(self.out, "{}{}[{}] = ({});", ind, mangle(name), i, v);
+                } else {
+                    let _ = writeln!(self.out, "{}nia_set({}, {}, {});", ind, mangle(name), i, v);
+                }
             }
             Stmt::Return(Some(e)) => {
                 let v = self.expr(e, fl);
@@ -618,6 +806,9 @@ impl<'p> CEmit<'p> {
                 let _ = writeln!(self.out, "{}}}", ind);
             }
             Stmt::ForRange { var, start, end, inclusive, body } => {
+                // the flat-array fill loop is subsumed by the malloc+memset at the
+                // `[]` creation, so emit nothing for it.
+                if self.flat.keys().any(|n| fill_loop_of(s, n).is_some()) { return; }
                 // hidden counter: body may reassign `var` without affecting iteration
                 let sv = self.expr(start, fl);
                 let ev = self.expr(end, fl);
@@ -692,7 +883,12 @@ impl<'p> CEmit<'p> {
             Expr::Index { base, index } if arr_ident(base).map_or(false, |n| self.cur_arrays.contains(n)) => {
                 let name = arr_ident(base).unwrap();
                 let i = self.expr(index, fl);
-                format!("nia_get({}, {})", mangle(name), i)
+                if self.is_flat(name) {
+                    // flat buffer: direct index; a byte read promotes to i64
+                    format!("(i64){}[{}]", mangle(name), i)
+                } else {
+                    format!("nia_get({}, {})", mangle(name), i)
+                }
             }
             Expr::Call { callee, args } => {
                 // len(arr)/pop(arr) on a local array var
