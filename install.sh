@@ -12,8 +12,32 @@ command -v cargo >/dev/null 2>&1 || {
 }
 
 cd "$(dirname "$0")/nova"
+
+# The JIT backend (Cranelift) can only target x86-64 / aarch64 / riscv64 / s390x.
+# On other hosts — notably 32-bit ARM (Termux on many phones reports `armv7l`) —
+# cranelift fails to even compile, so we build with `--no-default-features`, which
+# turns the JIT off. The interpreter, bytecode VM, and AOT-via-C backend need
+# nothing from cranelift and stay fully functional.
+BUILD_FLAGS=""
+case "$(uname -m)" in
+  armv6l|armv7l|armv8l|arm)
+    echo "note: $(uname -m) has no JIT backend (cranelift can't target it) — building without the JIT."
+    echo "      interpreter, bytecode VM, and AOT (nova build) all still work."
+    BUILD_FLAGS="--no-default-features"
+    ;;
+esac
+
 echo "building Nova (release)..."
-cargo build --release
+if ! cargo build --release $BUILD_FLAGS; then
+  # Belt-and-suspenders: if a full build failed on an arch we didn't special-case
+  # (some other cranelift-unsupported host), retry once with the JIT disabled.
+  if [ -z "$BUILD_FLAGS" ]; then
+    echo "note: full build failed — retrying without the JIT (--no-default-features)..." >&2
+    cargo build --release --no-default-features
+  else
+    exit 1
+  fi
+fi
 
 BIN="target/release/nova"
 [ -x "$BIN" ] || { echo "error: build produced no binary" >&2; exit 1; }

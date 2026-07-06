@@ -168,21 +168,36 @@ fn main() {
                 .unwrap_or(100);
             let result = if flag_present(&args, "--no-jit") {
                 bytecode::run(&compiled, &interp)
-            } else if flag_present(&args, "--jit") {
-                match jit::Jit::compile(&program) {
-                    Some(j) => bytecode::run_jit(&compiled, &interp, &j),
-                    None => bytecode::run(&compiled, &interp), // nothing eligible
-                }
             } else {
-                let t = jit::TieredJit::new(&program, threshold);
-                t.warm_loops(); // compile loop kernels up-front, even if called once
-                let r = bytecode::run_tiered(&compiled, &interp, &t);
-                if flag_present(&args, "--jit-stats") {
-                    let names = t.compiled_functions();
-                    eprintln!("jit-stats: threshold={} compiled={} {:?}",
-                              t.threshold, names.len(), names);
+                #[cfg(feature = "jit")]
+                {
+                    if flag_present(&args, "--jit") {
+                        match jit::Jit::compile(&program) {
+                            Some(j) => bytecode::run_jit(&compiled, &interp, &j),
+                            None => bytecode::run(&compiled, &interp), // nothing eligible
+                        }
+                    } else {
+                        let t = jit::TieredJit::new(&program, threshold);
+                        t.warm_loops(); // compile loop kernels up-front, even if called once
+                        let r = bytecode::run_tiered(&compiled, &interp, &t);
+                        if flag_present(&args, "--jit-stats") {
+                            let names = t.compiled_functions();
+                            eprintln!("jit-stats: threshold={} compiled={} {:?}",
+                                      t.threshold, names.len(), names);
+                        }
+                        r
+                    }
                 }
-                r
+                // JIT disabled at build time (e.g. 32-bit ARM, where cranelift can't
+                // target the host): every mode falls back to the pure bytecode VM.
+                #[cfg(not(feature = "jit"))]
+                {
+                    let _ = threshold;
+                    if flag_present(&args, "--jit") {
+                        eprintln!("note: this build has no JIT (compiled without the `jit` feature); running the bytecode VM");
+                    }
+                    bytecode::run(&compiled, &interp)
+                }
             };
             if let Err(e) = result {
                 eprintln!("{}", diag::render("runtime error", &path, &src, &e));
@@ -197,9 +212,17 @@ fn main() {
                 Err(e) => { eprintln!("{}", e); exit(1); }
             };
             interp::fold_program(&mut program);
+            #[cfg(feature = "jit")]
             match jit::Jit::compile(&program) {
                 Some(j) => print!("{}", j.dump()),
                 None => eprintln!("jit: no integer-pure functions are eligible"),
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                let _ = &program;
+                eprintln!("jit: this build has no JIT (compiled without the `jit` feature); \
+                           rebuild with `--features jit` on a cranelift-supported arch \
+                           (x86-64/aarch64/riscv64/s390x)");
             }
         }
         "disasm" => {
@@ -242,6 +265,7 @@ fn main() {
                     let speedup = interp_t.as_secs_f64() / vm_t.as_secs_f64().max(1e-9);
                     eprintln!("interp: {:?}   vm: {:?}   speedup: {:.2}x", interp_t, vm_t, speedup);
                     // JIT, when any function is eligible
+                    #[cfg(feature = "jit")]
                     if let Some(jit) = jit::Jit::compile(&program) {
                         let interp2 = match interp::Interp::new(&program) {
                             Ok(i) => i,
@@ -802,9 +826,15 @@ fn run_embedded(src: &str) {
     interp.set_args(std::env::args().skip(1).collect());
     let result = match bytecode::compile_program(&program) {
         Ok(c) => {
-            let t = jit::TieredJit::new(&program, 100);
-            t.warm_loops();
-            bytecode::run_tiered(&c, &interp, &t)
+            #[cfg(feature = "jit")]
+            {
+                let t = jit::TieredJit::new(&program, 100);
+                t.warm_loops();
+                bytecode::run_tiered(&c, &interp, &t)
+            }
+            // No JIT in this build: run the pure bytecode VM (same outputs).
+            #[cfg(not(feature = "jit"))]
+            { bytecode::run(&c, &interp) }
         }
         Err(_) => interp.run().map(|_| ()),
     };

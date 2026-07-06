@@ -1126,30 +1126,44 @@ pub fn run(c: &Compiled, interp: &Interp) -> Result<(), String> {
     eval_main(c, interp).map(|_| ())
 }
 
+#[cfg(feature = "jit")]
 pub fn run_jit(c: &Compiled, interp: &Interp, jit: &crate::jit::Jit) -> Result<(), String> {
     eval_main_jit(c, interp, Some(jit)).map(|_| ())
 }
 
+#[cfg(feature = "jit")]
 pub fn run_tiered(c: &Compiled, interp: &Interp, t: &crate::jit::TieredJit) -> Result<(), String> {
     eval_main_tiered(c, interp, t).map(|_| ())
 }
 
+// Pure bytecode VM — always available, no JIT tier. This is the only VM entry
+// point when the `jit` feature is off (e.g. 32-bit ARM), and stays byte-identical
+// to `nova run`.
 pub fn eval_main(c: &Compiled, interp: &Interp) -> Result<Value, String> {
-    eval_main_opts(c, interp, None, None)
-}
-
-pub fn eval_main_jit(c: &Compiled, interp: &Interp, jit: Option<&crate::jit::Jit>) -> Result<Value, String> {
-    eval_main_opts(c, interp, jit, None)
-}
-
-pub fn eval_main_tiered(c: &Compiled, interp: &Interp, t: &crate::jit::TieredJit) -> Result<Value, String> {
-    eval_main_opts(c, interp, None, Some(t))
-}
-
-fn eval_main_opts(c: &Compiled, interp: &Interp, jit: Option<&crate::jit::Jit>,
-                  tiered: Option<&crate::jit::TieredJit>) -> Result<Value, String> {
     interp.init_consts()?;
-    let vm = Vm::new(c, interp, jit, tiered);
+    #[cfg(feature = "jit")]
+    let vm = Vm::new(c, interp, None, None);
+    #[cfg(not(feature = "jit"))]
+    let vm = Vm::new(c, interp);
+    finish_vm(&vm, c, interp)
+}
+
+#[cfg(feature = "jit")]
+pub fn eval_main_jit(c: &Compiled, interp: &Interp, jit: Option<&crate::jit::Jit>) -> Result<Value, String> {
+    interp.init_consts()?;
+    let vm = Vm::new(c, interp, jit, None);
+    finish_vm(&vm, c, interp)
+}
+
+#[cfg(feature = "jit")]
+pub fn eval_main_tiered(c: &Compiled, interp: &Interp, t: &crate::jit::TieredJit) -> Result<Value, String> {
+    interp.init_consts()?;
+    let vm = Vm::new(c, interp, None, Some(t));
+    finish_vm(&vm, c, interp)
+}
+
+// Run `main` on the VM and convert the escaping Flow exactly like `Interp::run`.
+fn finish_vm(vm: &Vm, c: &Compiled, interp: &Interp) -> Result<Value, String> {
     let main = &c.chunks[c.main];
     let result = vm.exec(main, vec![Value::Null; main.n_locals]);
     // Drive any still-queued fire-and-forget tasks to completion, exactly as the
@@ -1496,8 +1510,11 @@ fn pop_int(stack: &mut Vec<Value>) -> Result<i64, String> {
 struct Vm<'a> {
     c: &'a Compiled,
     interp: &'a Interp,
+    #[cfg(feature = "jit")]
     jit: Option<&'a crate::jit::Jit>,               // eager JIT (--jit)
+    #[cfg(feature = "jit")]
     tiered: Option<&'a crate::jit::TieredJit<'a>>,  // tiered JIT (default)
+    #[cfg(feature = "jit")]
     call_counts: RefCell<Vec<u64>>,                 // per-chunk, for tiering
     // free-lists of reusable buffers so calls don't allocate a fresh operand
     // stack / locals frame each time (big win for recursion-heavy code).
@@ -1506,12 +1523,22 @@ struct Vm<'a> {
 }
 
 impl<'a> Vm<'a> {
+    #[cfg(feature = "jit")]
     fn new(c: &'a Compiled, interp: &'a Interp,
            jit: Option<&'a crate::jit::Jit>,
            tiered: Option<&'a crate::jit::TieredJit<'a>>) -> Self {
         Vm {
             c, interp, jit, tiered,
             call_counts: RefCell::new(vec![0; c.chunks.len()]),
+            stack_pool: RefCell::new(Vec::new()),
+            locals_pool: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[cfg(not(feature = "jit"))]
+    fn new(c: &'a Compiled, interp: &'a Interp) -> Self {
+        Vm {
+            c, interp,
             stack_pool: RefCell::new(Vec::new()),
             locals_pool: RefCell::new(Vec::new()),
         }
@@ -1688,6 +1715,7 @@ impl<'a> Vm<'a> {
                     // Tiered JIT (default): count calls per chunk; once a function
                     // crosses the threshold, compile its callee closure and take
                     // the native path from then on. Cold functions never compile.
+                    #[cfg(feature = "jit")]
                     if let Some(t) = self.tiered {
                         if !t.is_compiled(&callee.name) && t.is_eligible(&callee.name) {
                             let mut counts = self.call_counts.borrow_mut();
@@ -1757,6 +1785,7 @@ impl<'a> Vm<'a> {
                     // Eager JIT (--jit): a compiled integer-pure function called with
                     // all-integer args runs as native code; a deopt re-runs it on
                     // the VM (safe — eligible functions are pure).
+                    #[cfg(feature = "jit")]
                     if let Some(jit) = self.jit {
                         let base = stack.len() - n;
                         if jit.is_compiled_f64(&callee.name)

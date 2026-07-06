@@ -12,90 +12,26 @@
 // only ever be faster, never wrong; the VM/interpreter stays the oracle.
 
 use std::collections::{HashMap, HashSet};
-use cranelift::prelude::*;
-use cranelift::prelude::types::{I64, I128};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Module, Linkage, FuncId};
 use crate::ast::*;
+
+// The cranelift native-code half lives in the `cl` submodule, gated behind the
+// `jit` feature. Everything above this point (the eligibility/kind analysis:
+// `eligible_set`, `float_eligible_set`, `numeric_kinds`, `FKind`, `array_vars`,
+// …) is pure Rust with no cranelift dependency and is also consumed by `aot.rs`,
+// so it stays compiled on every arch. When the feature is off (e.g. a 32-bit-ARM
+// build where cranelift can't target the host) the whole `cl` module — `Jit`,
+// `TieredJit`, and their codegen — simply isn't compiled, and the VM runs pure
+// bytecode. `Jit` and `TieredJit` are re-exported so callers see `jit::Jit` etc.
+#[cfg(feature = "jit")]
+pub use cl::{Jit, TieredJit};
 
 // functions with more parameters than this stay on the VM (keeps the call ABI
 // dispatch in `raw_call` finite)
 const MAX_ARITY: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Runtime helpers callable from JIT code.
-//
-// Local integer arrays: a JIT-eligible function may build arrays of i64 that
-// never escape it (see `array_vars`). They live in a thread-local arena of
-// Vec<i64> pools addressed by handle; `raw_call` resets the arena after each
-// top-level native call, so re-running on the VM after a deopt starts clean —
-// array effects are invisible outside the JIT, preserving purity. Bounds
-// violations and pops of an empty array set the deopt flag: the VM re-run then
-// raises the exact interpreter error (or returns its null for empty pop).
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static JIT_ARENA: std::cell::RefCell<(Vec<Vec<i64>>, usize)> =
-        std::cell::RefCell::new((Vec::new(), 0));
-}
-
-extern "C" fn nova_arr_new() -> i64 {
-    JIT_ARENA.with(|a| {
-        let (pool, live) = &mut *a.borrow_mut();
-        if *live < pool.len() { pool[*live].clear(); } else { pool.push(Vec::new()); }
-        *live += 1;
-        (*live - 1) as i64
-    })
-}
-
-extern "C" fn nova_arr_push(h: i64, v: i64) {
-    JIT_ARENA.with(|a| a.borrow_mut().0[h as usize].push(v));
-}
-
-extern "C" fn nova_arr_len(h: i64) -> i64 {
-    JIT_ARENA.with(|a| a.borrow().0[h as usize].len() as i64)
-}
-
-extern "C" fn nova_arr_get(dp: *mut i64, h: i64, i: i64) -> i64 {
-    JIT_ARENA.with(|a| {
-        let arr = &a.borrow().0[h as usize];
-        if i < 0 || i as usize >= arr.len() {
-            unsafe { *dp = 1; }
-            0
-        } else {
-            arr[i as usize]
-        }
-    })
-}
-
-extern "C" fn nova_arr_set(dp: *mut i64, h: i64, i: i64, v: i64) {
-    JIT_ARENA.with(|a| {
-        let arr = &mut a.borrow_mut().0[h as usize];
-        if i < 0 || i as usize >= arr.len() {
-            unsafe { *dp = 1; }
-        } else {
-            arr[i as usize] = v;
-        }
-    })
-}
-
-extern "C" fn nova_arr_pop(dp: *mut i64, h: i64) -> i64 {
-    JIT_ARENA.with(|a| {
-        match a.borrow_mut().0[h as usize].pop() {
-            Some(v) => v,
-            None => { unsafe { *dp = 1; } 0 } // interp returns null: deopt re-runs
-        }
-    })
-}
-
-fn jit_arena_reset() {
-    JIT_ARENA.with(|a| a.borrow_mut().1 = 0);
-}
-
-// f64 `%` and `**` have no Cranelift instruction; call back into Rust so the
-// results are bit-identical to the interpreter's `as_f(l) % as_f(r)` / powf.
-extern "C" fn nova_fmod(a: f64, b: f64) -> f64 { a % b }
-extern "C" fn nova_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
+// The JIT's runtime helpers (the `nova_arr_*` local-array arena, `nova_fmod`,
+// `nova_fpow`) are cranelift-linked and live inside the `cl` module below, so
+// they aren't compiled when the `jit` feature is off.
 
 // ---------------------------------------------------------------------------
 // Eligibility (a fixpoint over the call graph)
@@ -597,6 +533,7 @@ impl FloatCheck {
 // float and mixed math, to_float/to_int, and calls to other numeric functions),
 // and it always returns a definite kind. The returned map also records each
 // function's result kind (I or F).
+#[cfg_attr(not(feature = "jit"), allow(dead_code))] // consumed only by the JIT
 pub fn numeric_eligible_set(prog: &Program, int_set: &HashSet<String>, float_set: &HashSet<String>)
     -> (HashSet<String>, HashMap<String, FKind>)
 {
@@ -626,6 +563,7 @@ pub fn numeric_eligible_set(prog: &Program, int_set: &HashSet<String>, float_set
     (set, rets)
 }
 
+#[cfg_attr(not(feature = "jit"), allow(dead_code))] // consumed only by the JIT
 fn is_num_intrinsic(name: &str) -> bool { matches!(name, "to_float" | "to_int") }
 
 // Type-checker for the numeric track: like FloatCheck but int∘int is allowed
@@ -673,6 +611,7 @@ fn body_has_pow(body: &[Stmt]) -> bool {
 
 impl NumCheck {
     // returns the function's result kind if it is numeric-eligible
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))] // consumed only by the JIT
     fn check_fn(f: &Func) -> Option<FKind> {
         let mut c = NumCheck { kinds: HashMap::new() };
         for p in &f.params { c.kinds.insert(p.clone(), FKind::I); } // all params are ints
@@ -778,6 +717,7 @@ fn binop_pure(op: BinOp) -> bool {
 }
 
 // does this body contain a loop at any nesting depth?
+#[cfg_attr(not(feature = "jit"), allow(dead_code))] // consumed only by the JIT
 fn body_has_loop(body: &[Stmt]) -> bool {
     body.iter().any(|s| match s {
         Stmt::While { .. } | Stmt::ForRange { .. } | Stmt::ForEach { .. } => true,
@@ -900,8 +840,91 @@ fn calls_expr(e: &Expr, out: &mut Vec<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// JIT module
+// JIT module (cranelift-backed; compiled only when the `jit` feature is on)
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "jit")]
+mod cl {
+use super::*;
+use cranelift::prelude::*;
+use cranelift::prelude::types::{I64, I128};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Module, Linkage, FuncId};
+
+// ---------------------------------------------------------------------------
+// Runtime helpers callable from JIT code.
+//
+// Local integer arrays: a JIT-eligible function may build arrays of i64 that
+// never escape it (see `array_vars`). They live in a thread-local arena of
+// Vec<i64> pools addressed by handle; `raw_call` resets the arena after each
+// top-level native call, so re-running on the VM after a deopt starts clean —
+// array effects are invisible outside the JIT, preserving purity. Bounds
+// violations and pops of an empty array set the deopt flag: the VM re-run then
+// raises the exact interpreter error (or returns its null for empty pop).
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static JIT_ARENA: std::cell::RefCell<(Vec<Vec<i64>>, usize)> =
+        std::cell::RefCell::new((Vec::new(), 0));
+}
+
+extern "C" fn nova_arr_new() -> i64 {
+    JIT_ARENA.with(|a| {
+        let (pool, live) = &mut *a.borrow_mut();
+        if *live < pool.len() { pool[*live].clear(); } else { pool.push(Vec::new()); }
+        *live += 1;
+        (*live - 1) as i64
+    })
+}
+
+extern "C" fn nova_arr_push(h: i64, v: i64) {
+    JIT_ARENA.with(|a| a.borrow_mut().0[h as usize].push(v));
+}
+
+extern "C" fn nova_arr_len(h: i64) -> i64 {
+    JIT_ARENA.with(|a| a.borrow().0[h as usize].len() as i64)
+}
+
+extern "C" fn nova_arr_get(dp: *mut i64, h: i64, i: i64) -> i64 {
+    JIT_ARENA.with(|a| {
+        let arr = &a.borrow().0[h as usize];
+        if i < 0 || i as usize >= arr.len() {
+            unsafe { *dp = 1; }
+            0
+        } else {
+            arr[i as usize]
+        }
+    })
+}
+
+extern "C" fn nova_arr_set(dp: *mut i64, h: i64, i: i64, v: i64) {
+    JIT_ARENA.with(|a| {
+        let arr = &mut a.borrow_mut().0[h as usize];
+        if i < 0 || i as usize >= arr.len() {
+            unsafe { *dp = 1; }
+        } else {
+            arr[i as usize] = v;
+        }
+    })
+}
+
+extern "C" fn nova_arr_pop(dp: *mut i64, h: i64) -> i64 {
+    JIT_ARENA.with(|a| {
+        match a.borrow_mut().0[h as usize].pop() {
+            Some(v) => v,
+            None => { unsafe { *dp = 1; } 0 } // interp returns null: deopt re-runs
+        }
+    })
+}
+
+fn jit_arena_reset() {
+    JIT_ARENA.with(|a| a.borrow_mut().1 = 0);
+}
+
+// f64 `%` and `**` have no Cranelift instruction; call back into Rust so the
+// results are bit-identical to the interpreter's `as_f(l) % as_f(r)` / powf.
+extern "C" fn nova_fmod(a: f64, b: f64) -> f64 { a % b }
+extern "C" fn nova_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
 
 impl Drop for Jit {
     fn drop(&mut self) {
@@ -2990,3 +3013,5 @@ mod jit_tests {
         assert!(names.contains(&"kern".to_string()), "hot numeric fn must compile");
     }
 }
+
+} // mod cl (jit feature)
