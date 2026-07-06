@@ -7,8 +7,8 @@ the whole corpus + std + examples — the same honesty rule as everything else.
 | stage | artifact | reference | gate | status |
 |---|---|---|---|---|
 | 1. lexer | `selfhost/lexer.nova` | `nova tokens <file>` (src/tokens.rs) | `tests/selfhost_smoke.sh` — 95/95 files byte-identical, incl. the lexer lexing **itself**; 4-tier identical | ✅ done |
-| 2. parser | `selfhost/parser.nova` | `nova ast <file>` (src/astdump.rs) | 95/95 files byte-identical, incl. the parser parsing **itself + the lexer**; 4-tier identical | ✅ done |
-| 3. checker | `selfhost/checker.nova` | `nova check` diagnostics | same messages | planned |
+| 2. parser | `selfhost/parser.nova` | `nova ast <file>` (src/astdump.rs) | 96/96 files byte-identical, incl. the parser parsing **itself + the lexer**; 4-tier identical | ✅ done |
+| 3. checker | `selfhost/checker.nova` | `nova check <file>` (types::Checker + diag.rs) | 96/96 files byte-identical (diagnostics + `OK` line), incl. checking **itself**; 4-tier identical | ✅ done |
 | 4. eval | `selfhost/eval.nova` (tree-walk) | `nova run` | same program output | planned |
 | 5. fixpoint | Nova builds `selfhost/*` with itself | the Rust-built binary | outputs converge | planned |
 
@@ -97,7 +97,41 @@ themselves), and the parser is 4-tier identical (interp / vm / --no-jit / --jit)
 The parser parses **itself and the lexer** byte-identically — the real
 self-hosting property.
 
-## Honest scope
-Stages 1–2 (lexer, parser) are done and verified on every real file. The
-checker/eval/fixpoint stages are real, separate efforts (tracked above) —
-nothing beyond the parser is claimed self-hosted yet.
+## Stage 3 — the checker (done)
+
+`selfhost/checker.nova` reproduces `nova check` **byte-identically** on every
+real file: the `OK: parsed N item(s), no type errors` line for clean files, and
+the two diagnostics that the checker actually emits on the corpus — **undefined
+variable** (errors) and **assigned but never used** (warnings) — rendered with
+the exact `src/diag.rs` caret frame (`--> file:line:col`, gutter, `^`).
+
+### How it works
+- The tokenizer records **source positions** (line/col per token); every
+  statement is wrapped `(@ L C …)` so a diagnostic can be located.
+- It **inlines `use "file.nova"` imports** (dedup by path) so the item count `N`
+  matches `nova check` (which flattens imports).
+- It parses items into the canonical S-expression (reusing the stage-2 parser)
+  and walks them, reproducing the Rust checker's exact scoping: a **flat
+  per-function scope** where both `let` **and bare assignment declare** a name,
+  nested blocks (`if`/`while`/`for`/`try`/…) get a scope *snapshot* that doesn't
+  leak, and `match`/slice/struct-pattern bindings, lambda params, `for`/`catch`
+  vars all scope correctly. A bare identifier value `(v NAME)` unresolved against
+  scope + consts + top-level fns + builtins (with uppercase-unit-variant and
+  `_`-prefix leniency) is an `undefined variable`; a `let`-bound local never read
+  is `assigned but never used`.
+
+### The gate
+`tests/selfhost_smoke.sh`: `nova check f` == `nova run selfhost/checker.nova f`
+for all 96 files (corpus + std + examples + the lexer/parser/checker), and the
+checker is 4-tier identical and **checks itself** byte-identically.
+
+### Honest scope
+Only the checks that actually fire on the corpus are ported (name resolution +
+unused-local) — that IS byte-identical `nova check` here. The rich
+type/effect/move/refinement inference in `types.rs` emits no diagnostics on the
+corpus and is future work. Stages 4–5 (eval, fixpoint) follow.
+
+## Honest scope (overall)
+Stages 1–3 (lexer, parser, checker) are done and verified on every real file.
+The eval/fixpoint stages are real, separate efforts (tracked above) — nothing
+beyond the checker is claimed self-hosted yet.

@@ -32,8 +32,16 @@ for f in $FILES; do
 done
 echo "self-host parser: $pp/$total byte-identical vs \`nova ast\`"
 
+# --- stage 3: checker (name resolution + unused-local diagnostics) ----------
+cp=0
+for f in $FILES; do
+  if cmp -s <("$BIN" check "$f" 2>&1) <("$BIN" run selfhost/checker.nova "$f" 2>&1); then cp=$((cp+1))
+  else echo "  checker DIFF: $f"; fail=$((fail+1)); fi
+done
+echo "self-host checker: $cp/$total byte-identical vs \`nova check\`"
+
 # --- 4-tier discipline on the Nova front-ends themselves ---------------------
-for prog in selfhost/lexer.nova selfhost/parser.nova; do
+for prog in selfhost/lexer.nova selfhost/parser.nova selfhost/checker.nova; do
   case "$prog" in *lexer*) sub="tokens";; *) sub="ast";; esac
   f=std/list.nova
   "$BIN" run         "$prog" "$f" > "$t/a" 2>&1
