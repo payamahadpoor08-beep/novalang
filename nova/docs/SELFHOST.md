@@ -9,7 +9,7 @@ the whole corpus + std + examples — the same honesty rule as everything else.
 | 1. lexer | `selfhost/lexer.nova` | `nova tokens <file>` (src/tokens.rs) | `tests/selfhost_smoke.sh` — 95/95 files byte-identical, incl. the lexer lexing **itself**; 4-tier identical | ✅ done |
 | 2. parser | `selfhost/parser.nova` | `nova ast <file>` (src/astdump.rs) | 96/96 files byte-identical, incl. the parser parsing **itself + the lexer**; 4-tier identical | ✅ done |
 | 3. checker | `selfhost/checker.nova` | `nova check <file>` (types::Checker + diag.rs) | 96/96 files byte-identical (diagnostics + `OK` line), incl. checking **itself**; 4-tier identical | ✅ done |
-| 4. eval | `selfhost/eval.nova` (tree-walk) | `nova run` | same program output | planned |
+| 4. eval | `selfhost/eval.nova` (tree-walk) | `nova run <file>` | program output byte-identical on every corpus + std + example file | ✅ done |
 | 5. fixpoint | Nova builds `selfhost/*` with itself | the Rust-built binary | outputs converge | planned |
 
 ## Stage 1 — the lexer (done)
@@ -129,9 +129,57 @@ checker is 4-tier identical and **checks itself** byte-identically.
 Only the checks that actually fire on the corpus are ported (name resolution +
 unused-local) — that IS byte-identical `nova check` here. The rich
 type/effect/move/refinement inference in `types.rs` emits no diagnostics on the
-corpus and is future work. Stages 4–5 (eval, fixpoint) follow.
+corpus and is future work.
+
+## Stage 4 — the evaluator (done)
+
+`selfhost/eval.nova` is a complete tree-walking interpreter written in Nova. It
+loads a program (inlining `use "file"` imports), parses every item into the
+canonical S-expression with the **stage-2 parser reused verbatim**, registers
+functions / consts / structs / enums / methods / trait-impls / type-refinements /
+`migrate` blocks / `machine`s / generators, then runs `main` — printing
+**byte-identically to `nova run`** for every corpus + std + example file.
+
+### What it reproduces (the whole runtime, not a subset)
+- **Values** native to Nova plus tagged carriers for the compound kinds:
+  `__nv_struct__` (alphabetical field display, matching the reference `BTreeMap`
+  order), `__nv_enum__`, `__nv_clo__` (closures with captured env), `__nv_range__`
+  (expanded to an array when printed or iterated), `__nv_chan__`, `__nv_gen__`,
+  `__nv_task__`, `__nv_machine__`.
+- **Control flow** via a `[flow,value]` tuple (`n`/`r`/`b`/`c`) plus native Nova
+  `throw`/`try` for exceptions; **expression blocks** run in a shadowing child
+  scope, swallow `throw`, run the tail on `break`, and yield the value on
+  `return`; **`break` at function level acts as a return**; **`defer`** fires
+  block-scoped in LIFO order on every exit path; `try`/`catch`/`finally` with
+  finally-wins semantics; a catch-less `try` swallows.
+- **Pattern matching** — literals, ranges, `or`, tuple, **slice with `...rest`
+  binding (prefix + suffix)**, struct, enum.
+- **The full builtin surface** (~200): collections, strings, math (incl.
+  `pi`/`e`/`tau`/`phi`, `lerp`, `array(n,fill)`), files, `exec`/dirs, seeded
+  `rand`, `time`, JSON, asserts, `min`/`max`/`min_of`/`max_of`, `count`, negative
+  and open-ended **slicing**.
+- **Lazy generators** (`yield` → replayed body, `.take`/`.next`/`for`),
+  **channels** (`chan`/`send`/`recv`/`<-`/`->>`), **cooperative async** (`spawn`
+  returns a task driven by `.await`/`recv`/end-of-program drain, matching the
+  reference's deferred scheduling), **`select`**.
+- **Refinement types** (`type Pos = Int if it > 0` enforced on annotated `let`),
+  **state machines** (`machine`/`send`/`state_of`, invalid-transition throw),
+  **state migration** (`migrate from A to B`), **big integers** (digit-fold so
+  literals past i64 promote), and the **attribute runtime**: `#[memo]`,
+  `#[self_healing]` (retry), `#[requires]`/`#[ensures]` contracts, `#[trace]`,
+  `#[profile]`, `#[time_travel]`, `#[hot_swap]`, `#[integrity]`, `#[version]`, with
+  the `hot_swap`/`integrity_of`/`profile_of`/`attrs_of`/`history_of`/`meta_of`/
+  `encrypt`/`decrypt`/`is_debugged` builtins.
+
+### The gate
+`tests/selfhost_smoke.sh`: `nova run f` == `nova run selfhost/eval.nova f` for
+**all 93** corpus + std + example files, and the evaluator is 4-tier identical
+(interp / vm / --no-jit / --jit). The three compute-heavy kernels
+(`aot_mandel`, `jit_arrays`, `numeric_mixed`) are a tree-walker running on top of
+the reference tree-walker, so they need a generous per-file timeout — the output
+is identical, only slower.
 
 ## Honest scope (overall)
-Stages 1–3 (lexer, parser, checker) are done and verified on every real file.
-The eval/fixpoint stages are real, separate efforts (tracked above) — nothing
-beyond the checker is claimed self-hosted yet.
+Stages 1–4 (lexer, parser, checker, evaluator) are done and verified byte-
+identical on every real file. Stage 5 (the fixpoint bootstrap — Nova building
+`selfhost/*` with itself and reproducing the Rust binary) is the remaining step.
