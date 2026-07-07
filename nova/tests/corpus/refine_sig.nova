@@ -1,0 +1,15 @@
+// Refinement types on parameters and returns must be enforced identically on
+// every tier (the refined function runs on the interpreter oracle; the VM/JIT
+// reach the same checks). Valid values pass unchanged.
+type Pos = Int if it > 0;
+type NonEmpty = Str if len(it) > 0;
+
+fn scale(x: Pos) -> Pos { x * 3 }
+fn tag(s: NonEmpty) -> NonEmpty { s + "!" }
+
+fn main() {
+  print(scale(7))          // 21
+  print(tag("hi"))         // hi!
+  // a caught violation prints the same message on every tier
+  try { print(scale(0 - 2)) } catch e { print(e) }
+}

@@ -118,7 +118,14 @@ fn main() {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
             match load_program(&path) {
                 Ok(p) => {
-                    let (errors, warnings) = types::Checker::new(&p).check(&p);
+                    let (mut errors, warnings) = types::Checker::new(&p).check(&p);
+                    // compile-time refinement checking: constant values that violate
+                    // a refined type's predicate are rejected here, not at runtime.
+                    let mut folded = p.clone();
+                    interp::fold_program(&mut folded);
+                    if let Ok(it) = interp::Interp::new(&folded) {
+                        errors.extend(it.static_refinement_errors(&folded));
+                    }
                     for w in &warnings {
                         eprintln!("{}", diag::render("warning", &path, &src, w));
                     }

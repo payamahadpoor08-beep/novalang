@@ -168,6 +168,7 @@ pub fn compile_program_opt(prog: &Program, optimize_flag: bool) -> Result<Compil
     // behaviour, so such functions may still be compiled.
     let mut compiled_names: Vec<String> = funcs.values()
         .filter(|f| func_compilable(f) && !uses_refined_let(&f.body, &refined)
+            && !func_refined_sig(f, &refined)
             && !f.attrs.iter().any(|a| is_behavioural_attr(&a.name)))
         .map(|f| f.name.clone())
         .collect();
@@ -268,6 +269,15 @@ fn uses_refined_let(body: &[Stmt], refined: &std::collections::HashSet<&str>) ->
             || finally_body.as_ref().map_or(false, |b| uses_refined_let(b, refined)),
         _ => false,
     })
+}
+
+// Does this function's signature use a refinement type on a parameter or its
+// return? Such functions are enforced at the interpreter's call boundary (params
+// checked on entry, return on exit), so — like refined `let`s and behavioural
+// attributes — they stay interp-only and every tier reaches the same checks.
+fn func_refined_sig(f: &Func, refined: &std::collections::HashSet<&str>) -> bool {
+    f.param_types.iter().flatten().any(|t| refined.contains(t.as_str()))
+        || f.ret_type.as_ref().map_or(false, |t| refined.contains(t.as_str()))
 }
 
 fn stmt_compilable(s: &Stmt) -> bool {
