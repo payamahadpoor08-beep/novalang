@@ -1091,10 +1091,15 @@ impl Interp {
         errs
     }
 
+    // Only the direct (top-level) statements of a function body are scanned: a
+    // top-level `let x: T = <bad constant>` unconditionally violates its invariant,
+    // so it is safe to reject at compile time. Bindings nested inside `try`
+    // (intentionally caught), or `if`/loop branches (conditionally reached) are
+    // left to the runtime check, avoiding any false compile-time rejection.
     fn scan_refined_consts(&self, body: &[Stmt], errs: &mut Vec<String>) {
         for s in body {
-            match s {
-                Stmt::Let { ty: Some(tn), value, .. } if self.refinements.contains_key(tn) => {
+            if let Stmt::Let { ty: Some(tn), value, .. } = s {
+                if self.refinements.contains_key(tn) {
                     if let Some(v) = Self::const_literal(value) {
                         if self.refine_check(tn, &v, &Scope::new()).is_err() {
                             errs.push(format!(
@@ -1102,18 +1107,6 @@ impl Interp {
                         }
                     }
                 }
-                Stmt::If { then, els, .. } => {
-                    self.scan_refined_consts(then, errs);
-                    if let Some(e) = els { self.scan_refined_consts(e, errs); }
-                }
-                Stmt::While { body, .. } | Stmt::ForRange { body, .. }
-                | Stmt::ForEach { body, .. } | Stmt::Defer(body) => self.scan_refined_consts(body, errs),
-                Stmt::TryCatch { body, catch_body, finally_body, .. } => {
-                    self.scan_refined_consts(body, errs);
-                    if let Some(b) = catch_body { self.scan_refined_consts(b, errs); }
-                    if let Some(b) = finally_body { self.scan_refined_consts(b, errs); }
-                }
-                _ => {}
             }
         }
     }

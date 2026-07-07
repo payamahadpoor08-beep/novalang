@@ -2055,6 +2055,20 @@ mod vm_tests {
     #[test] fn if_value() { assert!(matches!(same("fn main(){ if 1<2 {10} else {20} }"), Value::Int(10))); }
     #[test] fn loops() { same("fn main(){ total=0; for i in 1..=100 { total = total + i }; total }"); }
     #[test] fn recursion() { same("fn f(n){ if n<2 {n} else {f(n-1)+f(n-2)} } fn main(){ f(15) }"); }
+    // Refinement types on parameters and returns are enforced identically on the
+    // interpreter and the VM (refined-signature functions run interp-only, so the
+    // VM reaches the same checks via call_named).
+    #[test] fn refinement_param_return() {
+        assert!(matches!(
+            same("type Pos = Int if it > 0; fn scale(x: Pos) -> Pos { x*3 } fn main(){ scale(7) }"),
+            Value::Int(21)));
+    }
+    #[test] fn refinement_violation_caught() {
+        // a refined-parameter violation throws a catchable error, same on both tiers
+        assert!(matches!(
+            same("type Pos = Int if it > 0; fn f(x: Pos){ x } fn main(){ r=0; try { f(0-1) } catch e { r=1 }; r }"),
+            Value::Int(1)));
+    }
     #[test] fn short_circuit() { same("fn main(){ (1<2) && (3>1) }"); same("fn main(){ false || (2==2) }"); }
     // Phase 2: delegated heap features must match the interpreter exactly
     #[test] fn arrays_and_foreach() {
