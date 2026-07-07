@@ -1061,6 +1061,75 @@ impl Interp {
         result
     }
 
+    // If `tn` names a refinement type, verify `v` satisfies its predicate (over the
+    // bound name `it`). This is the single enforcement point shared by refined
+    // `let`s, function parameters and returns, so a value of a refined type always
+    // satisfies its invariant wherever it is introduced — a soundness guarantee the
+    // interpreter is the oracle for (refined-typed functions run on the interpreter
+    // tier; see `uses_refinements` in bytecode.rs, which keeps every tier identical).
+    pub(crate) fn refine_check(&self, tn: &str, v: &Value, scope: &Scope) -> Result<(), String> {
+        if let Some(pred) = self.refinements.get(tn).cloned() {
+            let mut pscope = scope.clone();
+            pscope.insert("it".to_string(), v.clone());
+            if !self.eval(&pred, &pscope)?.is_truthy() {
+                return Err(format!("refinement `{}` violated by value {}", tn, v));
+            }
+        }
+        Ok(())
+    }
+
+    // Compile-time refinement checking: a refined `let x: T = <constant>` whose
+    // constant value violates T's predicate is rejected before the program ever
+    // runs (reported by `nova check`), rather than crashing at runtime. Only fires
+    // for decidable constant values, so it never produces a false positive.
+    pub fn static_refinement_errors(&self, program: &Program) -> Vec<String> {
+        let mut errs = Vec::new();
+        if self.refinements.is_empty() { return errs; }
+        for item in &program.items {
+            if let Item::Func(f) = item { self.scan_refined_consts(&f.body, &mut errs); }
+        }
+        errs
+    }
+
+    // Only the direct (top-level) statements of a function body are scanned: a
+    // top-level `let x: T = <bad constant>` unconditionally violates its invariant,
+    // so it is safe to reject at compile time. Bindings nested inside `try`
+    // (intentionally caught), or `if`/loop branches (conditionally reached) are
+    // left to the runtime check, avoiding any false compile-time rejection.
+    fn scan_refined_consts(&self, body: &[Stmt], errs: &mut Vec<String>) {
+        for s in body {
+            if let Stmt::Let { ty: Some(tn), value, .. } = s {
+                if self.refinements.contains_key(tn) {
+                    if let Some(v) = Self::const_literal(value) {
+                        if self.refine_check(tn, &v, &Scope::new()).is_err() {
+                            errs.push(format!(
+                                "refinement `{}` violated at compile time by constant {}", tn, v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A compile-time-known value (literal, or a negated numeric literal). `None`
+    // for anything not decidably constant — those defer to the runtime check.
+    fn const_literal(e: &Expr) -> Option<Value> {
+        match e {
+            Expr::At { expr, .. } => Self::const_literal(expr),
+            Expr::Int(n) => Some(Value::Int(*n)),
+            Expr::Float(x) => Some(Value::Float(*x)),
+            Expr::Bool(b) => Some(Value::Bool(*b)),
+            Expr::Str(s) => Some(Value::Str(s.clone())),
+            Expr::Null => Some(Value::Null),
+            Expr::Unary { op: UnOp::Neg, expr } => match Self::const_literal(expr)? {
+                Value::Int(n) => Some(Value::Int(-n)),
+                Value::Float(x) => Some(Value::Float(-x)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     // Run a non-generator, non-async user function body over a pooled scope frame,
     // converting the resulting Flow to a value exactly as the call boundary does.
     fn run_user_body(&self, func: &Func, mut args: Vec<Value>) -> Result<Value, String> {
@@ -1068,18 +1137,38 @@ impl Interp {
         let mut scope = Scope::from_backing(backing);
         for (p, v) in func.params.iter().zip(args.drain(..)) { scope.insert(p.clone(), v); }
         self.give_args(args);
-        let result = self.exec_block(&func.body, &mut scope);
+        // Enforce refinement types on parameters and the return value (cheap
+        // `is_empty` guard skips this entirely for programs that declare none).
+        let refined = !self.refinements.is_empty();
+        let outcome = (|| -> Result<Value, String> {
+            if refined {
+                for (i, p) in func.params.iter().enumerate() {
+                    if let Some(Some(tn)) = func.param_types.get(i) {
+                        let v = scope.get(p).cloned().unwrap_or(Value::Null);
+                        self.refine_check(tn, &v, &scope)?;
+                    }
+                }
+            }
+            let flow = self.exec_block(&func.body, &mut scope)?;
+            let v = match flow {
+                Flow::Return(v) | Flow::Break(v) => v,
+                Flow::Continue | Flow::Normal => Value::Null,
+                Flow::Throw(e) => {
+                    *self.pending_throw.borrow_mut() = Some(e);
+                    return Err(THROW_SENTINEL.to_string());
+                }
+            };
+            if refined {
+                if let Some(tn) = &func.ret_type {
+                    self.refine_check(tn, &v, &scope)?;
+                }
+            }
+            Ok(v)
+        })();
         let mut backing = scope.into_backing();
         backing.clear();
         self.scope_pool.borrow_mut().push(backing);
-        match result? {
-            Flow::Return(v) | Flow::Break(v) => Ok(v),
-            Flow::Continue | Flow::Normal => Ok(Value::Null),
-            Flow::Throw(e) => {
-                *self.pending_throw.borrow_mut() = Some(e);
-                Err(THROW_SENTINEL.to_string())
-            }
-        }
+        outcome
     }
 
     pub(crate) fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
