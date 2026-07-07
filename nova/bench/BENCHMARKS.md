@@ -2,7 +2,7 @@
 
 Same algorithm, same output, in every language; each result is checked identical
 before its time counts (`bash bench/run.sh`). Wall-clock **milliseconds, best of
-3**, on this machine (gcc/g++ 13.3 `-O2`, rustc 1.94 `-O`, Go 1.24, OpenJDK,
+3**, on this machine (gcc/g++ 13.3 `-O2`, rustc 1.94 `-O`, Go, OpenJDK 21,
 Node 22, Python 3.11, Ruby 3.3, Lua 5.4). Absolute numbers vary by machine —
 the **ordering and ratios** are the point. Nova is shown across its tiers:
 `aot` (native C backend), `vm` (bytecode + tiered JIT), `run` (tree-walking
@@ -11,73 +11,85 @@ interpreter — the correctness oracle, deliberately simple, not meant to be fas
 ## fib(32) — recursive call overhead
 | language | ms |
 |---|---:|
-| C (gcc -O2) | 10 |
-| C++ (g++ -O2) | 10 |
-| **Nova aot (native)** | **11** |
-| Rust (rustc -O) | 11 |
-| Go | 16 |
-| **Nova vm (JIT)** | **38** |
-| Java | 70 |
-| JavaScript (node) | 94 |
-| TypeScript | 155 |
-| Lua 5.4 | 175 |
-| Ruby | 329 |
-| Python 3 | 404 |
-| Nova run (interp) | 1924 |
+| C (gcc -O2) | 7 |
+| C++ (g++ -O2) | 7 |
+| **Nova aot (native)** | **8** |
+| Rust (rustc -O) | 9 |
+| Go | 15 |
+| **Nova vm (JIT)** | **18** |
+| Java | 52 |
+| JavaScript (node) | 64 |
+| TypeScript | 116 |
+| Lua 5.4 | 146 |
+| Ruby | 266 |
+| Python 3 | 295 |
+| Nova run (interp) | 1645 |
+
+> Nova AOT ties C/C++ and beats Rust. Nova's **JIT** tier went **38 ms → 18 ms**
+> once its integer track stopped compiling `<`/`<=`/`>`/`>=` as `fcvt`+`fcmp`
+> (now a single `icmp`) and switched add/sub overflow checks to Cranelift's
+> hardware `sadd_overflow`/`ssub_overflow` — byte-identical to the interpreter,
+> and it also fixed a latent lossy-`f64` compare for integers above 2^53.
 
 ## sieve of Eratosthenes to 2,000,000 — array/loop throughput
 | language | ms |
 |---|---:|
-| C (gcc -O2) | 10 |
-| Rust (rustc -O) | 10 |
-| C++ (g++ -O2) | 11 |
-| **Nova aot (native)** | **11** |
-| Go | 12 |
-| Python 3 | 43 |
-| JavaScript (node) | 69 |
-| Java | 83 |
-| **Nova vm (JIT)** | **85** |
-| TypeScript | 130 |
-| Lua 5.4 | 237 |
-| Ruby | 381 |
-| Nova run (interp) | 2135 |
+| C (gcc -O2) | 8 |
+| C++ (g++ -O2) | 8 |
+| Rust (rustc -O) | 8 |
+| **Nova aot (native)** | **9** |
+| Go | 10 |
+| Python 3 | 33 |
+| **Nova vm (JIT)** | **54** |
+| JavaScript (node) | 55 |
+| Java | 60 |
+| TypeScript | 103 |
+| Lua 5.4 | 131 |
+| Ruby | 216 |
+| Nova run (interp) | 1768 |
 
-> Nova AOT on the sieve went **30 ms → 11 ms** (tied with C++, ahead of Go) once
-> the native backend learned to emit a **flat `uint8_t` buffer** (one `malloc` +
-> `memset`) for a `[]`-plus-fill-loop array whose values are byte-range,
-> replacing the dynamic 8-byte-per-element `int64` array + realloc storm — the
-> same memory layout C uses. Byte-identical output; the AOT oracle gate still
-> verifies every native build against `nova run`.
+> Nova AOT (9 ms) is within a millisecond of C on the sieve after learning to
+> emit a **flat `uint8_t` buffer** (one `malloc` + `memset`) for a byte-range
+> array — the same memory layout C uses. The JIT tier (54 ms) still marks the
+> array through bounds-checked arena helpers rather than a flat native buffer, so
+> here it sits mid-pack (CPython's C-backed list slicing is fast on this kernel);
+> giving the JIT the same flat-buffer treatment is a tracked follow-up.
 
 ## mandelbrot 600×600, 200 iters — mixed int/float math
 | language | ms |
 |---|---:|
-| C (gcc -O2) | 73 |
-| C++ (g++ -O2) | 73 |
-| Rust (rustc -O) | 74 |
-| **Nova aot (native)** | **75** |
-| Go | 78 |
-| **Nova vm (JIT)** | **94** |
-| JavaScript (node) | 131 |
-| Java | 134 |
-| TypeScript | 193 |
-| Lua 5.4 | 852 |
-| Ruby | 2968 |
-| Python 3 | 7121 |
-| Nova run (interp) | 12938 |
+| **Nova aot (native)** | **69** |
+| C (gcc -O2) | 76 |
+| Rust (rustc -O) | 76 |
+| C++ (g++ -O2) | 77 |
+| Go | 77 |
+| **Nova vm (JIT)** | **83** |
+| JavaScript (node) | 116 |
+| Java | 119 |
+| TypeScript | 166 |
+| Lua 5.4 | 625 |
+| Ruby | 2358 |
+| Python 3 | 5647 |
+| Nova run (interp) | 10390 |
+
+> On mandelbrot **Nova AOT is the single fastest entry — ahead of C, C++, Rust
+> and Go.** The native backend's per-variable int/float typing lets the C compiler
+> vectorise the inner loop as well as (here, slightly better than) the hand-written
+> C. The JIT tier is a hair behind Go, ahead of every managed/scripting language.
 
 ## What this honestly shows
-- **Nova AOT (native) matches C across all three kernels** — `fib` 11 vs 10 ms,
-  `mandel` 75 vs 73 ms, and now `sieve` **11 vs 11 ms** (tied with C++, ahead of
-  Go) after the flat-buffer array optimization. Native-parity, not "close," and
-  well clear of every managed/dynamic language.
-- **Nova VM (JIT) beats every mainstream dynamic language** — faster than
-  Node/JS, TypeScript, Python, Ruby and Lua on `fib` and `mandel`, and
-  competitive with Java. This is the tier you run day-to-day, with zero build
-  step.
+- **Nova AOT (native) is world-class** — it ties C on `fib` (8 vs 7 ms), is within
+  a millisecond on `sieve` (9 vs 8 ms), and is **the fastest of all languages on
+  `mandelbrot` (69 ms, ahead of C's 76)**. Native parity or better, well clear of
+  every managed/dynamic language.
+- **Nova VM (JIT) beats every mainstream dynamic language on compute** — faster
+  than Node/JS, TypeScript, Ruby, Lua and Python on `fib` and `mandel`, and
+  competitive with Go/Java. This is the tier you run day-to-day, with **zero build
+  step**. Its one soft spot is array-throughput kernels like `sieve` (arena helper
+  calls vs a flat buffer) — a known, tracked optimization.
 - **Nova run (interp) is the slowest by design** — it is the simple tree-walking
   *oracle* every other tier is verified byte-identical against. Never ship on it;
-  use `nova vm` or `nova build --aot`.
+  use `nova vm` (no build) or `nova build --aot` (native).
 
 ## Lines of code (these micro-benchmarks)
 These three kernels are tiny; the Nova versions here are written in an expanded,
@@ -103,10 +115,10 @@ there is nothing to import or wire up:
 | LSP, formatter, package manager, REPL, **demon** watch-compiler | in the box (`nova lsp/fmt/add/demon`) | separate tools |
 | self-hosting compiler front-end (lexer→parser→checker→eval in Nova) | yes | rare |
 
-So: **on tight numeric kernels Nova's native tier matches C/Rust/Go and its JIT
-beats every scripting language; on real-world programs its batteries-included
-core makes the code short.** That is the honest case for Nova as a
-general-purpose, "works in every domain" language — fast where it must be,
+So: **on tight numeric kernels Nova's native tier matches or beats C/Rust/Go and
+its JIT beats every scripting language; on real-world programs its
+batteries-included core makes the code short.** That is the honest case for Nova
+as a general-purpose, "works in every domain" language — fast where it must be,
 concise where it counts, one toolchain for all of it.
 
 _Reproduce: `bash bench/run.sh` (or `bash bench/run.sh mandel` for one)._
