@@ -881,6 +881,25 @@ extern "C" fn nova_arr_push(h: i64, v: i64) {
     JIT_ARENA.with(|a| a.borrow_mut().0[h as usize].push(v));
 }
 
+// Allocate a fresh arena array of `n` copies of `v` in one shot — the fused form
+// of `s = []; for _ in 0..n { push(s, v) }`. `n <= 0` yields an empty array,
+// matching a for-range that never iterates. Byte-identical to the push loop.
+extern "C" fn nova_arr_fill(n: i64, v: i64) -> i64 {
+    JIT_ARENA.with(|a| {
+        let (pool, live) = &mut *a.borrow_mut();
+        let cnt = if n <= 0 { 0 } else { n as usize };
+        if *live < pool.len() {
+            let slot = &mut pool[*live];
+            slot.clear();
+            slot.resize(cnt, v);
+        } else {
+            pool.push(vec![v; cnt]);
+        }
+        *live += 1;
+        (*live - 1) as i64
+    })
+}
+
 extern "C" fn nova_arr_len(h: i64) -> i64 {
     JIT_ARENA.with(|a| a.borrow().0[h as usize].len() as i64)
 }
@@ -990,6 +1009,7 @@ impl Jit {
             .finish(settings::Flags::new(flags)).ok()?;
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         builder.symbol("nova_arr_new", nova_arr_new as *const u8);
+        builder.symbol("nova_arr_fill", nova_arr_fill as *const u8);
         builder.symbol("nova_arr_push", nova_arr_push as *const u8);
         builder.symbol("nova_arr_len", nova_arr_len as *const u8);
         builder.symbol("nova_arr_get", nova_arr_get as *const u8);
@@ -1003,8 +1023,9 @@ impl Jit {
         let mut helpers: HashMap<&'static str, FuncId> = HashMap::new();
         {
             let f64t = types::F64;
-            let sigs: [(&'static str, &[Type], &[Type]); 8] = [
+            let sigs: [(&'static str, &[Type], &[Type]); 9] = [
                 ("nova_arr_new", &[], &[I64]),
+                ("nova_arr_fill", &[I64, I64], &[I64]),
                 ("nova_arr_push", &[I64, I64], &[]),
                 ("nova_arr_len", &[I64], &[I64]),
                 ("nova_arr_get", &[I64, I64, I64], &[I64]),
@@ -2109,6 +2130,21 @@ impl<'p> TieredJit<'p> {
 // Per-function code generation
 // ---------------------------------------------------------------------------
 
+// Is `e` a fill value that is the same on every iteration of a loop counted by
+// `var`? Conservative: literals and outer variables (≠ var) are invariant; simple
+// unary/binary/`@` compositions of invariants are too; anything else returns false
+// (so we don't fuse). Never returns true for an expression that reads `var`.
+fn fill_value_ok(e: &Expr, var: &str) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Null => true,
+        Expr::Ident(n) => n != var,
+        Expr::At { expr, .. } => fill_value_ok(expr, var),
+        Expr::Unary { expr, .. } => fill_value_ok(expr, var),
+        Expr::Binary { lhs, rhs, .. } => fill_value_ok(lhs, var) && fill_value_ok(rhs, var),
+        _ => false,
+    }
+}
+
 struct LoopCtx { header: Block, exit: Block }
 
 struct FnGen<'a, 'b> {
@@ -2211,8 +2247,61 @@ impl<'a, 'b> FnGen<'a, 'b> {
         v
     }
 
+    // Recognise `s = []` immediately followed by `for _ in 0..N { push(s, V) }`
+    // where V does not depend on the loop counter — the idiomatic way to build a
+    // filled array. Returns (array_name, count_expr, value_expr) so the caller can
+    // emit a single `nova_arr_fill(N, V)` instead of one `push` call per element.
+    fn fill_fusion<'s>(&self, stmts: &'s [Stmt]) -> Option<(&'s str, &'s Expr, &'s Expr)> {
+        if stmts.len() < 2 { return None; }
+        // stmts[0]: `name = []` (empty array literal) on a known array var
+        let name = match &stmts[0] {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                match strip_at(value) { Expr::Array(e) if e.is_empty() => name.as_str(), _ => return None }
+            }
+            _ => return None,
+        };
+        if !self.arrays.contains(name) { return None; }
+        // stmts[1]: `for VAR in 0..END { push(name, VALUE) }`, exclusive, one stmt
+        let (var, end, count_body) = match &stmts[1] {
+            Stmt::ForRange { var, start, end, inclusive: false, body } => {
+                match strip_at(start) { Expr::Int(0) => (var.as_str(), end, body), _ => return None }
+            }
+            _ => return None,
+        };
+        if count_body.len() != 1 { return None; }
+        let value = match &count_body[0] {
+            Stmt::Expr(e) => match strip_at(e) {
+                Expr::Call { callee, args } if callee == "push" && args.len() == 2
+                    && as_ident(&args[0]) == Some(name) => &args[1],
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // the pushed value must be identical every iteration: only fuse when it is
+        // provably loop-invariant (a constant/outer variable, conservatively). The
+        // fill loop's body is just the push, so an outer variable can't change
+        // across iterations; anything we can't prove invariant falls back to the
+        // ordinary push-loop lowering (still correct, just not fused).
+        if !fill_value_ok(value, var) { return None; }
+        Some((name, end, value))
+    }
+
     fn lower(&mut self, body: &[Stmt]) -> Option<()> {
-        for s in body { self.stmt(s)?; }
+        let mut i = 0;
+        while i < body.len() {
+            if self.returned { break; }
+            if let Some((name, count, value)) = self.fill_fusion(&body[i..]) {
+                let n = self.expr(count)?;
+                let v = self.expr(value)?;
+                let h = self.helper_call("nova_arr_fill", &[n, v], false)?;
+                let var = self.declare(name);
+                self.b.def_var(var, h);
+                i += 2;
+                continue;
+            }
+            self.stmt(&body[i])?;
+            i += 1;
+        }
         if !self.returned {
             let zero = self.b.ins().iconst(I64, 0);
             self.b.ins().return_(&[zero]);
