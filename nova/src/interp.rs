@@ -474,6 +474,83 @@ enum Sock {
     Stream(std::net::TcpStream),
 }
 
+// --- crypto / encoding primitives (dependency-free) -------------------------
+// Standard base64 (RFC 4648) and SHA-1, used by base64_*/sha1_hex/ws_accept.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(B64[((n >> 18) & 63) as usize] as char);
+        out.push(B64[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62), b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let (mut acc, mut nbits, mut out) = (0u32, 0u32, Vec::new());
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() { continue; }
+        acc = (acc << 6) | val(c)?;
+        nbits += 6;
+        if nbits >= 8 { nbits -= 8; out.push(((acc >> nbits) & 0xFF) as u8); }
+    }
+    Some(out)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let ml = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 { msg.push(0); }
+    msg.extend_from_slice(&ml.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+        }
+        for i in 16..80 { w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1); }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
+            e = d; d = c; c = b.rotate_left(30); b = a; a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b); h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d); h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for i in 0..5 { out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes()); }
+    out
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes { s.push_str(&format!("{:02x}", b)); }
+    s
+}
+
 impl Interp {
     #[inline]
     fn take_args(&self) -> Vec<Value> {
@@ -1471,6 +1548,90 @@ impl Interp {
                 let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_close expects a handle".into()) };
                 self.sockets.borrow_mut().remove(&h);
                 return Ok(Value::Null);
+            }
+            // Binary-safe socket I/O: bytes as an array of ints 0..255, so binary
+            // protocols (e.g. WebSocket frames) survive intact (unlike tcp_read,
+            // which is UTF-8-lossy and meant for text).
+            "tcp_read_bytes" => {
+                use std::io::Read as _;
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_read_bytes expects a connection handle".into()) };
+                let n = match args.get(1) { Some(Value::Int(n)) => (*n).max(0) as usize, None => 65536, _ => return Err("tcp_read_bytes(conn, max_bytes)".into()) };
+                let mut buf = vec![0u8; n];
+                let got = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Stream(s)) => { let mut sr = s; sr.read(&mut buf) }
+                        _ => return Err(format!("tcp_read_bytes: handle {} is not a connection", h)),
+                    }
+                };
+                return match got {
+                    Ok(k) => Ok(Value::Array(Rc::new(RefCell::new(
+                        buf[..k].iter().map(|b| Value::Int(*b as i64)).collect())))),
+                    Err(e) => self.fail_assert(format!("tcp_read_bytes: {}", e)),
+                };
+            }
+            "tcp_write_bytes" => {
+                use std::io::Write as _;
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_write_bytes expects a connection handle".into()) };
+                let bytes: Vec<u8> = match args.get(1) {
+                    Some(Value::Array(a)) => a.borrow().iter().map(|v| match v { Value::Int(n) => (*n & 0xFF) as u8, _ => 0 }).collect(),
+                    _ => return Err("tcp_write_bytes(conn, [int]) expects a byte array".into()),
+                };
+                let wrote = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Stream(s)) => { let mut sr = s; sr.write_all(&bytes).map(|_| bytes.len()) }
+                        _ => return Err(format!("tcp_write_bytes: handle {} is not a connection", h)),
+                    }
+                };
+                return match wrote {
+                    Ok(k) => Ok(Value::Int(k as i64)),
+                    Err(e) => self.fail_assert(format!("tcp_write_bytes: {}", e)),
+                };
+            }
+            // DNS / hostfile: `resolve` uses the OS resolver (which honours
+            // /etc/hosts), `hostname` reports this machine's name.
+            "resolve" => {
+                use std::net::ToSocketAddrs as _;
+                let host = match args.get(0) { Some(Value::Str(s)) => s.clone(), _ => return Err("resolve expects a \"host\" or \"host:port\" string".into()) };
+                let query = if host.contains(':') { host.clone() } else { format!("{}:0", host) };
+                return match query.to_socket_addrs() {
+                    Ok(addrs) => Ok(Value::Array(Rc::new(RefCell::new(
+                        addrs.map(|a| Value::Str(a.ip().to_string())).collect())))),
+                    Err(e) => self.fail_assert(format!("resolve {}: {}", host, e)),
+                };
+            }
+            "hostname" => {
+                let name = std::fs::read_to_string("/etc/hostname").ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("HOSTNAME").ok())
+                    .unwrap_or_else(|| "localhost".to_string());
+                return Ok(Value::Str(name));
+            }
+            // Encoding + hashing (dependency-free), enough for HTTP auth, data URIs
+            // and the WebSocket upgrade handshake.
+            "base64_encode" => {
+                let s = match args.get(0) { Some(Value::Str(s)) => s.clone(), Some(v) => v.to_string(), None => return Err("base64_encode(text)".into()) };
+                return Ok(Value::Str(b64_encode(s.as_bytes())));
+            }
+            "base64_decode" => {
+                let s = match args.get(0) { Some(Value::Str(s)) => s.clone(), _ => return Err("base64_decode(text)".into()) };
+                return match b64_decode(&s) {
+                    Some(bytes) => Ok(Value::Str(String::from_utf8_lossy(&bytes).into_owned())),
+                    None => self.fail_assert("base64_decode: invalid base64".to_string()),
+                };
+            }
+            "sha1_hex" => {
+                let s = match args.get(0) { Some(Value::Str(s)) => s.clone(), Some(v) => v.to_string(), None => return Err("sha1_hex(text)".into()) };
+                return Ok(Value::Str(hex_of(&sha1_digest(s.as_bytes()))));
+            }
+            // WebSocket upgrade token: base64(sha1(key + GUID)) per RFC 6455.
+            "ws_accept" => {
+                let key = match args.get(0) { Some(Value::Str(s)) => s.clone(), _ => return Err("ws_accept(sec_websocket_key)".into()) };
+                let mut data = key.into_bytes();
+                data.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                return Ok(Value::Str(b64_encode(&sha1_digest(&data))));
             }
             "read_file" => {
                 let path = match args.get(0) {

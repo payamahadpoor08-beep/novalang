@@ -1250,6 +1250,8 @@ fn builtin_names() -> Vec<&'static str> {
         "to_float", "chr", "ord",
         "exec", "list_dir", "mkdir", "cwd", "chdir", "now_ms", "sleep_ms", "setenv",
         "tcp_listen", "tcp_accept", "tcp_connect", "tcp_read", "tcp_write", "tcp_close",
+        "tcp_read_bytes", "tcp_write_bytes", "resolve", "hostname",
+        "base64_encode", "base64_decode", "sha1_hex", "ws_accept",
     ]
 }
 
