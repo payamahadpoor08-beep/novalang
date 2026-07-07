@@ -2566,9 +2566,16 @@ impl<'a, 'b> FnGen<'a, 'b> {
                 self.guard_deopt(bad);
                 if matches!(op, Shl) { self.b.ins().ishl(a, b) } else { self.b.ins().sshr(a, b) }
             }
+            // Both operands are i64 on this track, so compare as integers —
+            // exactly what the interpreter does for `Int op Int` (interp.rs:
+            // `a < b`). The earlier float detour (fcvt+fcmp) was slower *and*
+            // lossy for |value| > 2^53; `icmp` is faster and byte-identical.
             Eq => { let c = self.b.ins().icmp(IntCC::Equal, a, b); self.b.ins().uextend(I64, c) }
             Ne => { let c = self.b.ins().icmp(IntCC::NotEqual, a, b); self.b.ins().uextend(I64, c) }
-            Lt | Le | Gt | Ge => self.cmp_as_float(op, a, b),
+            Lt => { let c = self.b.ins().icmp(IntCC::SignedLessThan, a, b); self.b.ins().uextend(I64, c) }
+            Le => { let c = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, a, b); self.b.ins().uextend(I64, c) }
+            Gt => { let c = self.b.ins().icmp(IntCC::SignedGreaterThan, a, b); self.b.ins().uextend(I64, c) }
+            Ge => { let c = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, b); self.b.ins().uextend(I64, c) }
             And | Or => unreachable!(),
         };
         Some(v)
@@ -2607,40 +2614,19 @@ impl<'a, 'b> FnGen<'a, 'b> {
         Some(self.b.block_params(merge)[0])
     }
 
-    fn cmp_as_float(&mut self, op: BinOp, a: Value, b: Value) -> Value {
-        let af = self.b.ins().fcvt_from_sint(types::F64, a);
-        let bf = self.b.ins().fcvt_from_sint(types::F64, b);
-        let cc = match op {
-            BinOp::Lt => FloatCC::LessThan,
-            BinOp::Le => FloatCC::LessThanOrEqual,
-            BinOp::Gt => FloatCC::GreaterThan,
-            BinOp::Ge => FloatCC::GreaterThanOrEqual,
-            _ => unreachable!(),
-        };
-        let c = self.b.ins().fcmp(cc, af, bf);
-        self.b.ins().uextend(I64, c)
-    }
-
+    // Signed add/sub with overflow deopt. Cranelift's `sadd_overflow` /
+    // `ssub_overflow` emit the result plus a hardware overflow flag in one op —
+    // the flag is set on exactly the inputs where `i64::checked_add`/`checked_sub`
+    // return None, so this is byte-identical to the interpreter (which promotes to
+    // BigInt on overflow) while replacing the 5-instruction sign-bit trick.
     fn add_checked(&mut self, a: Value, b: Value) -> Value {
-        let r = self.b.ins().iadd(a, b);
-        let t1 = self.b.ins().bxor(a, r);
-        let t2 = self.b.ins().bxor(b, r);
-        let t3 = self.b.ins().band(t1, t2);
-        let zero = self.b.ins().iconst(I64, 0);
-        let ovf = self.b.ins().icmp(IntCC::SignedLessThan, t3, zero);
-        let ovf = self.b.ins().uextend(I64, ovf);
+        let (r, ovf) = self.b.ins().sadd_overflow(a, b);
         self.guard_deopt(ovf);
         r
     }
 
     fn sub_checked(&mut self, a: Value, b: Value) -> Value {
-        let r = self.b.ins().isub(a, b);
-        let t1 = self.b.ins().bxor(a, b);
-        let t2 = self.b.ins().bxor(a, r);
-        let t3 = self.b.ins().band(t1, t2);
-        let zero = self.b.ins().iconst(I64, 0);
-        let ovf = self.b.ins().icmp(IntCC::SignedLessThan, t3, zero);
-        let ovf = self.b.ins().uextend(I64, ovf);
+        let (r, ovf) = self.b.ins().ssub_overflow(a, b);
         self.guard_deopt(ovf);
         r
     }
