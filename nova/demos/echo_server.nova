@@ -1,0 +1,11 @@
+// A one-shot TCP echo server, written entirely in Nova.
+//   nova run demos/echo_server.nova
+fn main() {
+  ln = tcp_listen("127.0.0.1:18080")
+  print("listening on 127.0.0.1:18080")
+  conn = tcp_accept(ln)
+  msg = tcp_read(conn, 1024)
+  tcp_write(conn, "echo: " + msg)
+  tcp_close(conn)
+  tcp_close(ln)
+}

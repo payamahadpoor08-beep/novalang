@@ -1,0 +1,9 @@
+// TCP client that talks to demos/echo_server.nova.
+//   nova run demos/echo_client.nova
+fn main() {
+  conn = tcp_connect("127.0.0.1:18080")
+  tcp_write(conn, "hello nova")
+  reply = tcp_read(conn, 1024)
+  print(reply)
+  tcp_close(conn)
+}

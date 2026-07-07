@@ -459,6 +459,19 @@ pub struct Interp {
     migrations: HashMap<String, (String, Vec<Stmt>)>,
     // results of `#[comptime]` functions, evaluated once before main.
     comptime: RefCell<HashMap<String, Value>>,
+    // Open TCP sockets (listeners and connections) addressed by an integer handle
+    // returned to Nova as a plain `Int` — so networking needs no new Value variant
+    // and stays byte-identical across tiers (net programs use these builtins via
+    // `call_named`, exactly like file I/O). `next_sock` hands out fresh handles.
+    sockets: RefCell<HashMap<i64, Sock>>,
+    next_sock: std::cell::Cell<i64>,
+}
+
+// A live socket behind a Nova integer handle. `&TcpStream` implements Read+Write,
+// so connections are used through a shared borrow of the registry.
+enum Sock {
+    Listener(std::net::TcpListener),
+    Stream(std::net::TcpStream),
 }
 
 impl Interp {
@@ -607,7 +620,17 @@ impl Interp {
             snapshots: RefCell::new(HashMap::new()),
             migrations,
             comptime: RefCell::new(HashMap::new()),
+            sockets: RefCell::new(HashMap::new()),
+            next_sock: std::cell::Cell::new(1),
         })
+    }
+
+    // Register a socket and hand back its integer handle.
+    fn sock_register(&self, s: Sock) -> i64 {
+        let h = self.next_sock.get();
+        self.next_sock.set(h + 1);
+        self.sockets.borrow_mut().insert(h, s);
+        h
     }
 
     // Evaluate all global constants into the consts map (idempotent).
@@ -1370,6 +1393,84 @@ impl Interp {
                     Ok(v) => Value::Str(v),
                     Err(_) => Value::Null,
                 });
+            }
+            // --- TCP networking -------------------------------------------------
+            // Blocking sockets addressed by integer handles. Enough to write real
+            // servers and clients (and, on top, HTTP) directly in Nova.
+            "tcp_listen" => {
+                let addr = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("tcp_listen expects an address string like \"127.0.0.1:8080\"".into()),
+                };
+                return match std::net::TcpListener::bind(&addr) {
+                    Ok(l) => Ok(Value::Int(self.sock_register(Sock::Listener(l)))),
+                    Err(e) => self.fail_assert(format!("tcp_listen {}: {}", addr, e)),
+                };
+            }
+            "tcp_accept" => {
+                let h = match args.get(0) {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err("tcp_accept expects a listener handle".into()),
+                };
+                let accepted = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Listener(l)) => l.accept(),
+                        _ => return Err(format!("tcp_accept: handle {} is not a listener", h)),
+                    }
+                };
+                return match accepted {
+                    Ok((stream, _)) => Ok(Value::Int(self.sock_register(Sock::Stream(stream)))),
+                    Err(e) => self.fail_assert(format!("tcp_accept: {}", e)),
+                };
+            }
+            "tcp_connect" => {
+                let addr = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("tcp_connect expects an address string".into()),
+                };
+                return match std::net::TcpStream::connect(&addr) {
+                    Ok(s) => Ok(Value::Int(self.sock_register(Sock::Stream(s)))),
+                    Err(e) => self.fail_assert(format!("tcp_connect {}: {}", addr, e)),
+                };
+            }
+            "tcp_read" => {
+                use std::io::Read as _;
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_read expects a connection handle".into()) };
+                let n = match args.get(1) { Some(Value::Int(n)) => (*n).max(0) as usize, None => 65536, _ => return Err("tcp_read(conn, max_bytes)".into()) };
+                let mut buf = vec![0u8; n];
+                let got = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Stream(s)) => { let mut sr = s; sr.read(&mut buf) }
+                        _ => return Err(format!("tcp_read: handle {} is not a connection", h)),
+                    }
+                };
+                return match got {
+                    Ok(k) => Ok(Value::Str(String::from_utf8_lossy(&buf[..k]).into_owned())),
+                    Err(e) => self.fail_assert(format!("tcp_read: {}", e)),
+                };
+            }
+            "tcp_write" => {
+                use std::io::Write as _;
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_write expects a connection handle".into()) };
+                let data = match args.get(1) { Some(Value::Str(s)) => s.clone(), Some(v) => v.to_string(), None => return Err("tcp_write(conn, text)".into()) };
+                let wrote = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Stream(s)) => { let mut sr = s; sr.write_all(data.as_bytes()).map(|_| data.len()) }
+                        _ => return Err(format!("tcp_write: handle {} is not a connection", h)),
+                    }
+                };
+                return match wrote {
+                    Ok(k) => Ok(Value::Int(k as i64)),
+                    Err(e) => self.fail_assert(format!("tcp_write: {}", e)),
+                };
+            }
+            "tcp_close" => {
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_close expects a handle".into()) };
+                self.sockets.borrow_mut().remove(&h);
+                return Ok(Value::Null);
             }
             "read_file" => {
                 let path = match args.get(0) {
@@ -4696,5 +4797,41 @@ fn expr_has_yield(e: &Expr) -> bool {
             expr_has_yield(scrutinee)
             || arms.iter().any(|a| a.guard.as_ref().map_or(false, expr_has_yield) || expr_has_yield(&a.body)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn interp() -> Interp {
+        let prog = crate::parser::parse_program("fn main(){ 0 }").expect("parse");
+        Interp::new(&prog).expect("interp")
+    }
+
+    // A full loopback exercise of the TCP builtins: a server thread binds, accepts,
+    // reads and echoes; the client connects, writes and reads the reply back. The
+    // mpsc handshake removes any bind/connect race.
+    #[test]
+    fn tcp_echo_loopback() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let it = interp();
+            let ln = it.call("tcp_listen", vec![Value::Str("127.0.0.1:19099".into())]).expect("listen");
+            tx.send(()).unwrap();
+            let conn = it.call("tcp_accept", vec![ln]).expect("accept");
+            let msg = it.call("tcp_read", vec![conn.clone(), Value::Int(1024)]).expect("read");
+            let m = match msg { Value::Str(s) => s, _ => String::new() };
+            it.call("tcp_write", vec![conn, Value::Str(format!("echo:{}", m))]).expect("write");
+        });
+        rx.recv().unwrap();
+        let it = interp();
+        let conn = it.call("tcp_connect", vec![Value::Str("127.0.0.1:19099".into())]).expect("connect");
+        it.call("tcp_write", vec![conn.clone(), Value::Str("ping".into())]).expect("write");
+        let reply = it.call("tcp_read", vec![conn, Value::Int(1024)]).expect("read");
+        server.join().unwrap();
+        match reply { Value::Str(s) => assert_eq!(s, "echo:ping"), other => panic!("got {:?}", other) }
     }
 }

@@ -117,6 +117,32 @@ nova fmt -w app.nova         # canonical formatter (idempotent)
 nova check app.nova          # gradual type checker with located errors
 ```
 
+## Networking (TCP + HTTP, in the box)
+
+Nova ships blocking TCP sockets as builtins — `tcp_listen`, `tcp_accept`,
+`tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close` — so servers, clients and
+(on top of them) HTTP are written directly in Nova, no libraries to wire up. A
+complete HTTP/1.1 server (see [`nova/demos/http_server.nova`](nova/demos/http_server.nova)):
+
+```nova
+fn respond(conn) {
+  req = tcp_read(conn, 4096)
+  body = "Hello from Nova over HTTP!\n"
+  resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+         "Content-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+  tcp_write(conn, resp); tcp_close(conn)
+}
+fn main() {
+  ln = tcp_listen("127.0.0.1:8080")
+  loop { respond(tcp_accept(ln)) }
+}
+```
+
+```bash
+nova run nova/demos/http_server.nova &
+curl http://127.0.0.1:8080          # -> Hello from Nova over HTTP!
+```
+
 ## Documentation
 
 | doc | contents |
