@@ -117,6 +117,46 @@ nova fmt -w app.nova         # canonical formatter (idempotent)
 nova check app.nova          # gradual type checker with located errors
 ```
 
+## Networking (TCP + HTTP, in the box)
+
+Nova ships blocking TCP sockets as builtins — `tcp_listen`, `tcp_accept`,
+`tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close` — so servers, clients and
+(on top of them) HTTP are written directly in Nova, no libraries to wire up. A
+complete HTTP/1.1 server (see [`nova/demos/http_server.nova`](nova/demos/http_server.nova)):
+
+```nova
+fn respond(conn) {
+  req = tcp_read(conn, 4096)
+  body = "Hello from Nova over HTTP!\n"
+  resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+         "Content-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+  tcp_write(conn, resp); tcp_close(conn)
+}
+fn main() {
+  ln = tcp_listen("127.0.0.1:8080")
+  loop { respond(tcp_accept(ln)) }
+}
+```
+
+```bash
+nova run nova/demos/http_server.nova &
+curl http://127.0.0.1:8080          # -> Hello from Nova over HTTP!
+```
+
+On top of the primitives, `nova/demos/` also has, in pure Nova:
+`web_app.nova` (routing + static-file hosting + a JSON API — front-end **and**
+back-end), and `ws_server.nova` / `ws_client.nova` (a full **WebSocket** RFC 6455
+echo, handshake and framing included, using `ws_accept` + binary `tcp_*_bytes`).
+Host resolution (`resolve`, honouring `/etc/hosts`), `hostname`, `base64_*`,
+`sha1_hex` and `ws_accept` are builtins too.
+
+**TLS/HTTPS** is built in via `tls_connect(host, port, [ca_pem])` and
+`tls_accept(listener, cert_pem, key_pem)` (rustls, pure-Rust `ring` backend); a
+TLS connection reads and writes with the same `tcp_*` builtins, so HTTPS and
+secure WebSocket are the same Nova code over an encrypted socket. TLS is an
+optional, default-on feature — the 32-bit-ARM `--no-default-features` build simply
+omits it. See `nova/demos/tls_server.nova` / `tls_client.nova`.
+
 ## Documentation
 
 | doc | contents |

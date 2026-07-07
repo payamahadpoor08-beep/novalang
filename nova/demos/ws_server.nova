@@ -1,0 +1,72 @@
+// A WebSocket (RFC 6455) echo server written in pure Nova, on top of the TCP +
+// ws_accept + byte-I/O builtins. Handshake, unmasking, framing — all in Nova.
+//   nova run demos/ws_server.nova
+fn header_value(req, key) {
+  lines = split(req, "\r\n")
+  i = 0
+  while i < len(lines) {
+    parts = split(lines[i], ": ")
+    if len(parts) >= 2 && parts[0] == key { return parts[1] }
+    i = i + 1
+  }
+  return ""
+}
+
+// Read one text frame from a client (client frames are always masked).
+fn ws_recv(conn) {
+  b = tcp_read_bytes(conn, 65536)
+  len7 = b[1] & 127
+  masked = (b[1] & 128) != 0
+  idx = 2
+  m0 = 0
+  m1 = 0
+  m2 = 0
+  m3 = 0
+  if masked {
+    m0 = b[2]
+    m1 = b[3]
+    m2 = b[4]
+    m3 = b[5]
+    idx = 6
+  }
+  msg = ""
+  j = 0
+  while j < len7 {
+    byte = b[idx + j]
+    r = j % 4
+    if masked && r == 0 { byte = byte ^ m0 }
+    if masked && r == 1 { byte = byte ^ m1 }
+    if masked && r == 2 { byte = byte ^ m2 }
+    if masked && r == 3 { byte = byte ^ m3 }
+    msg = msg + chr(byte)
+    j = j + 1
+  }
+  return msg
+}
+
+// Send one unmasked text frame (server -> client), payload < 126 bytes.
+fn ws_send(conn, msg) {
+  n = len(msg)
+  frame = [129, n]
+  i = 0
+  while i < n {
+    push(frame, ord(msg[i]))
+    i = i + 1
+  }
+  tcp_write_bytes(conn, frame)
+}
+
+fn main() {
+  ln = tcp_listen("127.0.0.1:18082")
+  print("ws server ready on 127.0.0.1:18082")
+  conn = tcp_accept(ln)
+  req = tcp_read(conn, 4096)
+  accept = ws_accept(header_value(req, "Sec-WebSocket-Key"))
+  tcp_write(conn, "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+    "Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+  msg = ws_recv(conn)
+  ws_send(conn, "echo:" + msg)
+  tcp_close(conn)
+  tcp_close(ln)
+}

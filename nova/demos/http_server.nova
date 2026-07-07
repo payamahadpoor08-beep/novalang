@@ -1,0 +1,21 @@
+// A minimal HTTP/1.1 server in pure Nova — serves one plain-text response per
+// connection. Run it, then `curl http://127.0.0.1:18081`.
+//   nova run demos/http_server.nova
+fn respond(conn) {
+  req = tcp_read(conn, 4096)
+  body = "Hello from Nova over HTTP!\n"
+  resp = "HTTP/1.1 200 OK\r\n" +
+         "Content-Type: text/plain\r\n" +
+         "Content-Length: " + str(len(body)) + "\r\n" +
+         "Connection: close\r\n\r\n" + body
+  tcp_write(conn, resp)
+  tcp_close(conn)
+}
+fn main() {
+  ln = tcp_listen("127.0.0.1:18081")
+  print("serving http on 127.0.0.1:18081")
+  loop {
+    conn = tcp_accept(ln)
+    respond(conn)
+  }
+}

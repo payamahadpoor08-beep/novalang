@@ -1,0 +1,15 @@
+// A TLS (HTTPS-grade) echo server in pure Nova. Give it a cert + key PEM;
+// `tls_accept` wraps an accepted TCP connection in TLS, then read/write are the
+// same builtins as plaintext.
+//   nova run demos/tls_server.nova /tmp/tlscert.pem /tmp/tlskey.pem
+fn main() {
+  cert = read_file(args()[0])
+  key = read_file(args()[1])
+  ln = tcp_listen("127.0.0.1:18443")
+  print("tls server ready on 127.0.0.1:18443")
+  conn = tls_accept(ln, cert, key)
+  msg = tcp_read(conn, 1024)
+  tcp_write(conn, "secure-echo:" + msg)
+  tcp_close(conn)
+  tcp_close(ln)
+}

@@ -1,0 +1,42 @@
+// A WebSocket client in pure Nova that talks to demos/ws_server.nova.
+//   nova run demos/ws_client.nova
+fn ws_send_masked(conn, msg) {
+  n = len(msg)
+  frame = [129]
+  push(frame, 128 + n)          // MASK bit set + payload length (< 126)
+  mask = [1, 2, 3, 4]
+  push(frame, mask[0])
+  push(frame, mask[1])
+  push(frame, mask[2])
+  push(frame, mask[3])
+  i = 0
+  while i < n {
+    push(frame, ord(msg[i]) ^ mask[i % 4])
+    i = i + 1
+  }
+  tcp_write_bytes(conn, frame)
+}
+
+fn ws_recv(conn) {
+  b = tcp_read_bytes(conn, 65536)
+  len7 = b[1] & 127
+  msg = ""
+  j = 0
+  while j < len7 {
+    msg = msg + chr(b[2 + j])   // server frames are unmasked
+    j = j + 1
+  }
+  return msg
+}
+
+fn main() {
+  conn = tcp_connect("127.0.0.1:18082")
+  key = "dGhlIHNhbXBsZSBub25jZQ=="
+  tcp_write(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n" +
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+    "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+  resp = tcp_read(conn, 1024)
+  ws_send_masked(conn, "hi ws")
+  print(ws_recv(conn))          // echo:hi ws
+  tcp_close(conn)
+}
