@@ -834,31 +834,42 @@ impl Interp {
     // bytecode VM's `CallDyn`, so both resolve names identically. (Closures held
     // in locals are handled by the caller, which has the scope.)
     pub(crate) fn call_named(&self, callee: &str, vals: Vec<Value>) -> Result<Value, String> {
+        // Ordinary function calls dominate; state-machine and enum-variant
+        // constructors are comparatively rare. When a program declares no machines
+        // (resp. no enum variants) the corresponding map is empty, so the `is_empty`
+        // guard skips the wasted string-hash lookup on every call and falls straight
+        // through to `self.call` (which resolves user functions in one lookup). The
+        // resolution order is unchanged when the maps are non-empty, so this stays
+        // byte-identical to the previous behaviour.
         // state-machine constructor: TrafficLight() -> struct with `state` field
-        if let Some((initial, _)) = self.machines.get(callee) {
-            if !vals.is_empty() {
-                return Err(format!("machine {} takes no constructor args", callee));
+        if !self.machines.is_empty() {
+            if let Some((initial, _)) = self.machines.get(callee) {
+                if !vals.is_empty() {
+                    return Err(format!("machine {} takes no constructor args", callee));
+                }
+                let mut fields = HashMap::new();
+                fields.insert("state".to_string(), Value::Str(initial.clone()));
+                return Ok(Value::Struct(Rc::new(RefCell::new(StructInstance {
+                    type_name: callee.to_string(),
+                    fields,
+                }))));
             }
-            let mut fields = HashMap::new();
-            fields.insert("state".to_string(), Value::Str(initial.clone()));
-            return Ok(Value::Struct(Rc::new(RefCell::new(StructInstance {
-                type_name: callee.to_string(),
-                fields,
-            }))));
         }
         // enum variant constructor: Some(x), Cons(h, t), ...
-        if let Some((enum_name, arity)) = self.variants.get(callee) {
-            if vals.len() != *arity {
-                return Err(format!(
-                    "enum variant {} expects {} args, got {}",
-                    callee, arity, vals.len()
-                ));
+        if !self.variants.is_empty() {
+            if let Some((enum_name, arity)) = self.variants.get(callee) {
+                if vals.len() != *arity {
+                    return Err(format!(
+                        "enum variant {} expects {} args, got {}",
+                        callee, arity, vals.len()
+                    ));
+                }
+                return Ok(Value::Enum(Rc::new(EnumVal {
+                    enum_name: enum_name.clone(),
+                    variant: callee.to_string(),
+                    data: vals,
+                })));
             }
-            return Ok(Value::Enum(Rc::new(EnumVal {
-                enum_name: enum_name.clone(),
-                variant: callee.to_string(),
-                data: vals,
-            })));
         }
         self.call(callee, vals)
     }

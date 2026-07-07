@@ -87,6 +87,23 @@ cd novalang\nova
 cargo build --release        # binary at target\release\nova.exe
 ```
 
+**32-bit ARM (Termux / Android, Raspberry Pi in 32-bit mode)**
+
+The JIT tier uses Cranelift, which can only target `x86-64`, `aarch64`, `riscv64`
+and `s390x`. On a 32-bit ARM host (Termux usually reports `armv7l`) Cranelift
+won't even compile, so build with the JIT turned off — everything else
+(interpreter, bytecode VM, and the native **AOT** backend via `nova build`) works
+unchanged:
+
+```bash
+cargo build --release --no-default-features   # JIT off; interp + VM + AOT still work
+```
+
+`./install.sh` detects a 32-bit ARM host automatically and does this for you (and
+falls back to `--no-default-features` if a full build fails on any host). The only
+thing you give up is the in-process JIT; you still get native-speed binaries from
+`nova build`.
+
 ## Quick start
 
 ```bash
