@@ -150,6 +150,13 @@ echo, handshake and framing included, using `ws_accept` + binary `tcp_*_bytes`).
 Host resolution (`resolve`, honouring `/etc/hosts`), `hostname`, `base64_*`,
 `sha1_hex` and `ws_accept` are builtins too.
 
+**TLS/HTTPS** is built in via `tls_connect(host, port, [ca_pem])` and
+`tls_accept(listener, cert_pem, key_pem)` (rustls, pure-Rust `ring` backend); a
+TLS connection reads and writes with the same `tcp_*` builtins, so HTTPS and
+secure WebSocket are the same Nova code over an encrypted socket. TLS is an
+optional, default-on feature — the 32-bit-ARM `--no-default-features` build simply
+omits it. See `nova/demos/tls_server.nova` / `tls_client.nova`.
+
 ## Documentation
 
 | doc | contents |

@@ -1,0 +1,11 @@
+// A TLS client in pure Nova. Passes the server's cert PEM as the trusted CA
+// (for a self-signed loopback demo); omit the 3rd arg to use the system roots
+// for real public HTTPS hosts.
+//   nova run demos/tls_client.nova /tmp/tlscert.pem
+fn main() {
+  ca = read_file(args()[0])
+  conn = tls_connect("localhost", 18443, ca)
+  tcp_write(conn, "hello tls")
+  print(tcp_read(conn, 1024))     // secure-echo:hello tls
+  tcp_close(conn)
+}

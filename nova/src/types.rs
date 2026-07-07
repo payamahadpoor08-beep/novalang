@@ -1252,6 +1252,7 @@ fn builtin_names() -> Vec<&'static str> {
         "tcp_listen", "tcp_accept", "tcp_connect", "tcp_read", "tcp_write", "tcp_close",
         "tcp_read_bytes", "tcp_write_bytes", "resolve", "hostname",
         "base64_encode", "base64_decode", "sha1_hex", "ws_accept",
+        "tls_connect", "tls_accept",
     ]
 }
 

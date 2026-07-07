@@ -12,6 +12,12 @@ cranelift = { version = "0.116", optional = true }
 cranelift-jit = { version = "0.116", optional = true }
 cranelift-module = { version = "0.116", optional = true }
 cranelift-native = { version = "0.116", optional = true }
+# TLS (the `ssl`/`tls_*` builtins). rustls with the pure-Rust `ring` backend, so
+# it needs no system OpenSSL; optional + default-on, and OFF under
+# `--no-default-features` so the 32-bit-ARM build never has to compile it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # The JIT is the only cranelift consumer. Cranelift can only *compile* for
 # x86-64/aarch64/s390x/riscv64 hosts, so on other arches (e.g. 32-bit ARM /
@@ -19,8 +25,9 @@ cranelift-native = { version = "0.116", optional = true }
 # build there with `--no-default-features`: the interpreter, bytecode VM, and
 # AOT-via-C backend need nothing from cranelift and stay fully functional.
 [features]
-default = ["jit"]
+default = ["jit", "tls"]
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 
 [[bin]]
 name = "nova"

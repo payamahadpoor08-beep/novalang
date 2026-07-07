@@ -467,12 +467,20 @@ pub struct Interp {
     next_sock: std::cell::Cell<i64>,
 }
 
-// A live socket behind a Nova integer handle. `&TcpStream` implements Read+Write,
-// so connections are used through a shared borrow of the registry.
+// A live socket behind a Nova integer handle.
 enum Sock {
     Listener(std::net::TcpListener),
     Stream(std::net::TcpStream),
+    // A TLS connection (client or server) — both rustls stream types unify behind
+    // one `Read + Write` trait object.
+    #[cfg(feature = "tls")]
+    Tls(Box<dyn ReadWrite>),
 }
+
+#[cfg(feature = "tls")]
+trait ReadWrite: std::io::Read + std::io::Write {}
+#[cfg(feature = "tls")]
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
 // --- crypto / encoding primitives (dependency-free) -------------------------
 // Standard base64 (RFC 4648) and SHA-1, used by base64_*/sha1_hex/ws_accept.
@@ -1517,9 +1525,11 @@ impl Interp {
                 let n = match args.get(1) { Some(Value::Int(n)) => (*n).max(0) as usize, None => 65536, _ => return Err("tcp_read(conn, max_bytes)".into()) };
                 let mut buf = vec![0u8; n];
                 let got = {
-                    let socks = self.sockets.borrow();
-                    match socks.get(&h) {
-                        Some(Sock::Stream(s)) => { let mut sr = s; sr.read(&mut buf) }
+                    let mut socks = self.sockets.borrow_mut();
+                    match socks.get_mut(&h) {
+                        Some(Sock::Stream(s)) => s.read(&mut buf),
+                        #[cfg(feature = "tls")]
+                        Some(Sock::Tls(s)) => s.read(&mut buf),
                         _ => return Err(format!("tcp_read: handle {} is not a connection", h)),
                     }
                 };
@@ -1533,9 +1543,11 @@ impl Interp {
                 let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tcp_write expects a connection handle".into()) };
                 let data = match args.get(1) { Some(Value::Str(s)) => s.clone(), Some(v) => v.to_string(), None => return Err("tcp_write(conn, text)".into()) };
                 let wrote = {
-                    let socks = self.sockets.borrow();
-                    match socks.get(&h) {
-                        Some(Sock::Stream(s)) => { let mut sr = s; sr.write_all(data.as_bytes()).map(|_| data.len()) }
+                    let mut socks = self.sockets.borrow_mut();
+                    match socks.get_mut(&h) {
+                        Some(Sock::Stream(s)) => s.write_all(data.as_bytes()).map(|_| data.len()),
+                        #[cfg(feature = "tls")]
+                        Some(Sock::Tls(s)) => s.write_all(data.as_bytes()).and_then(|_| s.flush()).map(|_| data.len()),
                         _ => return Err(format!("tcp_write: handle {} is not a connection", h)),
                     }
                 };
@@ -1558,9 +1570,11 @@ impl Interp {
                 let n = match args.get(1) { Some(Value::Int(n)) => (*n).max(0) as usize, None => 65536, _ => return Err("tcp_read_bytes(conn, max_bytes)".into()) };
                 let mut buf = vec![0u8; n];
                 let got = {
-                    let socks = self.sockets.borrow();
-                    match socks.get(&h) {
-                        Some(Sock::Stream(s)) => { let mut sr = s; sr.read(&mut buf) }
+                    let mut socks = self.sockets.borrow_mut();
+                    match socks.get_mut(&h) {
+                        Some(Sock::Stream(s)) => s.read(&mut buf),
+                        #[cfg(feature = "tls")]
+                        Some(Sock::Tls(s)) => s.read(&mut buf),
                         _ => return Err(format!("tcp_read_bytes: handle {} is not a connection", h)),
                     }
                 };
@@ -1578,9 +1592,11 @@ impl Interp {
                     _ => return Err("tcp_write_bytes(conn, [int]) expects a byte array".into()),
                 };
                 let wrote = {
-                    let socks = self.sockets.borrow();
-                    match socks.get(&h) {
-                        Some(Sock::Stream(s)) => { let mut sr = s; sr.write_all(&bytes).map(|_| bytes.len()) }
+                    let mut socks = self.sockets.borrow_mut();
+                    match socks.get_mut(&h) {
+                        Some(Sock::Stream(s)) => s.write_all(&bytes).map(|_| bytes.len()),
+                        #[cfg(feature = "tls")]
+                        Some(Sock::Tls(s)) => s.write_all(&bytes).and_then(|_| s.flush()).map(|_| bytes.len()),
                         _ => return Err(format!("tcp_write_bytes: handle {} is not a connection", h)),
                     }
                 };
@@ -1632,6 +1648,65 @@ impl Interp {
                 let mut data = key.into_bytes();
                 data.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
                 return Ok(Value::Str(b64_encode(&sha1_digest(&data))));
+            }
+            // --- TLS ------------------------------------------------------------
+            // A TLS connection behaves exactly like a TCP one for read/write, so
+            // HTTPS and secure WebSocket are the same Nova code over `tls_connect`
+            // / `tls_accept`. rustls with the pure-Rust `ring` backend.
+            #[cfg(feature = "tls")]
+            "tls_connect" => {
+                use std::sync::Arc;
+                let host = match args.get(0) { Some(Value::Str(s)) => s.clone(), _ => return Err("tls_connect(host, port, [ca_pem])".into()) };
+                let port = match args.get(1) { Some(Value::Int(n)) => *n as u16, _ => return Err("tls_connect(host, port, [ca_pem])".into()) };
+                let mut roots = rustls::RootCertStore::empty();
+                if let Some(Value::Str(ca)) = args.get(2) {
+                    for c in rustls_pemfile::certs(&mut ca.as_bytes()) {
+                        let c = c.map_err(|e| format!("tls_connect: bad CA pem: {}", e))?;
+                        let _ = roots.add(c);
+                    }
+                } else {
+                    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                }
+                let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|_| format!("tls_connect: invalid server name {}", host))?;
+                let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+                    .map_err(|e| format!("tls_connect: {}", e))?;
+                let tcp = match std::net::TcpStream::connect((host.as_str(), port)) {
+                    Ok(t) => t,
+                    Err(e) => return self.fail_assert(format!("tls_connect {}:{}: {}", host, port, e)),
+                };
+                let tls = rustls::StreamOwned::new(conn, tcp);
+                return Ok(Value::Int(self.sock_register(Sock::Tls(Box::new(tls)))));
+            }
+            #[cfg(feature = "tls")]
+            "tls_accept" => {
+                use std::sync::Arc;
+                let h = match args.get(0) { Some(Value::Int(n)) => *n, _ => return Err("tls_accept(listener, cert_pem, key_pem)".into()) };
+                let cert_pem = match args.get(1) { Some(Value::Str(s)) => s.clone(), _ => return Err("tls_accept(listener, cert_pem, key_pem)".into()) };
+                let key_pem = match args.get(2) { Some(Value::Str(s)) => s.clone(), _ => return Err("tls_accept(listener, cert_pem, key_pem)".into()) };
+                let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                    .collect::<Result<_, _>>().map_err(|e| format!("tls_accept: bad cert pem: {}", e))?;
+                let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                    .map_err(|e| format!("tls_accept: bad key pem: {}", e))?
+                    .ok_or_else(|| "tls_accept: no private key in pem".to_string())?;
+                let config = rustls::ServerConfig::builder().with_no_client_auth()
+                    .with_single_cert(certs, key).map_err(|e| format!("tls_accept: {}", e))?;
+                let accepted = {
+                    let socks = self.sockets.borrow();
+                    match socks.get(&h) {
+                        Some(Sock::Listener(l)) => l.accept(),
+                        _ => return Err(format!("tls_accept: handle {} is not a listener", h)),
+                    }
+                };
+                let (tcp, _) = match accepted { Ok(x) => x, Err(e) => return self.fail_assert(format!("tls_accept: {}", e)) };
+                let conn = rustls::ServerConnection::new(Arc::new(config)).map_err(|e| format!("tls_accept: {}", e))?;
+                let tls = rustls::StreamOwned::new(conn, tcp);
+                return Ok(Value::Int(self.sock_register(Sock::Tls(Box::new(tls)))));
+            }
+            #[cfg(not(feature = "tls"))]
+            "tls_connect" | "tls_accept" => {
+                return Err(format!("{}: TLS is not compiled into this build (rebuild with --features tls)", name));
             }
             "read_file" => {
                 let path = match args.get(0) {
@@ -4994,5 +5069,113 @@ mod net_tests {
         let reply = it.call("tcp_read", vec![conn, Value::Int(1024)]).expect("read");
         server.join().unwrap();
         match reply { Value::Str(s) => assert_eq!(s, "echo:ping"), other => panic!("got {:?}", other) }
+    }
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tls_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    // A self-signed CA and a leaf cert (SAN localhost / 127.0.0.1) signed by it,
+    // valid to 2036 — enough to exercise a real, verified TLS handshake offline.
+    const CA: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDDzCCAfegAwIBAgIUeTBO84kZYpWq5nvOZBPBLbGgtEAwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMTm92YSBUZXN0IENBMB4XDTI2MDcwNzA3NDcwM1oXDTM2
+MDcwNDA3NDcwM1owFzEVMBMGA1UEAwwMTm92YSBUZXN0IENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnXNatF5kaHdABllBHifp5+aUdKH0jIhgfZfz
+I6PqJ9DXO5LzolZSK8PNTKdZA8NfcBkFtIKcfERdXEQwSPshr/leKtqP3EzEHy9p
+EYU7CxnJFU8LdtD2cdzA+VTUQ6Fn2yNxCqMz2GW9g8fEY+5ewkhDGr6inxGcZqLu
+JznhDcbHhGIF8NBt0W3evVI4UE5OsrbjFOOgf96IAURVmFHTaP8KyA3cJ05pzfhQ
+Cyvgn//gc05LAPrQPaGphap1fD/4n+f0Dyj+DQHZx05JXFqbTzw38s7UIZdiExJE
+OfWF5BRYeTYZ08SWs2JUdv71/Sxuur67GHiHKR40zirufTnnHwIDAQABo1MwUTAd
+BgNVHQ4EFgQUl8fpSRRhe/mTtbZEzidLUph7h70wHwYDVR0jBBgwFoAUl8fpSRRh
+e/mTtbZEzidLUph7h70wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOC
+AQEAY9FelrGzTGOy6Us6sTjby4U2miLlt9+uiIHmjyN4Lb2ZULzXs2Cvo1weRvjc
+u8Jrs2bDg50L1hqTjORSMKxZidoup8k9fXYLhKnj/hHLPXrTHGqWyBwNzM9trLJw
+cwoSF74Fw3U5od8bDZOMIn9KNceOKHTsewRK0SKork6fMbCIk15tcRJKQKGUAbhm
+TbWwSomqqeOCNs/NAtWx0khCc9aQmkaf14nphpsfBD0QEt1+CVxo/n40PX1B42mn
+In+oIq+if8WE0fmXab0yRNEV/AQyJl8R977loVVNNX360Lq33pW/x3x4PGCamt5B
+J8KVARe0Whli9dzrx87letFdhA==
+-----END CERTIFICATE-----
+"#;
+    const LEAF: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDRjCCAi6gAwIBAgIUDn+zSaAyq8/xaWs9kSqTHrejy/cwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMTm92YSBUZXN0IENBMB4XDTI2MDcwNzA3NDcwNFoXDTM2
+MDcwNDA3NDcwNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0B
+AQEFAAOCAQ8AMIIBCgKCAQEAwdTOJFjYrZ/uqRG5M1DCe3PEsk9LcvcDBCOiGn01
+bDurNXhHeYK2SuxkHYjAtA8AP/HwX//AuMwCzMhcocvkwc4/Cewj8cHASeCiY55N
+5ry2tb2ML31QxiZ7J3HioMkfsjSYLPqn5HN3LhxjweHhQi7fEUR4A1bdYcbqyMtv
+ZgBSdmZumBMLVpQ8kW/BGnvVfIDSjPjlcluPSxiT1sg7SlHiYGLNOwokf3cK6VcZ
+6WtshvO4BjskLAc6151pB8kNpA8vXsJ4jvV4MgoA59WdlPNsH+OAEOj4a3mrShZg
+lXh2GhULBEd0ymrAePUPbJ+WbUNXuwTkUjIuQYxoo7JmAwIDAQABo4GMMIGJMBoG
+A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRMEAjAAMAsGA1UdDwQEAwIF
+oDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUVfAML4XXUdFJrkaifacI
+oIIusdwwHwYDVR0jBBgwFoAUl8fpSRRhe/mTtbZEzidLUph7h70wDQYJKoZIhvcN
+AQELBQADggEBABhtKBqrFXk9mUULJDElOPR9AaKDMckUIDLEY8tV8D2d/oNN93xR
+5mJpdmmA4Bt3wLyKemylumq8mEeAt2BdufJErOnAsdiQByEV5oYC97FsTkMOqdCI
+L6FfwF4iM9521sysz07O73NDxxoXfxx8a/+b8YkyjxT0wbmg+N1fDOXIa1swAj9i
+cEg01lv2YmG3kwQOTgvKVwER49aomi41DrLUXJCswT2Zr/I78EfmPPDElip5NIM6
+R1kkMn8OoUD3qdmx7oIJ1O0YLDZfAkeybIGFwrvp6YrCqaaPRLzehWRlF5FyvMQw
+v+4LxHe+0xyXMzg+tlsejI+yAjYWwXdWPIE=
+-----END CERTIFICATE-----
+"#;
+    const KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDB1M4kWNitn+6p
+EbkzUMJ7c8SyT0ty9wMEI6IafTVsO6s1eEd5grZK7GQdiMC0DwA/8fBf/8C4zALM
+yFyhy+TBzj8J7CPxwcBJ4KJjnk3mvLa1vYwvfVDGJnsnceKgyR+yNJgs+qfkc3cu
+HGPB4eFCLt8RRHgDVt1hxurIy29mAFJ2Zm6YEwtWlDyRb8Eae9V8gNKM+OVyW49L
+GJPWyDtKUeJgYs07CiR/dwrpVxnpa2yG87gGOyQsBzrXnWkHyQ2kDy9ewniO9Xgy
+CgDn1Z2U82wf44AQ6PhreatKFmCVeHYaFQsER3TKasB49Q9sn5ZtQ1e7BORSMi5B
+jGijsmYDAgMBAAECggEAXhAjqcfj/v4qF6oeMiTy/G4F+nI4ryXoNM4GEMzKbCfY
+wi4IoZMpW9q0CxEeU0MkX+PNPwkiQYvfn/lr2qjT7qlkNjB+kQfxhOiaZbWhIGRc
+Vn4R1cn+tOpfwZim3lg8JYMYhltttpPCNoJYdvJjGncckYikpRo2fQjHT4JKITkU
+5NYYdfA2Ad6zjO9LMgdX7857xBUOgWJPJzrp/eWygrrc/wGMrwKdPv/gh7XC+9YG
++AMWJ3cg/Wr75XJrS4miJj9G0NsSa0+Ym4coUJ/GNNb1kBJvYQ5EUjdXhh5toBGe
+cRKHcJs3/hg0c66NPTtDEKaWhOObCEZszpc0fD1b4QKBgQD8eVb1oIdeky61zjZf
+rZUZbxukdcDwCOLyw/u/y59CfY9I/VV9LKLcAqCMB5PpmOkV/uFVaSDrxyIH1NDj
+c/BtpyCyVZqOsNjF8amZ5k8Qifn1Hy6V53gfFDVwqZTn/hXwM9SjhKKLabzC7B2X
+lYT27S2M78FGv4EE4Vq4xF4tvQKBgQDEic11MxrjcxdO1sbzXVyf+7MRixb3xmK+
+xfHmSvo33uiHmVkjv5cgSuQWLg0n/qfbfVVnARB+ObgUlMMtulB7SL6aRQ9J3Er2
+3uriQjWFHg7bTgteXZ6GlxWHcBDALYbKAc34poyZETchSjvRxM/b1q6r0xIpRxTN
+o0LCSyy+vwKBgQCZ1WVC7LkOyyde53MCAUYj5Ss2nfkdSIzf1sKCLpOvc8nmc1Wv
+m47v9znTmJprbxw2psKtxAynHQKDOwy8Slxos7iccMRnxSGQGpt4hngOX8PJs2Iz
+PIJYjXuyVeHBKXQ8k5gwuhRAVgEJ08yEHDqUKhfjFAL0FKOMUbNxeVTZEQKBgQC8
+lQ1Tu6m9PR3MREG6GodZ6wWze6aaMP1m2EB4HNFi8rxkADyMFLZKAhJBRgbRrYQb
+E3Py1g6hT3jWJrfxFKlM4kwhcspssLgtkVAHskfwZxsSSxyVe3c05Zt+zYUFIaoI
+AxtDz2txJBemFbi4WwSniKMps+nlOZM4jcLs830HuQKBgQD7OMIAVfx2Iy9GwRL3
+BcEMu0eeZrS7tZJ8aHS34Pv6JczfpJLTO1edAJ4pqMuj76/o0NoDq3N7y5YPiP8G
+/YKudAVyFN4yCaPJkoNJf/mBKeIUZRZnGzlka5PGGiHMs2xG8lKH4uMBt5TI9xio
+hpvVPaSu7yUgt6I8fbAlZF7XWg==
+-----END PRIVATE KEY-----
+"#;
+
+    fn interp() -> Interp {
+        let prog = crate::parser::parse_program("fn main(){ 0 }").expect("parse");
+        Interp::new(&prog).expect("interp")
+    }
+
+    // Real, verified TLS: the server presents a leaf signed by the CA; the client
+    // trusts that CA and checks the server name against the cert's SAN.
+    #[test]
+    fn tls_echo_loopback() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let it = interp();
+            let ln = it.call("tcp_listen", vec![Value::Str("127.0.0.1:19100".into())]).expect("listen");
+            tx.send(()).unwrap();
+            let conn = it.call("tls_accept", vec![ln, Value::Str(LEAF.into()), Value::Str(KEY.into())]).expect("tls_accept");
+            let msg = it.call("tcp_read", vec![conn.clone(), Value::Int(1024)]).expect("read");
+            let m = match msg { Value::Str(s) => s, _ => String::new() };
+            it.call("tcp_write", vec![conn, Value::Str(format!("secure:{}", m))]).expect("write");
+        });
+        rx.recv().unwrap();
+        let it = interp();
+        let conn = it.call("tls_connect", vec![Value::Str("localhost".into()), Value::Int(19100), Value::Str(CA.into())]).expect("tls_connect");
+        it.call("tcp_write", vec![conn.clone(), Value::Str("ping".into())]).expect("write");
+        let reply = it.call("tcp_read", vec![conn, Value::Int(1024)]).expect("read");
+        server.join().unwrap();
+        match reply { Value::Str(s) => assert_eq!(s, "secure:ping"), other => panic!("got {:?}", other) }
     }
 }
