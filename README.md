@@ -143,6 +143,13 @@ nova run nova/demos/http_server.nova &
 curl http://127.0.0.1:8080          # -> Hello from Nova over HTTP!
 ```
 
+On top of the primitives, `nova/demos/` also has, in pure Nova:
+`web_app.nova` (routing + static-file hosting + a JSON API — front-end **and**
+back-end), and `ws_server.nova` / `ws_client.nova` (a full **WebSocket** RFC 6455
+echo, handshake and framing included, using `ws_accept` + binary `tcp_*_bytes`).
+Host resolution (`resolve`, honouring `/etc/hosts`), `hostname`, `base64_*`,
+`sha1_hex` and `ws_accept` are builtins too.
+
 ## Documentation
 
 | doc | contents |

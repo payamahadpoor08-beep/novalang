@@ -1,0 +1,39 @@
+// A small web app in pure Nova: routing (back-end) + static file hosting
+// (front-end) + a JSON API — all on the TCP builtins, nothing imported.
+//   nova run demos/web_app.nova   then   curl http://127.0.0.1:18083/
+fn path_of(req) {
+  first = split(req, "\r\n")[0]        // "GET /path HTTP/1.1"
+  parts = split(first, " ")
+  if len(parts) >= 2 { return parts[1] }
+  return "/"
+}
+
+fn send(conn, status, ctype, body) {
+  tcp_write(conn, "HTTP/1.1 " + status + "\r\n" +
+    "Content-Type: " + ctype + "\r\n" +
+    "Content-Length: " + str(len(body)) + "\r\n" +
+    "Connection: close\r\n\r\n" + body)
+}
+
+fn handle(conn) {
+  req = tcp_read(conn, 8192)
+  path = path_of(req)
+  if path == "/" {
+    send(conn, "200 OK", "text/html",
+      "<!doctype html><h1>Nova web</h1><p>Routing + hosting + JSON, in pure Nova.</p>")
+  } else if path == "/api/host" {
+    send(conn, "200 OK", "application/json",
+      "{\"host\": \"" + hostname() + "\", \"now\": " + str(now_ms()) + "}")
+  } else if file_exists("." + path) {
+    send(conn, "200 OK", "text/plain", read_file("." + path))   // static hosting
+  } else {
+    send(conn, "404 Not Found", "text/plain", "not found\n")
+  }
+  tcp_close(conn)
+}
+
+fn main() {
+  ln = tcp_listen("127.0.0.1:18083")
+  print("web app on http://127.0.0.1:18083")
+  loop { handle(tcp_accept(ln)) }
+}
