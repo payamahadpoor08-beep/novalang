@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use crate::ast::*;
 use crate::jit::{eligible_set, float_eligible_set};
 
-pub enum Backend { C, Llvm, Wasm, Arm, Arm32 }
+pub enum Backend { C, Llvm, Wasm, Arm, Arm32, Native }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tier { Typed, Boxed }
@@ -411,6 +411,9 @@ pub fn emit(prog: &Program, backend: &Backend) -> Option<(String, Tier)> {
         Backend::Llvm => {
             if let Some(code) = emit_boxed_llvm(prog) { return Some((code, Tier::Boxed)); }
         }
+        // the native object backend emits no C/LLVM text — it is handled entirely
+        // by `build::build_native` (Cranelift -> .o -> link), never reaching here.
+        Backend::Native => {}
     }
     None
 }
@@ -433,6 +436,7 @@ fn emit_typed(prog: &Program, backend: &Backend) -> Option<String> {
         // compiler + run harness differ (cross gcc+qemu / clang wasm32-wasi+node).
         Backend::C | Backend::Arm | Backend::Arm32 | Backend::Wasm => CEmit::new(&a).emit(),
         Backend::Llvm => LlEmit::new(&a).emit(),
+        Backend::Native => return None, // handled by build::build_native
     })
 }
 

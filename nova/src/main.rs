@@ -47,6 +47,7 @@ fn main() {
             // verified byte-identical vs `nova run`; falls back to embed
             let aot_backend = args.iter().skip(2).find_map(|a| match a.as_str() {
                 "--aot" | "--aot=c" => Some(aot::Backend::C),
+                "--aot=native" => Some(aot::Backend::Native),
                 "--aot=llvm" => Some(aot::Backend::Llvm),
                 "--aot=wasm" => Some(aot::Backend::Wasm),
                 "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(aot::Backend::Arm),
@@ -62,6 +63,7 @@ fn main() {
                     Ok(Some(tier)) => {
                         let (which, kind) = match bk {
                             aot::Backend::C => ("c", "native"),
+                            aot::Backend::Native => ("native", "native"),
                             aot::Backend::Llvm => ("llvm", "native"),
                             aot::Backend::Wasm => ("wasm", "wasm32"),
                             aot::Backend::Arm => ("arm", "aarch64"),
@@ -808,6 +810,8 @@ VM FLAGS:
 
 BUILD FLAGS:
   --aot | --aot=c      pure native binary via the C backend (cc -O2)
+  --aot=native         pure native binary straight from Cranelift IR -> .o -> cc-linked
+                       (no C for logic; integer programs; verified vs `nova run`)
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
   --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
   --aot=arm            static aarch64 binary, typed+boxed (cross gcc, qemu-verified)
