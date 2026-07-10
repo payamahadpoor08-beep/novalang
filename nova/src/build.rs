@@ -29,6 +29,11 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         .map_err(|e| format!("cannot read {}: {}", entry, e))?;
     let mut program = crate::parser::parse_program(&source)?;
     crate::interp::fold_program(&mut program);
+    // Native object backend: Cranelift IR -> relocatable .o -> link with cc.
+    // Separate path (no C/LLVM text). Only available with the `jit` feature.
+    if matches!(backend, crate::aot::Backend::Native) {
+        return build_native(entry, out, &program);
+    }
     let (code, tier) = match crate::aot::emit(&program, backend) {
         Some(ct) => ct,
         None => return Ok(None),
@@ -53,6 +58,7 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         // ARMv7 (32-bit hard-float): older / weaker phones.
         crate::aot::Backend::Arm32 => ("c", "arm-linux-gnueabihf-gcc"),
         crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
+        crate::aot::Backend::Native => unreachable!("native handled by build_native above"),
     };
     let tmp = out.with_extension(ext);
     std::fs::write(&tmp, &code).map_err(|e| e.to_string())?;
@@ -110,6 +116,60 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         let _ = std::fs::remove_file(out);
         Ok(None)
     }
+}
+
+// The native object-code AOT path: lower the program's numeric core to a real
+// relocatable object with Cranelift (`jit::compile_object` — the SAME codegen the
+// JIT uses, no C for program logic), write `build/<name>.o`, then link it with
+// `cc` (used only as the libc linker driver). Ship the binary only if its output
+// is byte-identical to `nova run` (the oracle gate). Returns Ok(None) when the
+// program isn't fully native-eligible or diverges — the caller falls back to the
+// C/embed AOT, so output is never wrong.
+#[cfg(feature = "jit")]
+fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
+    -> Result<Option<crate::aot::Tier>, String>
+{
+    let obj = match crate::jit::compile_object(program) {
+        Some(bytes) => bytes,
+        None => return Ok(None), // not integer-native -> fall back
+    };
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let objp = out.with_extension("o");
+    std::fs::write(&objp, &obj).map_err(|e| e.to_string())?;
+    // link with cc (libc + crt); cc compiles no program logic here.
+    let status = Command::new("cc")
+        .arg("-O2").arg("-o").arg(out).arg(&objp)
+        .status().map_err(|e| format!("cannot run cc: {}", e))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&objp);
+        return Ok(None);
+    }
+    // oracle gate: keep the native binary only on a byte-identical match.
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let expect = Command::new(&exe).arg("run").arg(entry).output()
+        .map_err(|e| e.to_string())?;
+    let got = Command::new(out).output().map_err(|e| e.to_string())?;
+    if expect.stdout == got.stdout && expect.status.code() == got.status.code() {
+        // keep the .o alongside the binary as proof of the object path
+        Ok(Some(crate::aot::Tier::Typed))
+    } else {
+        let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_file(&objp);
+        Ok(None)
+    }
+}
+
+// Without the jit feature there is no Cranelift, so the native object backend is
+// unavailable — fall back to the embed build honestly.
+#[cfg(not(feature = "jit"))]
+fn build_native(_entry: &str, _out: &Path, _program: &crate::ast::Program)
+    -> Result<Option<crate::aot::Tier>, String>
+{
+    Ok(None)
 }
 
 // Node harness: instantiate the wasm32-wasi module, run it under node's WASI
