@@ -2844,11 +2844,38 @@ fn main_print_arg(f: &Func) -> Option<&Expr> {
     inner
 }
 
-// Build a relocatable object for a pure-integer `print(<int>)` program.
-// Returns the object bytes, or `None` if the program isn't fully integer-native
-// (the caller then uses the C/embed AOT). `emit_program` correctness is still
-// backed by the build's oracle gate (output byte-diffed against `nova run`).
-pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
+// Which JIT track the value-producing function was compiled on, and how the
+// entry must call + print it.
+#[derive(Clone, Copy, PartialEq)]
+enum Track { Int, Float, NumInt, NumFloat }
+
+// A compile-time-constant argument to the value-producing function.
+#[derive(Clone, Copy)]
+enum ArgConst { I(i64), F(f64) }
+
+// Extract a constant literal argument (post-fold): an Int/Float literal or a
+// negated one. `None` if the expression isn't a decidable numeric constant.
+fn const_arg(e: &Expr) -> Option<ArgConst> {
+    match unwrap_at(e) {
+        Expr::Int(n) => Some(ArgConst::I(*n)),
+        Expr::Float(x) => Some(ArgConst::F(*x)),
+        Expr::Unary { op: UnOp::Neg, expr } => match const_arg(expr)? {
+            ArgConst::I(n) => Some(ArgConst::I(n.wrapping_neg())),
+            ArgConst::F(x) => Some(ArgConst::F(-x)),
+        },
+        _ => None,
+    }
+}
+
+// Build a relocatable object for a numeric `print(<expr>)` program, covering the
+// full surface the JIT compiles: the integer track (`FnGen`, incl. local integer
+// arrays/structs), the float track (`FloatGen`), and the numeric-mixed track
+// (`NumGen`, result int or f64-bits). Returns `(object bytes, needs_runtime)` —
+// `needs_runtime` is true iff the object may reference `runtime/nova_native_rt.c`
+// (arena helpers / fmod-fpow / float printer), so the caller knows whether to
+// link it. `None` when the program isn't numeric-native (→ C/embed fallback).
+// Correctness is backed by the build's oracle gate (byte-diff vs `nova run`).
+pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
     // 1) locate `main` and extract its single `print(<expr>)` argument
     let main = prog.items.iter().find_map(|it| match it {
         Item::Func(f) if f.name == "main" => Some(f),
@@ -2856,31 +2883,65 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
     })?;
     let inner = main_print_arg(main)?.clone();
 
-    // 2) synthesize `fn __nova_main_val() { return <inner> }` and splice it into a
-    //    clone of the program so the eligibility analysis can pick it up as an
-    //    ordinary integer function whose value is what `main` would print.
+    // 2) pick how the printed value is produced. If `main` prints a direct call
+    //    `f(const-args)` to a user function (fib/mandel/sieve all do), call `f`
+    //    DIRECTLY with those constants — this covers the numeric track, whose
+    //    classifier rejects cross-function calls so a `return f(..)` wrapper can't
+    //    be typed. Otherwise (a literal / arithmetic expr) synthesize
+    //    `fn __nova_main_val() { return <inner> }` and let the analysis type that.
     const MAIN_VAL: &str = "__nova_main_val";
-    let main_val = Func {
-        name: MAIN_VAL.to_string(),
-        params: Vec::new(),
-        param_types: Vec::new(),
-        param_modes: Vec::new(),
-        ret_type: None,
-        type_params: Vec::new(),
-        where_bounds: Vec::new(),
-        effects: None,
-        body: vec![Stmt::Return(Some(inner))],
-        is_async: false,
-        attrs: Vec::new(),
+    let user_fn = |name: &str| prog.items.iter().any(|it|
+        matches!(it, Item::Func(f) if f.name == name));
+    let direct: Option<(String, Vec<ArgConst>)> = match unwrap_at(&inner) {
+        Expr::Call { callee, args } if user_fn(callee) => {
+            let consts: Option<Vec<ArgConst>> = args.iter().map(const_arg).collect();
+            consts.map(|c| (callee.clone(), c))
+        }
+        _ => None,
     };
-    let mut aug = prog.clone();
-    aug.items.push(Item::Func(main_val));
 
-    // 3) integer track only: every function we emit must be pure-integer eligible
-    //    with no local arrays/structs (those need the linked arena runtime, a
-    //    later increment). Bail otherwise -> C/embed fallback.
+    let aug = if direct.is_some() {
+        prog.clone() // call an existing function directly; no wrapper needed
+    } else {
+        let main_val = Func {
+            name: MAIN_VAL.to_string(),
+            params: Vec::new(), param_types: Vec::new(), param_modes: Vec::new(),
+            ret_type: None, type_params: Vec::new(), where_bounds: Vec::new(),
+            effects: None, body: vec![Stmt::Return(Some(inner.clone()))],
+            is_async: false, attrs: Vec::new(),
+        };
+        let mut a = prog.clone();
+        a.items.push(Item::Func(main_val));
+        a
+    };
+
+    // 3) compute the three JIT tracks over the program and find which one the
+    //    value-producing function (`__nova_main_val`, or the directly-called `f`)
+    //    landed on. If none, it isn't numeric-native -> C/embed fallback.
     let eligible = eligible_set(&aug);
-    if !eligible.contains(MAIN_VAL) { return None; }
+    let feligible = float_eligible_set(&aug, &eligible);
+    let (numeric, nret) = numeric_eligible_set(&aug, &eligible, &feligible);
+    let (producer_name, producer_args): (String, Vec<ArgConst>) = match &direct {
+        Some((name, consts)) => (name.clone(), consts.clone()),
+        None => (MAIN_VAL.to_string(), Vec::new()),
+    };
+    let pn = producer_name.as_str();
+    let track = if eligible.contains(pn) { Track::Int }
+        else if feligible.contains(pn) { Track::Float }
+        else if numeric.contains(pn) {
+            if nret.get(pn) == Some(&FKind::F) { Track::NumFloat } else { Track::NumInt }
+        } else { return None };
+    // the direct-call ABI carries constants by value: integer/numeric callees take
+    // i64 params (all-Int), the float callee takes f64 params. Reject a kind
+    // mismatch (e.g. an Int literal to an f64 param) -> fallback, never wrong.
+    let args_ok = producer_args.iter().all(|a| match (track, a) {
+        (Track::Float, ArgConst::F(_)) => true,
+        (Track::Float, ArgConst::I(_)) => false,
+        (_, ArgConst::I(_)) => true,   // int/numeric params are i64
+        (_, ArgConst::F(_)) => false,
+    });
+    if !args_ok { return None; }
+
     let mut funcs: HashMap<&str, &Func> = HashMap::new();
     let mut sdefs: HashMap<String, Vec<String>> = HashMap::new();
     for item in &aug.items {
@@ -2890,12 +2951,15 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
             _ => {}
         }
     }
-    for name in &eligible {
-        let f = funcs.get(name.as_str())?;
-        if !array_vars(f).is_empty() || !struct_vars(f, &sdefs).is_empty() {
-            return None; // needs the arena runtime -> not this increment
-        }
-    }
+    // link the runtime object when the emitted code may reference it: any local
+    // array/struct (arena helpers), or any float/numeric function (fmod/fpow and
+    // the float printer). Pure-integer array-free programs (fib) link only libc.
+    let uses_arena = eligible.iter().any(|n| {
+        let f = funcs[n.as_str()];
+        !array_vars(f).is_empty() || !struct_vars(f, &sdefs).is_empty()
+    });
+    let needs_runtime = uses_arena || !feligible.is_empty() || !numeric.is_empty()
+        || matches!(track, Track::Float | Track::NumFloat);
 
     // 4) build the object module for the host ISA
     let mut flags = settings::builder();
@@ -2908,11 +2972,12 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
         isa, "nova", cranelift_module::default_libcall_names()).ok()?;
     let mut module = ObjectModule::new(builder);
 
-    // runtime helpers as imports (declared for FnGen safety; unused by the
-    // integer track, so no relocations are emitted against them)
+    // runtime helper imports (raw i64/f64 ABI matching src/jit.rs's Rust helpers,
+    // provided by runtime/nova_native_rt.c). Unreferenced ones emit no relocation.
     let mut helpers: HashMap<&'static str, FuncId> = HashMap::new();
     {
-        let sigs: [(&'static str, &[Type], &[Type]); 7] = [
+        let f64t = types::F64;
+        let sigs: [(&'static str, &[Type], &[Type]); 9] = [
             ("nova_arr_new", &[], &[I64]),
             ("nova_arr_fill", &[I64, I64], &[I64]),
             ("nova_arr_push", &[I64, I64], &[]),
@@ -2920,6 +2985,8 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
             ("nova_arr_get", &[I64, I64, I64], &[I64]),
             ("nova_arr_set", &[I64, I64, I64, I64], &[]),
             ("nova_arr_pop", &[I64, I64], &[I64]),
+            ("nova_fmod", &[f64t, f64t], &[f64t]),
+            ("nova_fpow", &[f64t, f64t], &[f64t]),
         ];
         for (name, params, rets) in sigs {
             let mut sig = module.make_signature();
@@ -2929,8 +2996,14 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
             helpers.insert(name, id);
         }
     }
+    let libm: HashMap<&'static str, FuncId> = [
+        ("fmod", helpers["nova_fmod"]), ("fpow", helpers["nova_fpow"]),
+    ].into_iter().collect();
 
-    // 5) declare every eligible function (internal linkage) so calls resolve
+    let mut ctx = module.make_context();
+    let mut fctx = FunctionBuilderContext::new();
+
+    // 5a) integer track (FnGen): (deopt_ptr, i64 args...) -> i64, incl. arrays
     let mut names: Vec<&str> = eligible.iter().map(|s| s.as_str()).collect();
     names.sort();
     let mut ids: HashMap<String, (FuncId, usize)> = HashMap::new();
@@ -2943,10 +3016,6 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
         let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
         ids.insert(name.to_string(), (id, f.params.len()));
     }
-
-    // 6) define each body via the SAME FnGen lowering the JIT uses
-    let mut ctx = module.make_context();
-    let mut fctx = FunctionBuilderContext::new();
     for name in &names {
         let f = funcs[*name];
         let (id, _) = ids[*name];
@@ -2954,9 +3023,10 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
         for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
         ctx.func.signature.returns.push(AbiParam::new(I64));
         {
+            let arrays = array_vars(f);
+            let structs = struct_vars(f, &sdefs);
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-            let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers,
-                                   HashSet::new(), HashMap::new(), &f.params);
+            let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params);
             g.lower(&f.body)?;
             b.finalize();
         }
@@ -2964,10 +3034,66 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
         module.clear_context(&mut ctx);
     }
 
-    // 7) the C-ABI entry point: `int main(void)` that calls __nova_main_val,
-    //    prints its i64 result in decimal (+'\n') via write(1, ...), returns 0.
-    //    On deopt (overflow to BigInt etc.) it returns 1 without printing, so the
-    //    oracle gate sees a divergence and the caller falls back — never wrong.
+    // 5b) float track (FloatGen): (f64 args...) -> f64, no deopt
+    let mut fnames: Vec<&str> = feligible.iter().map(|s| s.as_str()).collect();
+    fnames.sort();
+    let mut fids: HashMap<String, (FuncId, usize)> = HashMap::new();
+    for name in &fnames {
+        let f = funcs[*name];
+        let mut sig = module.make_signature();
+        for _ in 0..f.params.len() { sig.params.push(AbiParam::new(types::F64)); }
+        sig.returns.push(AbiParam::new(types::F64));
+        let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
+        fids.insert(name.to_string(), (id, f.params.len()));
+    }
+    for name in &fnames {
+        let f = funcs[*name];
+        let (id, _) = fids[*name];
+        for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(types::F64)); }
+        ctx.func.signature.returns.push(AbiParam::new(types::F64));
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let mut g = FloatGen::new(&mut b, &mut module, &fids, &libm, &f.params);
+            g.lower(&f.body)?;
+            b.finalize();
+        }
+        module.define_function(id, &mut ctx).ok()?;
+        module.clear_context(&mut ctx);
+    }
+
+    // 5c) numeric-mixed track (NumGen): same i64 ABI as the integer track
+    let mut nnames: Vec<&str> = numeric.iter().map(|s| s.as_str()).collect();
+    nnames.sort();
+    let mut nids: HashMap<String, (FuncId, usize)> = HashMap::new();
+    for name in &nnames {
+        let f = funcs[*name];
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(I64)); // deopt flag pointer
+        for _ in 0..f.params.len() { sig.params.push(AbiParam::new(I64)); }
+        sig.returns.push(AbiParam::new(I64));
+        let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
+        nids.insert(name.to_string(), (id, f.params.len()));
+    }
+    for name in &nnames {
+        let f = funcs[*name];
+        let (id, _) = nids[*name];
+        let rk = nret[*name];
+        ctx.func.signature.params.push(AbiParam::new(I64));
+        for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let mut g = NumGen::new(&mut b, &mut module, &libm, &f.params, rk);
+            g.lower(&f.body)?;
+            b.finalize();
+        }
+        module.define_function(id, &mut ctx).ok()?;
+        module.clear_context(&mut ctx);
+    }
+
+    // 6) the C-ABI entry point: `int main(void)` that calls __nova_main_val and
+    //    prints its result (+'\n'), returning 0 — or 1 on deopt (no output), so
+    //    the oracle gate sees a divergence and the caller falls back.
     let write_id = {
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(I32)); // fd
@@ -2976,7 +3102,16 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
         sig.returns.push(AbiParam::new(I64));
         module.declare_function("write", Linkage::Import, &sig).ok()?
     };
-    let (mv_id, _) = ids[MAIN_VAL];
+    let print_f64_id = {
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(types::F64));
+        module.declare_function("nova_print_f64", Linkage::Import, &sig).ok()?
+    };
+    let mv_id = match track {
+        Track::Int => ids[pn].0,
+        Track::Float => fids[pn].0,
+        Track::NumInt | Track::NumFloat => nids[pn].0,
+    };
     let main_id = {
         let mut sig = module.make_signature();
         sig.returns.push(AbiParam::new(I32));
@@ -2985,45 +3120,86 @@ pub fn compile_object(prog: &Program) -> Option<Vec<u8>> {
     ctx.func.signature.returns.push(AbiParam::new(I32));
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        build_native_entry(&mut b, &mut module, mv_id, write_id);
+        build_native_entry(&mut b, &mut module, mv_id, track, &producer_args, write_id, print_f64_id);
         b.finalize();
     }
     module.define_function(main_id, &mut ctx).ok()?;
     module.clear_context(&mut ctx);
 
-    // 8) emit the relocatable object bytes
-    module.finish().emit().ok()
+    // 7) emit the relocatable object bytes
+    Some((module.finish().emit().ok()?, needs_runtime))
 }
 
-// Emit the body of the C-ABI `main`: call the nullary i64 producer, then itoa +
-// write(1, ...). All lowered in Cranelift IR — no C, no printf variadics.
+// Emit the body of the C-ABI `main`: call the nullary value producer, then print
+// its result. Integer/numeric-int -> in-IR decimal itoa + write(1,…); float /
+// numeric-float -> nova_print_f64 (runtime, byte-identical to the interpreter).
 fn build_native_entry(b: &mut FunctionBuilder, module: &mut ObjectModule,
-                      producer: FuncId, write_id: FuncId) {
+                      producer: FuncId, track: Track, args: &[ArgConst],
+                      write_id: FuncId, print_f64_id: FuncId) {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.seal_block(entry);
 
-    // deopt flag on the stack, initialised to 0
-    let slot = b.func.create_sized_stack_slot(
-        StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-    let zero64 = b.ins().iconst(I64, 0);
-    b.ins().stack_store(zero64, slot, 0);
-    let dptr = b.ins().stack_addr(I64, slot, 0);
+    let float_out = matches!(track, Track::Float | Track::NumFloat);
+    let has_deopt = !matches!(track, Track::Float); // float track never deopts
 
-    // r = __nova_main_val(&deopt)
     let pref = module.declare_func_in_func(producer, b.func);
-    let call = b.ins().call(pref, &[dptr]);
-    let r = b.inst_results(call)[0];
-
-    // if deopt flag set -> diverge (return 1, no output)
-    let flag = b.ins().stack_load(I64, slot, 0);
     let print_blk = b.create_block();
     let diverge_blk = b.create_block();
-    b.ins().brif(flag, diverge_blk, &[], print_blk, &[]);
 
-    // ---- print block: decimal itoa into a 32-byte stack buffer, backwards ----
+    // materialise the constant arguments in the callee's ABI: i64 for the
+    // integer/numeric tracks, f64 for the float track.
+    let mut argvals: Vec<Value> = Vec::new();
+    for a in args {
+        argvals.push(match a {
+            ArgConst::I(n) => b.ins().iconst(I64, *n),
+            ArgConst::F(x) => b.ins().f64const(*x),
+        });
+    }
+
+    // call the producer with its track's ABI; branch to the print block (float
+    // track can't deopt, so it jumps straight there).
+    let r; // the producer's raw result (i64 for int/numeric, f64 for float)
+    if has_deopt {
+        let slot = b.func.create_sized_stack_slot(
+            StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let zero64 = b.ins().iconst(I64, 0);
+        b.ins().stack_store(zero64, slot, 0);
+        let dptr = b.ins().stack_addr(I64, slot, 0);
+        let mut call_args = vec![dptr]; // deopt ptr first
+        call_args.extend_from_slice(&argvals);
+        let call = b.ins().call(pref, &call_args);
+        r = b.inst_results(call)[0];
+        let flag = b.ins().stack_load(I64, slot, 0);
+        b.ins().brif(flag, diverge_blk, &[], print_blk, &[]);
+    } else {
+        let call = b.ins().call(pref, &argvals);
+        r = b.inst_results(call)[0];
+        b.ins().jump(print_blk, &[]);
+    }
+
     b.switch_to_block(print_blk);
     b.seal_block(print_blk);
+
+    // ---- float path: hand the f64 to the runtime formatter ----
+    if float_out {
+        // numeric-float returns f64 *bits* in an i64; reinterpret. float track
+        // already returns an f64.
+        let fv = if matches!(track, Track::NumFloat) {
+            b.ins().bitcast(types::F64, MemFlags::new(), r)
+        } else { r };
+        let fref = module.declare_func_in_func(print_f64_id, b.func);
+        b.ins().call(fref, &[fv]);
+        let ok = b.ins().iconst(I32, 0);
+        b.ins().return_(&[ok]);
+        b.switch_to_block(diverge_blk);
+        b.seal_block(diverge_blk);
+        let one = b.ins().iconst(I32, 1);
+        b.ins().return_(&[one]);
+        return;
+    }
+
+    // ---- integer path: decimal itoa into a 32-byte stack buffer, backwards ----
     let buf = b.func.create_sized_stack_slot(
         StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 3));
     let base = b.ins().stack_addr(I64, buf, 0);
@@ -3386,30 +3562,53 @@ mod jit_tests {
         assert!(names.contains(&"kern".to_string()), "hot numeric fn must compile");
     }
 
-    // The native object backend must produce an object for an integer
-    // `print(<int>)` program, and must decline (fall back) for programs it can't
-    // yet lower natively (strings/floats/arrays). Correctness of the emitted code
-    // is proven end-to-end by the build's oracle gate; here we only assert the
-    // object is produced / declined as intended.
+    // The native object backend emits an object across the full numeric surface
+    // (int / float / numeric-mixed / arrays), and declines (falls back) for
+    // non-numeric programs. Correctness of the emitted code is proven end-to-end
+    // by the build's oracle gate; here we assert emit/decline + the needs_runtime
+    // flag (pure-integer array-free programs must link only libc).
     #[test] fn native_object_integer_program() {
         let src = "fn fib(n){ if n<2 {n} else {fib(n-1)+fib(n-2)} } fn main(){ print(fib(10)) }";
         let mut prog = parse_program(src).expect("parse");
         fold_program(&mut prog);
-        let obj = super::compile_object(&prog);
-        assert!(obj.is_some(), "integer print program must emit an object");
-        assert!(!obj.unwrap().is_empty(), "object must be non-empty bytes");
+        let (obj, needs_rt) = super::compile_object(&prog).expect("integer program must emit");
+        assert!(!obj.is_empty(), "object must be non-empty bytes");
+        assert!(!needs_rt, "pure-integer program must link only libc (no runtime)");
     }
-    #[test] fn native_object_declines_nonint() {
+    #[test] fn native_object_float_program() {
+        let src = "fn area(r){ 3.14159 * r * r } fn main(){ print(area(2.0)) }";
+        let mut prog = parse_program(src).expect("parse");
+        fold_program(&mut prog);
+        let (obj, needs_rt) = super::compile_object(&prog).expect("float program must emit");
+        assert!(!obj.is_empty());
+        assert!(needs_rt, "float program needs the runtime float printer");
+    }
+    #[test] fn native_object_numeric_and_array_programs() {
+        // numeric-mixed (mandel-style: float math, int result) and integer arrays
         for src in [
-            "fn main(){ print(\"hi\") }",           // string arg
-            "fn main(){ print(1.5) }",              // float arg
-            "fn main(){ let a=[1,2]; print(a[0]) }", // array (needs runtime)
-            "fn main(){ print(1); print(2) }",       // two prints
+            "fn k(n){ t=0; for i in 0..n { if to_float(i)*0.5 > 1.0 { t=t+1 } }; t }\n\
+             fn main(){ print(k(10)) }",
+            "fn c(n){ s=[]; for i in 0..n { push(s,1) }; s[0]=0; t=0; \
+             for k in 0..n { t=t+s[k] }; t } fn main(){ print(c(50)) }",
+        ] {
+            let mut prog = parse_program(src).expect("parse");
+            fold_program(&mut prog);
+            let (obj, needs_rt) = super::compile_object(&prog)
+                .unwrap_or_else(|| panic!("numeric/array program must emit: {}", src));
+            assert!(!obj.is_empty());
+            assert!(needs_rt, "numeric/array program links the runtime: {}", src);
+        }
+    }
+    #[test] fn native_object_declines_nonnumeric() {
+        for src in [
+            "fn main(){ print(\"hi\") }",       // string arg (boxed tier)
+            "fn main(){ print(true) }",         // bool arg
+            "fn main(){ print(1); print(2) }",  // two prints
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
             assert!(super::compile_object(&prog).is_none(),
-                    "must decline non-integer-native program: {}", src);
+                    "must decline non-numeric program: {}", src);
         }
     }
 }
