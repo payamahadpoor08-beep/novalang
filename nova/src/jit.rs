@@ -23,7 +23,7 @@ use crate::ast::*;
 // `TieredJit`, and their codegen — simply isn't compiled, and the VM runs pure
 // bytecode. `Jit` and `TieredJit` are re-exported so callers see `jit::Jit` etc.
 #[cfg(feature = "jit")]
-pub use cl::{Jit, TieredJit, compile_object};
+pub use cl::{Jit, TieredJit, compile_object, NativeTarget};
 
 // functions with more parameters than this stay on the VM (keeps the call ABI
 // dispatch in `raw_call` finite)
@@ -850,6 +850,7 @@ use cranelift::prelude::*;
 use cranelift::prelude::types::{I64, I128, I32, I8};
 use cranelift::codegen::Context;
 use cranelift::codegen::control::ControlPlane;
+use cranelift::codegen::isa;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Module, Linkage, FuncId};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -2950,6 +2951,24 @@ fn const_arg(e: &Expr) -> Option<ArgConst> {
     }
 }
 
+// Which architecture the native object is emitted for. `Host` uses the running
+// machine's ISA; the cross targets emit a relocatable object for another arch
+// (linked + qemu-verified by the build). The same Cranelift IR lowers to every
+// target — the entry's itoa/`write` is arch-independent — so nothing here is
+// arch-specific; only the ISA and the object's binary format differ.
+#[derive(Clone, Copy, PartialEq)]
+pub enum NativeTarget { Host, Aarch64 }
+
+impl NativeTarget {
+    // the target triple string, or None for the host (uses cranelift_native).
+    fn triple(self) -> Option<&'static str> {
+        match self {
+            NativeTarget::Host => None,
+            NativeTarget::Aarch64 => Some("aarch64-unknown-linux-gnu"),
+        }
+    }
+}
+
 // Build a relocatable object for a numeric `print(<expr>)` program, covering the
 // full surface the JIT compiles: the integer track (`FnGen`, incl. local integer
 // arrays/structs), the float track (`FloatGen`), and the numeric-mixed track
@@ -2958,7 +2977,7 @@ fn const_arg(e: &Expr) -> Option<ArgConst> {
 // (arena helpers / fmod-fpow / float printer), so the caller knows whether to
 // link it. `None` when the program isn't numeric-native (→ C/embed fallback).
 // Correctness is backed by the build's oracle gate (byte-diff vs `nova run`).
-pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
+pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, bool)> {
     // 1) locate `main` and extract its single `print(<expr>)` argument
     let main = prog.items.iter().find_map(|it| match it {
         Item::Func(f) if f.name == "main" => Some(f),
@@ -3050,13 +3069,20 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
         || !feligible.is_empty() || !numeric.is_empty()
         || items.iter().any(|(_, t, _)| matches!(t, Track::Float | Track::NumFloat));
 
-    // 4) build the object module for the host ISA
+    // 4) build the object module for the requested ISA (host, or a cross target)
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
-    // relocatable object code is position-independent
-    flags.set("is_pic", "true").ok()?;
-    let isa = cranelift_native::builder().ok()?
-        .finish(settings::Flags::new(flags)).ok()?;
+    // the host binary is a PIE (linked with plain `cc`); the aarch64 cross binary
+    // links static non-PIE, so it emits non-PIC code.
+    flags.set("is_pic", if target == NativeTarget::Host { "true" } else { "false" }).ok()?;
+    let isa = match target.triple() {
+        None => cranelift_native::builder().ok()?
+            .finish(settings::Flags::new(flags)).ok()?,
+        Some(triple) => {
+            let t = triple.parse::<target_lexicon::Triple>().ok()?;
+            isa::lookup(t).ok()?.finish(settings::Flags::new(flags)).ok()?
+        }
+    };
     let builder = ObjectBuilder::new(
         isa, "nova", cranelift_module::default_libcall_names()).ok()?;
     let mut module = ObjectModule::new(builder);
@@ -3743,7 +3769,7 @@ mod jit_tests {
         let src = "fn fib(n){ if n<2 {n} else {fib(n-1)+fib(n-2)} } fn main(){ print(fib(10)) }";
         let mut prog = parse_program(src).expect("parse");
         fold_program(&mut prog);
-        let (obj, needs_rt) = super::compile_object(&prog).expect("integer program must emit");
+        let (obj, needs_rt) = super::compile_object(&prog, super::NativeTarget::Host).expect("integer program must emit");
         assert!(!obj.is_empty(), "object must be non-empty bytes");
         assert!(!needs_rt, "pure-integer program must link only libc (no runtime)");
     }
@@ -3751,7 +3777,7 @@ mod jit_tests {
         let src = "fn area(r){ 3.14159 * r * r } fn main(){ print(area(2.0)) }";
         let mut prog = parse_program(src).expect("parse");
         fold_program(&mut prog);
-        let (obj, needs_rt) = super::compile_object(&prog).expect("float program must emit");
+        let (obj, needs_rt) = super::compile_object(&prog, super::NativeTarget::Host).expect("float program must emit");
         assert!(!obj.is_empty());
         assert!(needs_rt, "float program needs the runtime float printer");
     }
@@ -3765,7 +3791,7 @@ mod jit_tests {
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
-            let (obj, needs_rt) = super::compile_object(&prog)
+            let (obj, needs_rt) = super::compile_object(&prog, super::NativeTarget::Host)
                 .unwrap_or_else(|| panic!("numeric/array program must emit: {}", src));
             assert!(!obj.is_empty());
             assert!(needs_rt, "numeric/array program links the runtime: {}", src);
@@ -3782,6 +3808,22 @@ mod jit_tests {
         src.push_str(" }\nfn main(){ agg() }");
         same_jit(&src);
     }
+    #[test] fn native_object_cross_arch() {
+        // the same Cranelift IR emits a real object for the aarch64 cross target —
+        // proves the aarch64 backend is compiled in (independent of a linker or
+        // qemu, which the build's oracle gate needs but this test does not).
+        let src = "fn fib(n){ if n<2 {n} else {fib(n-1)+fib(n-2)} } fn main(){ print(fib(10)) }";
+        let mut prog = parse_program(src).expect("parse");
+        fold_program(&mut prog);
+        for (t, label) in [
+            (super::NativeTarget::Host, "host"),
+            (super::NativeTarget::Aarch64, "aarch64"),
+        ] {
+            let (obj, _) = super::compile_object(&prog, t)
+                .unwrap_or_else(|| panic!("{} target must emit an object", label));
+            assert!(obj.len() > 64, "{} object must be real ELF bytes", label);
+        }
+    }
     #[test] fn native_object_multi_print() {
         // multiple print()s in main -> all emit (numeric surface), needs runtime.
         for src in [
@@ -3790,7 +3832,7 @@ mod jit_tests {
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
-            let (obj, needs_rt) = super::compile_object(&prog)
+            let (obj, needs_rt) = super::compile_object(&prog, super::NativeTarget::Host)
                 .unwrap_or_else(|| panic!("multi-print must emit: {}", src));
             assert!(!obj.is_empty());
             assert!(needs_rt, "multi-print uses the runtime printers: {}", src);
@@ -3805,7 +3847,7 @@ mod jit_tests {
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
-            assert!(super::compile_object(&prog).is_none(),
+            assert!(super::compile_object(&prog, super::NativeTarget::Host).is_none(),
                     "must decline non-numeric program: {}", src);
         }
     }

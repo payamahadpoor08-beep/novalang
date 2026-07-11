@@ -381,6 +381,7 @@ name = "nova"
 version = "3.31.0"
 dependencies = [
  "cranelift",
+ "cranelift-codegen",
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
@@ -391,6 +392,7 @@ dependencies = [
  "pest_derive",
  "rustls",
  "rustls-pemfile",
+ "target-lexicon",
  "webpki-roots 0.26.11",
 ]
 
