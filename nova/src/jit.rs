@@ -3019,18 +3019,27 @@ fn const_str(e: &Expr) -> Option<String> {
 }
 
 // Format a constant interpolation hole / `str()` argument exactly as Nova prints
-// it. Ints -> decimal, bools -> `true`/`false`, strings -> raw. Floats and
-// anything else return `None` (leave that program to the C/embed fallback rather
-// than risk a formatting mismatch — the oracle gate would catch it regardless).
+// it. Ints -> decimal, floats -> `float_str`, bools -> `true`/`false`, strings ->
+// raw. Anything not a decidable constant returns `None` (leave that program to the
+// C/embed fallback; the oracle gate would catch any mismatch regardless).
 fn const_hole(e: &Expr) -> Option<String> {
     match unwrap_at(e) {
         Expr::Str(s) => Some(s.clone()),
         Expr::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
         other => match const_arg(other) {
             Some(ArgConst::I(n)) => Some(n.to_string()),
-            _ => None,
+            Some(ArgConst::F(x)) => Some(float_str(x)),
+            None => None,
         },
     }
+}
+
+// A Nova float's string form, byte-identical to `impl Display for Value`
+// (interp.rs): an integral finite float prints as `{:.1}` ("5.0", "-0.0"), else
+// Rust's default shortest-round-tripping f64 formatting. Reused to bake constant
+// float pieces of a native string.
+fn float_str(x: f64) -> String {
+    if x.fract() == 0.0 && x.is_finite() { format!("{:.1}", x) } else { format!("{}", x) }
 }
 
 // ---------------------------------------------------------------------------
@@ -3086,10 +3095,10 @@ fn str_shape(e: &Expr, params: &HashSet<&str>) -> bool {
     fn walk(e: &Expr, params: &HashSet<&str>, committed: &mut bool) -> bool {
         match strip_at(e) {
             Expr::Str(_) => { *committed = true; true }
-            // an int/bool used in a string position is printed as its string form
-            // (interpreter coercion / `str()`); a numeric parameter is passed to the
-            // producer already boxed to that string form, so both are strings here.
-            Expr::Int(_) | Expr::Bool(_) => { *committed = true; true }
+            // an int/float/bool used in a string position is printed as its string
+            // form (interpreter coercion / `str()`); a numeric parameter is passed
+            // to the producer already boxed to that form, so both are strings here.
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => { *committed = true; true }
             Expr::Ident(p) => params.contains(p.as_str()),
             Expr::Binary { op: BinOp::Add, lhs, rhs } => {
                 *committed = true;
@@ -3185,9 +3194,10 @@ impl<'a, 'b> StrGen<'a, 'b> {
     fn lower_str(&mut self, e: &Expr) -> Option<Value> {
         match strip_at(e) {
             Expr::Str(s) => self.lit(s.as_bytes()),
-            // an int/bool literal in string position -> its string form, matching
-            // the interpreter's Display (decimal ints, true/false).
+            // an int/float/bool literal in string position -> its string form,
+            // matching the interpreter's Display (decimal ints, float_str, true/false).
             Expr::Int(n) => self.lit(n.to_string().as_bytes()),
+            Expr::Float(x) => self.lit(float_str(*x).as_bytes()),
             Expr::Bool(b) => self.lit(if *b { b"true" } else { b"false" }),
             Expr::Ident(p) => self.params.get(p).copied(),
             // `str(x)` / `to_str(x)` -> x's string form (numeric params already
@@ -4357,7 +4367,7 @@ mod jit_tests {
         for src in [
             "fn main(){ print(true) }",                          // bool arg (boxed tier)
             "fn main(){ let x=1; print(x) }",                    // non-print statement
-            "fn main(){ print(f\"pi={3.14}\") }",                // float f-string hole
+            "fn f(n){ \"v=\" + str(n * 2) } fn main(){ print(f(5)) }", // arithmetic in string
             "fn greet(n){ n } fn main(){ print(greet(\"hi\")) }", // runtime string via fn
         ] {
             let mut prog = parse_program(src).expect("parse");
@@ -4401,6 +4411,9 @@ mod jit_tests {
             "fn label(n){ \"count: \" + str(n) } fn main(){ print(label(5)) }",
             "fn tag(name, n){ f\"{name}: {n}\" } fn main(){ print(tag(\"age\", 30)) }",
             "fn f(name, n){ name + \" has \" + n } fn main(){ print(f(\"bob\", 7)) }",
+            // increment 2b: float parameters / literals, formatted via float_str.
+            "fn dim(w){ \"w=\" + str(w) } fn main(){ print(dim(2.5)) }",
+            "fn pt(name, x){ f\"{name}={x} (pi {3.14})\" } fn main(){ print(pt(\"r\", 1.5)) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
