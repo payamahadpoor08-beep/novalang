@@ -76,6 +76,42 @@ i64 nova_arr_pop(i64 *dp, i64 h) {
     return a->data[--a->len];
 }
 
+/* ---- heap strings: handle = pointer to a length-prefixed byte buffer ------ */
+/* Backs the native string track (src/jit.rs StrGen). A Nova string is an NStr;
+ * concatenation matches the interpreter's `format!("{}{}", a, b)` byte-for-byte.
+ * Like the arena arrays, allocations live until process exit (no free). */
+
+typedef struct { i64 len; char *data; } NStr;
+
+i64 nova_str_lit(const char *p, i64 n) {
+    NStr *s = (NStr *)malloc(sizeof(NStr));
+    s->len = n;
+    s->data = (char *)malloc(n > 0 ? (size_t)n : 1);
+    memcpy(s->data, p, (size_t)n);
+    return (i64)(intptr_t)s;
+}
+
+i64 nova_str_concat(i64 a, i64 b) {
+    NStr *x = (NStr *)(intptr_t)a, *y = (NStr *)(intptr_t)b;
+    NStr *r = (NStr *)malloc(sizeof(NStr));
+    r->len = x->len + y->len;
+    r->data = (char *)malloc(r->len > 0 ? (size_t)r->len : 1);
+    memcpy(r->data, x->data, (size_t)x->len);
+    memcpy(r->data + x->len, y->data, (size_t)y->len);
+    return (i64)(intptr_t)r;
+}
+
+/* print a Nova string value: its bytes + trailing newline, one write(2). */
+void nova_str_print(i64 h) {
+    NStr *s = (NStr *)(intptr_t)h;
+    char *buf = (char *)malloc((size_t)s->len + 1);
+    memcpy(buf, s->data, (size_t)s->len);
+    buf[s->len] = '\n';
+    ssize_t _ = write(1, buf, (size_t)s->len + 1);
+    (void)_;
+    free(buf);
+}
+
 /* ---- f64 % and ** (call back like the JIT's Rust nova_fmod/nova_fpow) ----- */
 double fmod(double, double); /* libm; no math.h to keep the TU minimal */
 double pow(double, double);

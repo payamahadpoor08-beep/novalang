@@ -2963,10 +2963,16 @@ enum Track { Int, Float, NumInt, NumFloat }
 #[derive(Clone, Copy)]
 enum ArgConst { I(i64), F(f64) }
 
-// A resolved printed value, in source order: either baked constant-string bytes
-// (a read-only data object + its byte length, printed with a `write` syscall) or
-// a number produced by a compiled function on one of the numeric tracks.
-enum RItem { Str(DataId, usize), Num(FuncId, Track, Vec<ArgConst>) }
+// A resolved printed value, in source order: baked constant-string bytes (a
+// read-only data object + its byte length, printed with a `write` syscall), a
+// number produced by a compiled function on a numeric track, or a run-time string
+// produced by a StrGen function (its FuncId + each constant-string argument boxed
+// as a data object + length, printed with nova_str_print).
+enum RItem {
+    Str(DataId, usize),
+    Num(FuncId, Track, Vec<ArgConst>),
+    StrProducer(FuncId, Vec<(DataId, usize)>),
+}
 
 // Extract a constant literal argument (post-fold): an Int/Float literal or a
 // negated one. `None` if the expression isn't a decidable numeric constant.
@@ -3027,6 +3033,189 @@ fn const_hole(e: &Expr) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native string track (StrGen). A Nova string value is represented at run time
+// as an i64 handle to a heap NStr (runtime/nova_native_rt.c). This is increment 1
+// of dynamic native strings: functions that compose a string from literals,
+// string parameters, `+` concatenation, f-strings (string holes), and calls to
+// other string functions. Numbers-in-strings, string locals/loops, and string
+// builtins are follow-up increments; anything unsupported declines and the
+// oracle gate (byte-diff vs `nova run`) guarantees output is never wrong.
+// ---------------------------------------------------------------------------
+
+// Functions whose result is such a run-time string. A function qualifies iff it
+// is not on a numeric track, its body is a single tail expression / return of a
+// string composition, and that composition contains at least one literal /
+// concat / f-string (so an identity `fn f(x){x}` is never mistyped). Closed under
+// calls by a fixpoint, exactly like `eligible_set`.
+fn str_eligible_set(prog: &Program, int_set: &HashSet<String>,
+                    float_set: &HashSet<String>, num_set: &HashSet<String>) -> HashSet<String> {
+    let mut funcs: HashMap<&str, &Func> = HashMap::new();
+    for item in &prog.items {
+        if let Item::Func(f) = item { funcs.insert(&f.name, f); }
+    }
+    fn tail(f: &Func) -> Option<&Expr> {
+        if f.body.len() != 1 { return None; }
+        match &f.body[0] { Stmt::Expr(e) | Stmt::Return(Some(e)) => Some(e), _ => None }
+    }
+    let mut set: HashSet<String> = funcs.values().filter(|f| {
+        if f.params.len() > MAX_ARITY { return false; }
+        if int_set.contains(&f.name) || float_set.contains(&f.name)
+            || num_set.contains(&f.name) { return false; }
+        let params: HashSet<&str> = f.params.iter().map(|s| s.as_str()).collect();
+        tail(f).map_or(false, |e| str_shape(e, &params))
+    }).map(|f| f.name.clone()).collect();
+    // drop any function that calls a name outside the set, until stable
+    loop {
+        let mut remove = None;
+        for name in &set {
+            let e = match tail(funcs[name.as_str()]) { Some(e) => e, None => continue };
+            let mut calls = Vec::new();
+            str_calls(e, &mut calls);
+            if calls.iter().any(|c| !set.contains(c)) { remove = Some(name.clone()); break; }
+        }
+        match remove { Some(n) => { set.remove(&n); } None => break }
+    }
+    set
+}
+
+// A string composition (calls allowed to anything — the fixpoint validates them),
+// requiring at least one string-committing node so pass-through/identity
+// functions are excluded.
+fn str_shape(e: &Expr, params: &HashSet<&str>) -> bool {
+    fn walk(e: &Expr, params: &HashSet<&str>, committed: &mut bool) -> bool {
+        match strip_at(e) {
+            Expr::Str(_) => { *committed = true; true }
+            Expr::Ident(p) => params.contains(p.as_str()),
+            Expr::Binary { op: BinOp::Add, lhs, rhs } => {
+                *committed = true;
+                walk(lhs, params, committed) && walk(rhs, params, committed)
+            }
+            Expr::FmtStr(parts) => {
+                *committed = true;
+                parts.iter().all(|p| match p {
+                    FmtPart::Lit(_) => true,
+                    FmtPart::Expr(h) => walk(h, params, committed),
+                })
+            }
+            // a call to a string-eligible function (validated by the fixpoint)
+            // produces a string, so it commits — this lets a pure pass-through like
+            // `fn deco(s){ wrap(wrap(s)) }` qualify, while an identity `fn f(x){x}`
+            // (no call, no literal) stays excluded.
+            Expr::Call { args, .. } => {
+                *committed = true;
+                args.iter().all(|a| walk(a, params, committed))
+            }
+            _ => false,
+        }
+    }
+    let mut committed = false;
+    walk(e, params, &mut committed) && committed
+}
+
+fn str_calls(e: &Expr, out: &mut Vec<String>) {
+    match strip_at(e) {
+        Expr::Binary { lhs, rhs, .. } => { str_calls(lhs, out); str_calls(rhs, out); }
+        Expr::FmtStr(parts) =>
+            for p in parts { if let FmtPart::Expr(h) = p { str_calls(h, out); } },
+        Expr::Call { callee, args } => {
+            out.push(callee.clone());
+            for a in args { str_calls(a, out); }
+        }
+        _ => {}
+    }
+}
+
+// Lowers a string-composition function body to an i64 string handle. Simpler than
+// FnGen: one value kind (handle), no deopt (concat can't fail). C-ABI
+// `(i64 handles...) -> i64`.
+struct StrGen<'a, 'b> {
+    b: &'a mut FunctionBuilder<'b>,
+    module: &'a mut dyn Module,
+    ids: &'a HashMap<String, (FuncId, usize)>, // other string functions
+    str_lit: FuncId,
+    str_concat: FuncId,
+    params: HashMap<String, Value>,
+}
+
+impl<'a, 'b> StrGen<'a, 'b> {
+    fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut dyn Module,
+           ids: &'a HashMap<String, (FuncId, usize)>,
+           str_lit: FuncId, str_concat: FuncId, params: &[String]) -> Self {
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let pv: Vec<Value> = b.block_params(entry).to_vec();
+        let mut pm = HashMap::new();
+        for (i, p) in params.iter().enumerate() { pm.insert(p.clone(), pv[i]); }
+        StrGen { b, module, ids, str_lit, str_concat, params: pm }
+    }
+
+    // box literal bytes into an NStr handle via nova_str_lit(ptr, len).
+    fn lit(&mut self, bytes: &[u8]) -> Option<Value> {
+        let data = self.module.declare_anonymous_data(false, false).ok()?;
+        let mut desc = DataDescription::new();
+        desc.define(bytes.to_vec().into_boxed_slice());
+        self.module.define_data(data, &desc).ok()?;
+        let gv = self.module.declare_data_in_func(data, self.b.func);
+        let ptr = self.b.ins().global_value(I64, gv);
+        let n = self.b.ins().iconst(I64, bytes.len() as i64);
+        let f = self.module.declare_func_in_func(self.str_lit, self.b.func);
+        let call = self.b.ins().call(f, &[ptr, n]);
+        Some(self.b.inst_results(call)[0])
+    }
+
+    fn concat(&mut self, a: Value, c: Value) -> Value {
+        let f = self.module.declare_func_in_func(self.str_concat, self.b.func);
+        let call = self.b.ins().call(f, &[a, c]);
+        self.b.inst_results(call)[0]
+    }
+
+    fn lower_str(&mut self, e: &Expr) -> Option<Value> {
+        match strip_at(e) {
+            Expr::Str(s) => self.lit(s.as_bytes()),
+            Expr::Ident(p) => self.params.get(p).copied(),
+            Expr::Binary { op: BinOp::Add, lhs, rhs } => {
+                let a = self.lower_str(lhs)?;
+                let c = self.lower_str(rhs)?;
+                Some(self.concat(a, c))
+            }
+            Expr::FmtStr(parts) => {
+                let mut acc: Option<Value> = None;
+                for p in parts {
+                    let piece = match p {
+                        FmtPart::Lit(s) => self.lit(s.as_bytes())?,
+                        FmtPart::Expr(h) => self.lower_str(h)?,
+                    };
+                    acc = Some(match acc { Some(a) => self.concat(a, piece), None => piece });
+                }
+                match acc { Some(v) => Some(v), None => self.lit(b"") }
+            }
+            Expr::Call { callee, args } => {
+                let (id, arity) = self.ids.get(callee).copied()?;
+                if args.len() != arity { return None; }
+                let mut av = Vec::new();
+                for a in args { av.push(self.lower_str(a)?); }
+                let f = self.module.declare_func_in_func(id, self.b.func);
+                let call = self.b.ins().call(f, &av);
+                Some(self.b.inst_results(call)[0])
+            }
+            _ => None,
+        }
+    }
+
+    fn lower(&mut self, body: &[Stmt]) -> Option<()> {
+        let e = match body.first()? {
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => e,
+            _ => return None,
+        };
+        let v = self.lower_str(e)?;
+        self.b.ins().return_(&[v]);
+        Some(())
+    }
+}
+
 // Which architecture the native object is emitted for. `Host` uses the running
 // machine's ISA; the cross targets emit a relocatable object for another arch
 // (linked + qemu-verified by the build). The same Cranelift IR lowers to every
@@ -3073,17 +3262,40 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     //    `fn __nova_main_val_N() { return <expr> }` and let the analysis type it.
     let user_fn = |name: &str| prog.items.iter().any(|it|
         matches!(it, Item::Func(f) if f.name == name));
-    // Each printed value is either a compile-time-constant string (baked to bytes
-    // and written directly — no runtime, libc-only) or a numeric value produced by
-    // a compiled function. `slots` records the source print order; `producers`
-    // (and later `items`) carry only the numeric ones.
-    enum Slot { Str(String), Num(usize) } // Num holds an index into `producers`
+    // String-eligible functions (computed on `prog`; the synthesized numeric
+    // producers below don't affect real functions' membership). A printed
+    // `f(<const strings>)` where `f` is string-eligible compiles natively via the
+    // StrGen track instead of falling back.
+    let str_set = {
+        let i = eligible_set(prog);
+        let fl = float_eligible_set(prog, &i);
+        let (nu, _) = numeric_eligible_set(prog, &i, &fl);
+        str_eligible_set(prog, &i, &fl, &nu)
+    };
+
+    // Each printed value is a compile-time-constant string (baked bytes, libc-only),
+    // a run-time string from a StrGen function, or a numeric value from a compiled
+    // function. `slots` records the print order; `producers`/`items` carry the
+    // numeric ones, `str_producers` the string-function ones.
+    enum Slot { Str(String), Num(usize), StrFn(usize) }
     let mut slots: Vec<Slot> = Vec::new();
     let mut producers: Vec<(String, Vec<ArgConst>)> = Vec::new();
+    let mut str_producers: Vec<(String, Vec<String>)> = Vec::new(); // (fn, const-string args)
     let mut aug = prog.clone();
     for (i, expr) in printed.iter().enumerate() {
         // a constant string prints via baked bytes — no producer function needed.
         if let Some(s) = const_str(expr) { slots.push(Slot::Str(s)); continue; }
+        // a string-eligible function called with constant-string args -> StrGen.
+        if let Expr::Call { callee, args } = strip_at(expr) {
+            if str_set.contains(callee) {
+                if let Some(sargs) = args.iter().map(const_str).collect::<Option<Vec<_>>>() {
+                    let idx = str_producers.len();
+                    str_producers.push((callee.clone(), sargs));
+                    slots.push(Slot::StrFn(idx));
+                    continue;
+                }
+            }
+        }
         let direct = match unwrap_at(expr) {
             Expr::Call { callee, args } if user_fn(callee) =>
                 args.iter().map(const_arg).collect::<Option<Vec<_>>>()
@@ -3159,6 +3371,7 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     let multi = slots.len() > 1;
     let needs_runtime = (multi && !items.is_empty()) || uses_arena
         || !feligible.is_empty() || !numeric.is_empty()
+        || !str_producers.is_empty() // string track uses nova_str_* from the runtime
         || items.iter().any(|(_, t, _)| matches!(t, Track::Float | Track::NumFloat));
 
     // 4) build the object module for the requested ISA (host, or a cross target)
@@ -3312,6 +3525,60 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
         jobs.push((id, ctx));
     }
 
+    // 5d) string track (StrGen): (i64 handles...) -> i64 handle, no deopt. Only
+    //     built when a string value is actually printed; declares the runtime
+    //     string imports and every string-eligible function (closed under calls).
+    let (str_lit_id, str_print_id, str_ids): (Option<FuncId>, Option<FuncId>, HashMap<String, (FuncId, usize)>) =
+    if str_producers.is_empty() {
+        (None, None, HashMap::new())
+    } else {
+        let lit = {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64)); // bytes ptr
+            sig.params.push(AbiParam::new(I64)); // len
+            sig.returns.push(AbiParam::new(I64));
+            module.declare_function("nova_str_lit", Linkage::Import, &sig).ok()?
+        };
+        let cat = {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64));
+            sig.params.push(AbiParam::new(I64));
+            sig.returns.push(AbiParam::new(I64));
+            module.declare_function("nova_str_concat", Linkage::Import, &sig).ok()?
+        };
+        let prn = {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64));
+            module.declare_function("nova_str_print", Linkage::Import, &sig).ok()?
+        };
+        let mut snames: Vec<&str> = str_set.iter().map(|s| s.as_str()).collect();
+        snames.sort();
+        let mut str_ids: HashMap<String, (FuncId, usize)> = HashMap::new();
+        for name in &snames {
+            let f = funcs[*name];
+            let mut sig = module.make_signature();
+            for _ in 0..f.params.len() { sig.params.push(AbiParam::new(I64)); }
+            sig.returns.push(AbiParam::new(I64));
+            let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
+            str_ids.insert(name.to_string(), (id, f.params.len()));
+        }
+        for name in &snames {
+            let f = funcs[*name];
+            let (id, _) = str_ids[*name];
+            let mut ctx = module.make_context();
+            for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
+            ctx.func.signature.returns.push(AbiParam::new(I64));
+            {
+                let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let mut g = StrGen::new(&mut b, &mut module, &str_ids, lit, cat, &f.params);
+                g.lower(&f.body)?;
+                b.finalize();
+            }
+            jobs.push((id, ctx));
+        }
+        (Some(lit), Some(prn), str_ids)
+    };
+
     // 6) the C-ABI entry point: `int main(void)` that calls __nova_main_val and
     //    prints its result (+'\n'), returning 0 — or 1 on deopt (no output), so
     //    the oracle gate sees a divergence and the caller falls back.
@@ -3358,6 +3625,22 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
                 };
                 resolved.push(RItem::Num(id, *track, args.clone()));
             }
+            Slot::StrFn(idx) => {
+                let (name, sargs) = &str_producers[*idx];
+                let id = str_ids[name].0;
+                // bake each constant-string argument as a read-only data object.
+                let mut arg_data = Vec::new();
+                for s in sargs {
+                    let bytes = s.clone().into_bytes();
+                    let len = bytes.len();
+                    let data = module.declare_anonymous_data(false, false).ok()?;
+                    let mut desc = DataDescription::new();
+                    desc.define(bytes.into_boxed_slice());
+                    module.define_data(data, &desc).ok()?;
+                    arg_data.push((data, len));
+                }
+                resolved.push(RItem::StrProducer(id, arg_data));
+            }
         }
     }
     let main_id = {
@@ -3377,9 +3660,14 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
                 // single number: keep the in-IR itoa path (pure-int stays libc-only).
                 RItem::Num(id, track, args) =>
                     build_native_entry(&mut b, &mut module, *id, *track, args, write_id, print_f64_id),
+                // single run-time string: box the args, call the producer, print.
+                RItem::StrProducer(id, args) =>
+                    build_native_entry_str_call(&mut b, &mut module, *id, args,
+                                                str_lit_id.unwrap(), str_print_id.unwrap()),
             }
         } else {
-            build_native_entry_multi(&mut b, &mut module, &resolved, write_id, print_i64_id, print_f64_id);
+            build_native_entry_multi(&mut b, &mut module, &resolved, write_id,
+                                     print_i64_id, print_f64_id, str_lit_id, str_print_id);
         }
         b.finalize();
     }
@@ -3405,6 +3693,39 @@ fn build_native_entry_str(b: &mut FunctionBuilder, module: &mut ObjectModule,
     let fd1 = b.ins().iconst(I32, 1);
     let wref = module.declare_func_in_func(write_id, b.func);
     b.ins().call(wref, &[fd1, ptr, n]);
+    let ok = b.ins().iconst(I32, 0);
+    b.ins().return_(&[ok]);
+}
+
+// Box each constant-string argument (its bytes already in a data object) via
+// nova_str_lit and call the StrGen producer, returning its result handle.
+fn call_str_producer(b: &mut FunctionBuilder, module: &mut ObjectModule,
+                     producer: FuncId, args: &[(DataId, usize)], str_lit: FuncId) -> Value {
+    let mut handles = Vec::new();
+    for (data, len) in args {
+        let gv = module.declare_data_in_func(*data, b.func);
+        let ptr = b.ins().global_value(I64, gv);
+        let n = b.ins().iconst(I64, *len as i64);
+        let lref = module.declare_func_in_func(str_lit, b.func);
+        let call = b.ins().call(lref, &[ptr, n]);
+        handles.push(b.inst_results(call)[0]);
+    }
+    let pref = module.declare_func_in_func(producer, b.func);
+    let call = b.ins().call(pref, &handles);
+    b.inst_results(call)[0]
+}
+
+// Emit the body of the C-ABI `main` for a single run-time string print: box the
+// constant-string args, call the StrGen producer, print the handle, return 0.
+fn build_native_entry_str_call(b: &mut FunctionBuilder, module: &mut ObjectModule,
+                               producer: FuncId, args: &[(DataId, usize)],
+                               str_lit: FuncId, str_print: FuncId) {
+    let entry = b.create_block();
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+    let h = call_str_producer(b, module, producer, args, str_lit);
+    let pref = module.declare_func_in_func(str_print, b.func);
+    b.ins().call(pref, &[h]);
     let ok = b.ins().iconst(I32, 0);
     b.ins().return_(&[ok]);
 }
@@ -3554,13 +3875,15 @@ fn build_native_entry(b: &mut FunctionBuilder, module: &mut ObjectModule,
 }
 
 // Emit the entry for a multi-`print` main: print each value in source order — a
-// constant string via a `write` of its baked bytes, a number via the runtime
-// printers (nova_print_i64 / nova_print_f64) — then return 0. Any producer that
+// constant string via a `write` of its baked bytes, a run-time string via a
+// StrGen producer + nova_str_print, a number via the runtime printers
+// (nova_print_i64 / nova_print_f64) — then return 0. Any numeric producer that
 // deopts jumps to a shared diverge path (return 1, no further output) so the
 // oracle gate falls back — never wrong.
 fn build_native_entry_multi(b: &mut FunctionBuilder, module: &mut ObjectModule,
                             items: &[RItem], write_id: FuncId,
-                            print_i64_id: FuncId, print_f64_id: FuncId) {
+                            print_i64_id: FuncId, print_f64_id: FuncId,
+                            str_lit_id: Option<FuncId>, str_print_id: Option<FuncId>) {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.seal_block(entry);
@@ -3579,6 +3902,13 @@ fn build_native_entry_multi(b: &mut FunctionBuilder, module: &mut ObjectModule,
                 let fd1 = b.ins().iconst(I32, 1);
                 let wref = module.declare_func_in_func(write_id, b.func);
                 b.ins().call(wref, &[fd1, ptr, n]);
+                continue;
+            }
+            RItem::StrProducer(pid, pargs) => {
+                // run-time string: box args, call the producer, print the handle.
+                let h = call_str_producer(b, module, *pid, pargs, str_lit_id.unwrap());
+                let pref = module.declare_func_in_func(str_print_id.unwrap(), b.func);
+                b.ins().call(pref, &[h]);
                 continue;
             }
             RItem::Num(id, track, args) => (*id, *track, args),
@@ -4028,6 +4358,39 @@ mod jit_tests {
             let (obj, _) = super::compile_object(&prog, super::NativeTarget::Host)
                 .unwrap_or_else(|| panic!("must emit an object: {}", src));
             assert!(!obj.is_empty(), "non-empty object: {}", src);
+        }
+    }
+    // Dynamic strings, increment 1: a user function that composes a string from a
+    // string parameter (concat / f-string / another string function) compiles to a
+    // real object via the StrGen track. The build's oracle gate verifies output.
+    #[test] fn native_object_string_functions() {
+        for src in [
+            "fn greet(name){ \"Hello, \" + name + \"!\" } fn main(){ print(greet(\"Nova\")) }",
+            "fn full(a, b){ a + \" \" + b } fn main(){ print(full(\"Ada\", \"Lovelace\")) }",
+            "fn hi(name){ f\"Hi {name}!\" } fn main(){ print(hi(\"X\")) }",
+            "fn wrap(s){ \"[\" + s + \"]\" } fn main(){ print(wrap(\"a\")); print(6*7) }",
+            // pure pass-through composition of string functions (no literal of its
+            // own) is eligible via calls to string-eligible functions.
+            "fn wrap(s){ \"[\" + s + \"]\" } fn deco(s){ wrap(wrap(s)) } fn main(){ print(deco(\"a\")) }",
+        ] {
+            let mut prog = parse_program(src).expect("parse");
+            fold_program(&mut prog);
+            let (obj, needs_rt) = super::compile_object(&prog, super::NativeTarget::Host)
+                .unwrap_or_else(|| panic!("string-fn program must emit: {}", src));
+            assert!(!obj.is_empty(), "non-empty object: {}", src);
+            assert!(needs_rt, "string track links the runtime: {}", src);
+        }
+    }
+    // The string track lowers the same IR for every arch — proves the aarch64 and
+    // riscv64 backends compile a StrGen function (independent of a linker/qemu,
+    // which the build's oracle gate needs but this test does not).
+    #[test] fn native_object_string_fn_cross_arch() {
+        let src = "fn greet(name){ \"Hi, \" + name } fn main(){ print(greet(\"Nova\")) }";
+        let mut prog = parse_program(src).expect("parse");
+        fold_program(&mut prog);
+        for t in [super::NativeTarget::Host, super::NativeTarget::Aarch64, super::NativeTarget::Riscv64] {
+            let (obj, _) = super::compile_object(&prog, t).expect("must emit for each target");
+            assert!(obj.len() > 64);
         }
     }
 }

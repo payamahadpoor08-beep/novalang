@@ -171,7 +171,7 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
 {
     let (obj, needs_runtime) = match crate::jit::compile_object(program, arch.target()) {
         Some(v) => v,
-        None => return Ok(None), // not numeric-native -> fall back
+        None => return Ok(None), // not native-able -> fall back
     };
     let (cc, runner) = arch.tools();
     // a cross target we have no linker for -> fall back (host C/embed AOT).
