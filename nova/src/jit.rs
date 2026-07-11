@@ -982,32 +982,47 @@ fn define_parallel<M: Module>(module: &mut M, mut jobs: Vec<(FuncId, Context)>) 
         if timing { eprintln!("nova: compiled {} fns serially in {:?}", jobs.len(), t0.elapsed()); }
         return Some(());
     }
-    // 1) parallel: compile each function to machine code (disjoint &mut chunks;
-    //    the ISA is Send+Sync, each thread uses its own ControlPlane).
-    {
+    // 1) parallel: compile each function to machine code across ALL of the host's
+    //    logical CPUs (every core of every socket that `available_parallelism`
+    //    reports — so a dual-socket 2×96-core workstation runs ~192-wide, a
+    //    many-socket rack wider still). A shared work queue makes it dynamic
+    //    work-stealing: every worker pulls the next function the instant it
+    //    finishes, so no core idles even when per-function compile cost varies
+    //    wildly — that's what keeps the speedup near-linear at high core counts.
+    //    Only the brief pop/push touch the lock; `ctx.compile` runs unlocked. The
+    //    ISA is Send+Sync; each worker uses its own ControlPlane. Deterministic
+    //    per function, so output stays byte-identical regardless of thread count.
+    let njobs = jobs.len();
+    let nthreads = ncpu.min(njobs);
+    let compiled: Vec<(FuncId, Context)> = {
         let isa = module.isa();
-        let nthreads = ncpu.min(jobs.len());
-        let chunk = jobs.len().div_ceil(nthreads);
+        let queue = std::sync::Mutex::new(jobs);            // functions still to compile
+        let done = std::sync::Mutex::new(Vec::with_capacity(njobs)); // compiled results
         let ok = std::thread::scope(|s| {
-            let handles: Vec<_> = jobs.chunks_mut(chunk).map(|slice| {
-                s.spawn(move || {
-                    let mut cp = ControlPlane::default();
-                    slice.iter_mut().all(|(_, ctx)| ctx.compile(isa, &mut cp).is_ok())
-                })
-            }).collect();
+            let handles: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
+                let mut cp = ControlPlane::default();
+                loop {
+                    let job = queue.lock().unwrap().pop();
+                    let Some((id, mut ctx)) = job else { return true };
+                    if ctx.compile(isa, &mut cp).is_err() { return false; }
+                    done.lock().unwrap().push((id, ctx));
+                }
+            })).collect();
             handles.into_iter().all(|h| h.join().unwrap_or(false))
         });
         if !ok { return None; }
-    }
-    // 2) serial: ingest each function's pre-compiled bytes + relocations.
-    for (id, ctx) in &jobs {
+        done.into_inner().unwrap()
+    };
+    // 2) serial: ingest each function's pre-compiled bytes + relocations. Order is
+    //    irrelevant — each function is defined independently by its FuncId.
+    for (id, ctx) in &compiled {
         let cc = ctx.compiled_code()?;
         module.define_function_bytes(*id, &ctx.func, cc.buffer.alignment as u64,
             cc.code_buffer(), cc.buffer.relocs()).ok()?;
     }
     if timing {
         eprintln!("nova: compiled {} fns across {} threads in {:?}",
-            jobs.len(), ncpu.min(jobs.len()), t0.elapsed());
+            njobs, nthreads, t0.elapsed());
     }
     Some(())
 }
