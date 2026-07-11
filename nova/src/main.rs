@@ -43,53 +43,59 @@ fn main() {
                     .and_then(|s| s.to_str()).unwrap_or("app").to_string()
             });
             let out = std::path::PathBuf::from("build").join(&name);
-            // --aot / --aot=c / --aot=llvm: pure native binary via cc/clang,
-            // verified byte-identical vs `nova run`; falls back to embed
-            let aot_backend = args.iter().skip(2).find_map(|a| match a.as_str() {
-                "--aot" | "--aot=c" => Some(aot::Backend::C),
-                "--aot=native" => Some(aot::Backend::Native),
-                "--aot=llvm" => Some(aot::Backend::Llvm),
-                "--aot=wasm" => Some(aot::Backend::Wasm),
-                "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(aot::Backend::Arm),
-                "--aot=arm32" | "--aot=armv7" | "--aot=armhf" => Some(aot::Backend::Arm32),
+            // Plain `--aot` tries the pure-Cranelift NATIVE backend first, then the
+            // C backend, then the embedded runtime — each verified byte-identical
+            // to `nova run`. `--aot=c` / `--aot=native` pin a single backend.
+            let aot_chain: Option<Vec<aot::Backend>> = args.iter().skip(2).find_map(|a| match a.as_str() {
+                "--aot" | "--aot=auto" => Some(vec![aot::Backend::Native, aot::Backend::C]),
+                "--aot=c" => Some(vec![aot::Backend::C]),
+                "--aot=native" => Some(vec![aot::Backend::Native]),
+                "--aot=llvm" => Some(vec![aot::Backend::Llvm]),
+                "--aot=wasm" => Some(vec![aot::Backend::Wasm]),
+                "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(vec![aot::Backend::Arm]),
+                "--aot=arm32" | "--aot=armv7" | "--aot=armhf" => Some(vec![aot::Backend::Arm32]),
                 _ => None,
             });
-            if let Some(bk) = aot_backend {
+            if let Some(chain) = aot_chain {
                 let extra: Vec<String> = args.iter().skip(2)
                     .find_map(|a| a.strip_prefix("--aot-flags="))
                     .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
                     .unwrap_or_default();
-                match build::build_aot(&entry, &out, &bk, &extra) {
-                    Ok(Some(tier)) => {
-                        let (which, kind) = match bk {
-                            aot::Backend::C => ("c", "native"),
-                            aot::Backend::Native => ("native", "native"),
-                            aot::Backend::Llvm => ("llvm", "native"),
-                            aot::Backend::Wasm => ("wasm", "wasm32"),
-                            aot::Backend::Arm => ("arm", "aarch64"),
-                            aot::Backend::Arm32 => ("arm32", "armv7"),
-                        };
-                        let art = if matches!(bk, aot::Backend::Wasm) {
-                            out.with_extension("wasm").display().to_string()
-                        } else { out.display().to_string() };
-                        println!("built {} (aot-{}, {} tier, {})", art, which, tier.name(), kind);
-                        return;
+                for (idx, bk) in chain.iter().enumerate() {
+                    let last = idx + 1 == chain.len();
+                    match build::build_aot(&entry, &out, bk, &extra) {
+                        Ok(Some(tier)) => {
+                            let (which, kind) = match bk {
+                                aot::Backend::C => ("c", "native"),
+                                aot::Backend::Native => ("native", "native"),
+                                aot::Backend::Llvm => ("llvm", "native"),
+                                aot::Backend::Wasm => ("wasm", "wasm32"),
+                                aot::Backend::Arm => ("arm", "aarch64"),
+                                aot::Backend::Arm32 => ("arm32", "armv7"),
+                            };
+                            let art = if matches!(bk, aot::Backend::Wasm) {
+                                out.with_extension("wasm").display().to_string()
+                            } else { out.display().to_string() };
+                            println!("built {} (aot-{}, {} tier, {})", art, which, tier.name(), kind);
+                            return;
+                        }
+                        Ok(None) if !last => continue, // try the next backend in the chain
+                        Ok(None) if matches!(bk, aot::Backend::Wasm) => {
+                            eprintln!("note: program not WASM-able (typed/boxed tier only, not embed; needs clang wasm32 + a wasi-sysroot + node, verified vs `nova run`); no .wasm emitted");
+                            exit(1);
+                        }
+                        Ok(None) if matches!(bk, aot::Backend::Arm) => {
+                            eprintln!("note: program not ARM-AOT-able or diverged in verify (needs aarch64-linux-gnu-gcc + qemu-aarch64); no arm binary emitted");
+                            exit(1);
+                        }
+                        Ok(None) if matches!(bk, aot::Backend::Arm32) => {
+                            eprintln!("note: program not ARMv7-AOT-able or diverged in verify (needs arm-linux-gnueabihf-gcc + qemu-arm); no arm32 binary emitted");
+                            exit(1);
+                        }
+                        Ok(None) => eprintln!(
+                            "note: program not fully AOT-able (or diverged in verify); using the embedded runtime build"),
+                        Err(e) => { eprintln!("error: {}", e); exit(1); }
                     }
-                    Ok(None) if matches!(bk, aot::Backend::Wasm) => {
-                        eprintln!("note: program not WASM-able (typed/boxed tier only, not embed; needs clang wasm32 + a wasi-sysroot + node, verified vs `nova run`); no .wasm emitted");
-                        exit(1);
-                    }
-                    Ok(None) if matches!(bk, aot::Backend::Arm) => {
-                        eprintln!("note: program not ARM-AOT-able or diverged in verify (needs aarch64-linux-gnu-gcc + qemu-aarch64); no arm binary emitted");
-                        exit(1);
-                    }
-                    Ok(None) if matches!(bk, aot::Backend::Arm32) => {
-                        eprintln!("note: program not ARMv7-AOT-able or diverged in verify (needs arm-linux-gnueabihf-gcc + qemu-arm); no arm32 binary emitted");
-                        exit(1);
-                    }
-                    Ok(None) => eprintln!(
-                        "note: program not fully AOT-able (or diverged in verify); using the embedded runtime build"),
-                    Err(e) => { eprintln!("error: {}", e); exit(1); }
                 }
             }
             match build::build(&entry, &out) {
@@ -809,9 +815,11 @@ VM FLAGS:
   --dump               print bytecode instead of running
 
 BUILD FLAGS:
-  --aot | --aot=c      pure native binary via the C backend (cc -O2)
+  --aot                native-first: tries the Cranelift object backend, then C,
+                       then the embedded runtime (each verified vs `nova run`)
   --aot=native         pure native binary straight from Cranelift IR -> .o -> cc-linked
-                       (no C for logic; integer programs; verified vs `nova run`)
+                       (no C for logic; numeric programs, incl. multi-print main)
+  --aot=c              pure native binary via the C backend (cc -O2)
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
   --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
   --aot=arm            static aarch64 binary, typed+boxed (cross gcc, qemu-verified)
