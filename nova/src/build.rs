@@ -33,10 +33,15 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         .map_err(|e| format!("cannot read {}: {}", entry, e))?;
     let mut program = crate::parser::parse_program(&source)?;
     crate::interp::fold_program(&mut program);
-    // Native object backend: Cranelift IR -> relocatable .o -> link with cc.
-    // Separate path (no C/LLVM text). Only available with the `jit` feature.
-    if matches!(backend, crate::aot::Backend::Native) {
-        return build_native(entry, out, &program);
+    // Native object backend: Cranelift IR -> relocatable .o -> link. Separate
+    // path (no C/LLVM text). Host, or a cross target (aarch64/riscv64).
+    let native_target = match backend {
+        crate::aot::Backend::Native => Some(NativeArch::Host),
+        crate::aot::Backend::NativeArm64 => Some(NativeArch::Aarch64),
+        _ => None,
+    };
+    if let Some(arch) = native_target {
+        return build_native(entry, out, &program, arch);
     }
     let (code, tier) = match crate::aot::emit(&program, backend) {
         Some(ct) => ct,
@@ -62,7 +67,8 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         // ARMv7 (32-bit hard-float): older / weaker phones.
         crate::aot::Backend::Arm32 => ("c", "arm-linux-gnueabihf-gcc"),
         crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
-        crate::aot::Backend::Native => unreachable!("native handled by build_native above"),
+        crate::aot::Backend::Native
+        | crate::aot::Backend::NativeArm64 => unreachable!("native handled by build_native above"),
     };
     let tmp = out.with_extension(ext);
     std::fs::write(&tmp, &code).map_err(|e| e.to_string())?;
@@ -122,21 +128,51 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
     }
 }
 
+// Which architecture the native object is built for, and the toolchain to link
+// and run it. Host links with `cc` and runs the binary directly; cross targets
+// link a static binary with a cross-gcc and run it under qemu (the same qemu the
+// C-backend ARM path already uses).
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, PartialEq)]
+enum NativeArch { Host, Aarch64 }
+
+#[cfg(feature = "jit")]
+impl NativeArch {
+    fn target(self) -> crate::jit::NativeTarget {
+        match self {
+            NativeArch::Host => crate::jit::NativeTarget::Host,
+            NativeArch::Aarch64 => crate::jit::NativeTarget::Aarch64,
+        }
+    }
+    // (C compiler / linker, qemu runner or None for host). The cross target links
+    // static so qemu needs no target sysroot at run time.
+    fn tools(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            NativeArch::Host => ("cc", None),
+            NativeArch::Aarch64 => ("aarch64-linux-gnu-gcc", Some("qemu-aarch64")),
+        }
+    }
+}
+
 // The native object-code AOT path: lower the program's numeric core to a real
 // relocatable object with Cranelift (`jit::compile_object` — the SAME codegen the
 // JIT uses, no C for program logic), write `build/<name>.o`, then link it with
-// `cc` (used only as the libc linker driver). Ship the binary only if its output
-// is byte-identical to `nova run` (the oracle gate). Returns Ok(None) when the
-// program isn't fully native-eligible or diverges — the caller falls back to the
-// C/embed AOT, so output is never wrong.
+// the target's toolchain (used only as the libc linker driver). Ship the binary
+// only if its output is byte-identical to `nova run` (the oracle gate, cross
+// binaries run under qemu). Returns Ok(None) when the program isn't native-
+// eligible, the cross toolchain is absent, or output diverges — the caller falls
+// back to the C/embed AOT, so output is never wrong.
 #[cfg(feature = "jit")]
-fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
+fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: NativeArch)
     -> Result<Option<crate::aot::Tier>, String>
 {
-    let (obj, needs_runtime) = match crate::jit::compile_object(program) {
+    let (obj, needs_runtime) = match crate::jit::compile_object(program, arch.target()) {
         Some(v) => v,
         None => return Ok(None), // not numeric-native -> fall back
     };
+    let (cc, runner) = arch.tools();
+    // a cross target we have no linker for -> fall back (host C/embed AOT).
+    if arch != NativeArch::Host && which(cc).is_none() { return Ok(None); }
     if let Some(dir) = out.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -145,39 +181,47 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
     let objp = out.with_extension("o");
     std::fs::write(&objp, &obj).map_err(|e| e.to_string())?;
     // For float/array/numeric programs, compile the runtime primitives object
-    // (arena arrays + fmod/fpow + the fmt_f64 float printer) and link it in. This
-    // is runtime, NOT program logic — exactly like the JIT linking Rust helpers.
+    // (arena arrays + fmod/fpow + the fmt_f64 float printer) with the target's cc
+    // and link it in. This is runtime, NOT program logic — exactly like the JIT
+    // linking Rust helpers.
     let rtp = out.parent().unwrap_or(Path::new(".")).join("nova_native_rt.o");
     let rtc = out.parent().unwrap_or(Path::new(".")).join("nova_native_rt.c");
-    if needs_runtime {
-        std::fs::write(&rtc, NOVA_NATIVE_RT).map_err(|e| e.to_string())?;
-        let st = Command::new("cc").arg("-O2").arg("-c").arg(&rtc).arg("-o").arg(&rtp)
-            .status().map_err(|e| format!("cannot run cc: {}", e))?;
-        if !st.success() {
-            let _ = std::fs::remove_file(&objp); let _ = std::fs::remove_file(&rtc);
-            return Ok(None);
-        }
-    }
-    // link with cc (libc + crt; cc compiles no program logic here). `-lm` for the
-    // runtime's fmod/pow when linked.
-    let mut cmd = Command::new("cc");
-    cmd.arg("-O2").arg("-o").arg(out).arg(&objp);
-    if needs_runtime { cmd.arg(&rtp).arg("-lm"); }
-    let status = cmd.status().map_err(|e| format!("cannot run cc: {}", e))?;
     let cleanup_rt = || {
         let _ = std::fs::remove_file(&rtp);
         let _ = std::fs::remove_file(&rtc);
     };
+    if needs_runtime {
+        std::fs::write(&rtc, NOVA_NATIVE_RT).map_err(|e| e.to_string())?;
+        let st = Command::new(cc).arg("-O2").arg("-c").arg(&rtc).arg("-o").arg(&rtp)
+            .status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
+        if !st.success() {
+            let _ = std::fs::remove_file(&objp);
+            cleanup_rt();
+            return Ok(None);
+        }
+    }
+    // link (libc + crt; cc compiles no program logic here). Cross targets link
+    // static + non-PIE so qemu needs no sysroot; `-lm` for the runtime's fmod/pow.
+    let mut cmd = Command::new(cc);
+    cmd.arg("-O2");
+    if arch != NativeArch::Host { cmd.arg("-static").arg("-no-pie"); }
+    cmd.arg("-o").arg(out).arg(&objp);
+    if needs_runtime { cmd.arg(&rtp).arg("-lm"); }
+    let status = cmd.status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
     if !status.success() {
         let _ = std::fs::remove_file(&objp);
         cleanup_rt();
         return Ok(None);
     }
-    // oracle gate: keep the native binary only on a byte-identical match.
+    // oracle gate: keep the native binary only on a byte-identical match. Cross
+    // binaries run under qemu (present in this environment).
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let expect = Command::new(&exe).arg("run").arg(entry).output()
         .map_err(|e| e.to_string())?;
-    let got = Command::new(out).output().map_err(|e| e.to_string())?;
+    let got = match runner {
+        Some(q) => Command::new(q).arg(out).output(),
+        None => Command::new(out).output(),
+    }.map_err(|e| e.to_string())?;
     cleanup_rt();
     if expect.stdout == got.stdout && expect.status.code() == got.status.code() {
         // keep the .o alongside the binary as proof of the object path
@@ -192,7 +236,11 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
 // Without the jit feature there is no Cranelift, so the native object backend is
 // unavailable — fall back to the embed build honestly.
 #[cfg(not(feature = "jit"))]
-fn build_native(_entry: &str, _out: &Path, _program: &crate::ast::Program)
+#[derive(Clone, Copy)]
+enum NativeArch { Host, Aarch64 }
+
+#[cfg(not(feature = "jit"))]
+fn build_native(_entry: &str, _out: &Path, _program: &crate::ast::Program, _arch: NativeArch)
     -> Result<Option<crate::aot::Tier>, String>
 {
     Ok(None)
