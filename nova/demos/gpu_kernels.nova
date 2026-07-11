@@ -1,0 +1,23 @@
+// Data-parallel GPU kernels in Nova.
+//
+// A `#[gpu]` function is a data-parallel kernel: `gpu_map(array, "kernel")`
+// applies it to every element. On a machine with a GPU it dispatches the
+// compiled compute kernel over the buffer; with no GPU it runs the identical
+// computation on the CPU — the result is byte-identical either way.
+//
+//   nova run  demos/gpu_kernels.nova     # runs it (CPU fallback here)
+//   nova gpu  demos/gpu_kernels.nova     # prints the GLSL compute source each
+//                                        # kernel compiles to for the GPU path
+
+#[gpu]
+fn square(x) { x * x }
+
+#[gpu]
+fn saxpy(x) { to_float(x) * 2.0 + 1.0 }   // a*x + b, elementwise
+
+fn main() {
+  data = [1, 2, 3, 4, 5, 6, 7, 8]
+  print(gpu_map(data, "square"))   // [1, 4, 9, 16, 25, 36, 49, 64]
+  print(gpu_map(data, "saxpy"))    // [3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0]
+  print(gpu_available())           // true when a GPU is present, else false
+}

@@ -509,7 +509,7 @@ compiler_attr = {
     | "throws"        ~ "(" ~ type_path ~ ("," ~ type_path)* ~ ")"
     | "test"          ~ "(" ~ string_lit ~ ")"
     | "anti_debug" | "arena" | "atomic" | "batch" | "cold" | "comptime"
-    | "exhaust" | "force_inline" | "fuse" | "fuzz" | "ghost" | "hot"
+    | "exhaust" | "force_inline" | "fuse" | "fuzz" | "ghost" | "gpu" | "hot"
     | "inline_cache" | "memo" | "obfuscate" | "pin" | "prelude" | "simd"
     | "tail_call" | "trace" | "unsafe" | "zero_alloc"
 }

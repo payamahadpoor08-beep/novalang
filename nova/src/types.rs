@@ -1253,6 +1253,7 @@ fn builtin_names() -> Vec<&'static str> {
         "tcp_read_bytes", "tcp_write_bytes", "resolve", "hostname",
         "base64_encode", "base64_decode", "sha1_hex", "ws_accept",
         "tls_connect", "tls_accept",
+        "gpu_map", "gpu_available",
     ]
 }
 
