@@ -101,6 +101,33 @@ i64 nova_str_concat(i64 a, i64 b) {
     return (i64)(intptr_t)r;
 }
 
+/* ASCII case folding: byte-identical to Rust's to_uppercase/to_lowercase for
+ * pure-ASCII input (bytes < 0x80). Non-ASCII bytes are left unchanged, so a
+ * Unicode string differs from the interpreter and the oracle gate falls back. */
+i64 nova_str_upper(i64 h) {
+    NStr *s = (NStr *)(intptr_t)h;
+    NStr *r = (NStr *)malloc(sizeof(NStr));
+    r->len = s->len;
+    r->data = (char *)malloc(s->len > 0 ? (size_t)s->len : 1);
+    for (i64 i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        r->data[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    return (i64)(intptr_t)r;
+}
+
+i64 nova_str_lower(i64 h) {
+    NStr *s = (NStr *)(intptr_t)h;
+    NStr *r = (NStr *)malloc(sizeof(NStr));
+    r->len = s->len;
+    r->data = (char *)malloc(s->len > 0 ? (size_t)s->len : 1);
+    for (i64 i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        r->data[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    return (i64)(intptr_t)r;
+}
+
 /* print a Nova string value: its bytes + trailing newline, one write(2). */
 void nova_str_print(i64 h) {
     NStr *s = (NStr *)(intptr_t)h;
