@@ -3086,6 +3086,10 @@ fn str_shape(e: &Expr, params: &HashSet<&str>) -> bool {
     fn walk(e: &Expr, params: &HashSet<&str>, committed: &mut bool) -> bool {
         match strip_at(e) {
             Expr::Str(_) => { *committed = true; true }
+            // an int/bool used in a string position is printed as its string form
+            // (interpreter coercion / `str()`); a numeric parameter is passed to the
+            // producer already boxed to that string form, so both are strings here.
+            Expr::Int(_) | Expr::Bool(_) => { *committed = true; true }
             Expr::Ident(p) => params.contains(p.as_str()),
             Expr::Binary { op: BinOp::Add, lhs, rhs } => {
                 *committed = true;
@@ -3097,6 +3101,11 @@ fn str_shape(e: &Expr, params: &HashSet<&str>) -> bool {
                     FmtPart::Lit(_) => true,
                     FmtPart::Expr(h) => walk(h, params, committed),
                 })
+            }
+            // `str(x)` / `to_str(x)` is transparent — x's string form.
+            Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 => {
+                *committed = true;
+                walk(&args[0], params, committed)
             }
             // a call to a string-eligible function (validated by the fixpoint)
             // produces a string, so it commits — this lets a pure pass-through like
@@ -3119,7 +3128,8 @@ fn str_calls(e: &Expr, out: &mut Vec<String>) {
         Expr::FmtStr(parts) =>
             for p in parts { if let FmtPart::Expr(h) = p { str_calls(h, out); } },
         Expr::Call { callee, args } => {
-            out.push(callee.clone());
+            // str()/to_str() are builtins, not user functions the fixpoint validates.
+            if callee != "str" && callee != "to_str" { out.push(callee.clone()); }
             for a in args { str_calls(a, out); }
         }
         _ => {}
@@ -3175,7 +3185,15 @@ impl<'a, 'b> StrGen<'a, 'b> {
     fn lower_str(&mut self, e: &Expr) -> Option<Value> {
         match strip_at(e) {
             Expr::Str(s) => self.lit(s.as_bytes()),
+            // an int/bool literal in string position -> its string form, matching
+            // the interpreter's Display (decimal ints, true/false).
+            Expr::Int(n) => self.lit(n.to_string().as_bytes()),
+            Expr::Bool(b) => self.lit(if *b { b"true" } else { b"false" }),
             Expr::Ident(p) => self.params.get(p).copied(),
+            // `str(x)` / `to_str(x)` -> x's string form (numeric params already
+            // arrive boxed to their string form, so this is the identity).
+            Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 =>
+                self.lower_str(&args[0]),
             Expr::Binary { op: BinOp::Add, lhs, rhs } => {
                 let a = self.lower_str(lhs)?;
                 let c = self.lower_str(rhs)?;
@@ -3285,10 +3303,16 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     for (i, expr) in printed.iter().enumerate() {
         // a constant string prints via baked bytes — no producer function needed.
         if let Some(s) = const_str(expr) { slots.push(Slot::Str(s)); continue; }
-        // a string-eligible function called with constant-string args -> StrGen.
+        // a string-eligible function called with constant args -> StrGen. Each arg
+        // is a constant string, or a constant int/bool boxed to its string form
+        // (byte-identical to how the function would print it), so a numeric
+        // parameter arrives already stringified.
         if let Expr::Call { callee, args } = strip_at(expr) {
             if str_set.contains(callee) {
-                if let Some(sargs) = args.iter().map(const_str).collect::<Option<Vec<_>>>() {
+                let sargs: Option<Vec<String>> = args.iter()
+                    .map(|a| const_str(a).or_else(|| const_hole(a)))
+                    .collect();
+                if let Some(sargs) = sargs {
                     let idx = str_producers.len();
                     str_producers.push((callee.clone(), sargs));
                     slots.push(Slot::StrFn(idx));
@@ -4372,6 +4396,11 @@ mod jit_tests {
             // pure pass-through composition of string functions (no literal of its
             // own) is eligible via calls to string-eligible functions.
             "fn wrap(s){ \"[\" + s + \"]\" } fn deco(s){ wrap(wrap(s)) } fn main(){ print(deco(\"a\")) }",
+            // increment 2: numeric parameters, boxed to their string form at the
+            // call site — `str(n)`, a numeric f-string hole, implicit `+` coercion.
+            "fn label(n){ \"count: \" + str(n) } fn main(){ print(label(5)) }",
+            "fn tag(name, n){ f\"{name}: {n}\" } fn main(){ print(tag(\"age\", 30)) }",
+            "fn f(name, n){ name + \" has \" + n } fn main(){ print(f(\"bob\", 7)) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
