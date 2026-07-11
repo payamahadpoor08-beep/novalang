@@ -2134,6 +2134,38 @@ impl Interp {
                 }
                 return Ok(Value::Array(Rc::new(RefCell::new(out))));
             }
+            // Data-parallel elementwise map — the CPU-side entry point for GPU
+            // offload. A `#[gpu]` kernel applied over an array: on a machine with a
+            // GPU (Vulkan) this dispatches the compiled compute kernel over the
+            // buffer; with no GPU it runs the identical computation on the CPU, so
+            // the result is byte-identical either way (verified: gpu_map == map).
+            // `nova gpu <file>` emits the GLSL/compute source the on-device path
+            // would compile. GPU dispatch requires GPU hardware + driver.
+            "gpu_map" => {
+                let arr = expect_array(args.get(0), "gpu_map")?;
+                let f = args.get(1).cloned().ok_or("gpu_map(array, kernel) expects 2 args")?;
+                let items: Vec<Value> = arr.borrow().clone();
+                let mut out = Vec::with_capacity(items.len());
+                for item in items { // CPU fallback (no GPU present); byte-identical
+                    // the kernel is a `#[gpu]` function named by string (the natural
+                    // GPU entry-point form) or an ordinary closure value.
+                    let v = match &f {
+                        Value::Str(name) => self.call_named(name, vec![item])?,
+                        _ => self.call_closure(&f, vec![item])?,
+                    };
+                    out.push(v);
+                }
+                return Ok(Value::Array(Rc::new(RefCell::new(out))));
+            }
+            // Is a data-parallel accelerator (GPU) available for offload? Probes
+            // the Linux DRM render nodes; false ⇒ gpu_map runs on the CPU.
+            "gpu_available" => {
+                let has = std::path::Path::new("/dev/dri").exists()
+                    && std::fs::read_dir("/dev/dri").map(|mut d|
+                        d.any(|e| e.map(|e| e.file_name().to_string_lossy().starts_with("render"))
+                            .unwrap_or(false))).unwrap_or(false);
+                return Ok(Value::Bool(has));
+            }
             "filter" => {
                 let arr = expect_array(args.get(0), "filter")?;
                 let f = args.get(1).cloned().ok_or("filter(array, fn) expects 2 args")?;

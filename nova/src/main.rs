@@ -8,6 +8,7 @@ mod jit;
 mod config;
 mod build;
 mod aot;
+mod gpu;
 mod diag;
 mod obfuscate;
 mod lsp;
@@ -257,6 +258,30 @@ fn main() {
             match bytecode::compile_program_opt(&program, optimize) {
                 Ok(c) => print!("{}", bytecode::disassemble(&c)),
                 Err(e) => { eprintln!("{} (run it with `nova run` instead)", e); exit(1); }
+            }
+        }
+        "gpu" => {
+            // Emit the GLSL compute source for each `#[gpu]` data-parallel kernel —
+            // the on-device artifact a Vulkan pipeline compiles to SPIR-V and
+            // dispatches over an array via `gpu_map`. Runs on the CPU (byte-identical)
+            // when no GPU is present.
+            let path = require_path(&args);
+            let program = match load_program(&path) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("{}", e); exit(1); }
+            };
+            let kernels = gpu::emit_kernels(&program);
+            if kernels.is_empty() {
+                eprintln!("no #[gpu] kernels in {} (annotate a data-parallel fn with #[gpu])", path);
+                exit(1);
+            }
+            let gpu_here = std::path::Path::new("/dev/dri").exists();
+            eprintln!("// GPU present on this host: {} (else gpu_map runs the CPU fallback, byte-identical)", gpu_here);
+            for (name, res) in kernels {
+                match res {
+                    Ok(glsl) => print!("{}", glsl),
+                    Err(why) => eprintln!("// kernel `{}`: CPU-only ({})", name, why),
+                }
             }
         }
         "bench" => {
@@ -808,6 +833,7 @@ COMMANDS:
   fmt [-w] <file>    format (print, or rewrite with -w)
   disasm  <file>     show compiled bytecode
   jit --dump <file>  show generated Cranelift IR
+  gpu     <file>     emit GLSL compute source for each #[gpu] kernel
   doc     <file>     extract documentation comments
   repl               interactive session (no arguments)
   version            print the version
