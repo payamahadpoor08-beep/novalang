@@ -954,17 +954,27 @@ fn lower_data(p: Pair<Rule>) -> Result<StructDef, String> {
     // data_field = { kw_mut? ~ ident ~ (":" ~ type_expr)? ~ ("=" ~ expr)? }
     let mut name = String::new();
     let mut fields = Vec::new();
+    let mut field_types: Vec<Option<String>> = Vec::new();
     for part in p.into_inner() {
         match part.as_rule() {
             Rule::ident => { if name.is_empty() { name = part.as_str().to_string(); } }
             Rule::data_fields => {
                 for f in part.into_inner() {
                     if f.as_rule() == Rule::data_field {
+                        // data_field = { kw_mut? ~ ident ~ (":" ~ type_expr)? ~ ("=" ~ expr)? }
+                        // the type is optional here (unlike struct fields).
+                        let mut fname: Option<String> = None;
+                        let mut fty: Option<String> = None;
                         for x in f.into_inner() {
-                            if x.as_rule() == Rule::ident {
-                                fields.push(x.as_str().to_string());
-                                break;
+                            match x.as_rule() {
+                                Rule::ident if fname.is_none() => fname = Some(x.as_str().to_string()),
+                                Rule::type_expr => fty = Some(type_head(x.as_str())),
+                                _ => {}
                             }
+                        }
+                        if let Some(fname) = fname {
+                            fields.push(fname);
+                            field_types.push(fty);
                         }
                     }
                 }
@@ -972,13 +982,14 @@ fn lower_data(p: Pair<Rule>) -> Result<StructDef, String> {
             _ => {}
         }
     }
-    Ok(StructDef { name, fields })
+    Ok(StructDef { name, fields, field_types })
 }
 
 fn lower_struct(p: Pair<Rule>) -> Result<StructDef, String> {
     // struct_decl = { kw_struct ~ ident ~ generic_params? ~ where_clause? ~ struct_body }
     let mut name = String::new();
     let mut fields = Vec::new();
+    let mut field_types: Vec<Option<String>> = Vec::new();
     for part in p.into_inner() {
         match part.as_rule() {
             Rule::ident => name = part.as_str().to_string(),
@@ -987,11 +998,21 @@ fn lower_struct(p: Pair<Rule>) -> Result<StructDef, String> {
                 for f in part.into_inner() {
                     if f.as_rule() == Rule::struct_field {
                         // struct_field = { attribute* ~ visibility? ~ kw_mut? ~ ident ~ ":" ~ type_expr }
+                        // The field name is the first `ident`; the declared type is the
+                        // `type_expr` after it — keep its head name (e.g. "Pos") so a
+                        // refinement type on the field can be enforced at runtime.
+                        let mut fname: Option<String> = None;
+                        let mut fty: Option<String> = None;
                         for x in f.into_inner() {
-                            if x.as_rule() == Rule::ident {
-                                fields.push(x.as_str().to_string());
-                                break;
+                            match x.as_rule() {
+                                Rule::ident if fname.is_none() => fname = Some(x.as_str().to_string()),
+                                Rule::type_expr => fty = Some(type_head(x.as_str())),
+                                _ => {}
                             }
+                        }
+                        if let Some(fname) = fname {
+                            fields.push(fname);
+                            field_types.push(fty);
                         }
                     }
                 }
@@ -999,7 +1020,7 @@ fn lower_struct(p: Pair<Rule>) -> Result<StructDef, String> {
             _ => {}
         }
     }
-    Ok(StructDef { name, fields })
+    Ok(StructDef { name, fields, field_types })
 }
 
 fn lower_impl(p: Pair<Rule>) -> Result<ImplBlock, String> {

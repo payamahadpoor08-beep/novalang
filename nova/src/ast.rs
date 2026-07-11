@@ -109,6 +109,10 @@ pub struct VariantDef {
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<String>,
+    // optional declared type per field (parallel to `fields`); None where the
+    // source omitted it (e.g. `data` fields). A refinement-type name here makes
+    // the field's predicate an invariant, checked on construction and on write.
+    pub field_types: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
