@@ -856,7 +856,7 @@ BUILD FLAGS:
   --aot                native-first: tries the Cranelift object backend, then C,
                        then the embedded runtime (each verified vs `nova run`)
   --aot=native         pure native binary straight from Cranelift IR -> .o -> cc-linked
-                       (no C for logic; numeric + constant-string programs, multi-print main)
+                       (no C for logic; numeric + string programs, incl. string functions, multi-print main)
   --aot=native-arm64   same, cross-compiled to an aarch64 object (qemu-verified)
   --aot=native-riscv64 same, cross-compiled to a riscv64gc object (qemu-verified)
   --aot=c              pure native binary via the C backend (cc -O2)
