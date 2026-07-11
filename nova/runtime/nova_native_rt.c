@@ -170,3 +170,17 @@ void nova_print_f64(double x) {
     (void)_;
     free(sb.buf);
 }
+
+/* print a Nova integer value in decimal + newline, one write(2). Used by the
+ * multi-print entry path (a single-print integer program keeps its in-IR itoa,
+ * so it still links only libc). Byte-identical to the interpreter's Int Display. */
+void nova_print_i64(i64 v) {
+    char buf[24];
+    int o = (int)sizeof buf;
+    buf[--o] = '\n';
+    unsigned long long m = v < 0 ? -(unsigned long long)v : (unsigned long long)v;
+    do { buf[--o] = (char)('0' + (int)(m % 10)); m /= 10; } while (m);
+    if (v < 0) buf[--o] = '-';
+    ssize_t _ = write(1, buf + o, (size_t)((int)sizeof buf - o));
+    (void)_;
+}
