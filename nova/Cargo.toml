@@ -13,11 +13,11 @@ cranelift-jit = { version = "0.116", optional = true }
 cranelift-module = { version = "0.116", optional = true }
 cranelift-native = { version = "0.116", optional = true }
 cranelift-object = { version = "0.116", optional = true }
-# Enable Cranelift's aarch64 codegen backend (feature-gated; the facade compiles
-# only the host arch) so `--aot=native-arm64` can cross-emit objects. Cargo
-# unifies this feature into the cranelift-codegen already pulled in by the facade.
-# Target triples come from target-lexicon (also already present).
-cranelift-codegen = { version = "0.116", optional = true, features = ["arm64"] }
+# Enable Cranelift's aarch64 + riscv64 codegen backends (feature-gated; the facade
+# compiles only the host arch) so `--aot=native-arm64/-riscv64` can cross-emit
+# objects. Cargo unifies these into the cranelift-codegen already pulled in by the
+# facade. Target triples come from target-lexicon (also already present).
+cranelift-codegen = { version = "0.116", optional = true, features = ["arm64", "riscv64"] }
 target-lexicon = { version = "0.13", optional = true }
 # TLS (the `ssl`/`tls_*` builtins). rustls with the pure-Rust `ring` backend, so
 # it needs no system OpenSSL; optional + default-on, and OFF under

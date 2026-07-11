@@ -52,6 +52,7 @@ fn main() {
                 "--aot=c" => Some(vec![aot::Backend::C]),
                 "--aot=native" => Some(vec![aot::Backend::Native]),
                 "--aot=native-arm64" | "--aot=native-aarch64" => Some(vec![aot::Backend::NativeArm64]),
+                "--aot=native-riscv64" | "--aot=native-riscv" => Some(vec![aot::Backend::NativeRiscv64]),
                 "--aot=llvm" => Some(vec![aot::Backend::Llvm]),
                 "--aot=wasm" => Some(vec![aot::Backend::Wasm]),
                 "--aot=arm" | "--aot=arm64" | "--aot=aarch64" => Some(vec![aot::Backend::Arm]),
@@ -71,6 +72,7 @@ fn main() {
                                 aot::Backend::C => ("c", "native"),
                                 aot::Backend::Native => ("native", "native"),
                                 aot::Backend::NativeArm64 => ("native-arm64", "aarch64"),
+                                aot::Backend::NativeRiscv64 => ("native-riscv64", "riscv64"),
                                 aot::Backend::Llvm => ("llvm", "native"),
                                 aot::Backend::Wasm => ("wasm", "wasm32"),
                                 aot::Backend::Arm => ("arm", "aarch64"),
@@ -97,6 +99,10 @@ fn main() {
                         }
                         Ok(None) if matches!(bk, aot::Backend::NativeArm64) => {
                             eprintln!("note: program not native-aarch64-able, or its cross toolchain is missing (needs aarch64-linux-gnu-gcc + qemu-aarch64), or it diverged in verify; no arm64 binary emitted");
+                            exit(1);
+                        }
+                        Ok(None) if matches!(bk, aot::Backend::NativeRiscv64) => {
+                            eprintln!("note: program not native-riscv64-able, or its cross toolchain is missing (needs riscv64-linux-gnu-gcc + qemu-riscv64), or it diverged in verify; no riscv64 binary emitted");
                             exit(1);
                         }
                         Ok(None) => eprintln!(
@@ -852,6 +858,7 @@ BUILD FLAGS:
   --aot=native         pure native binary straight from Cranelift IR -> .o -> cc-linked
                        (no C for logic; numeric programs, incl. multi-print main)
   --aot=native-arm64   same, cross-compiled to an aarch64 object (qemu-verified)
+  --aot=native-riscv64 same, cross-compiled to a riscv64gc object (qemu-verified)
   --aot=c              pure native binary via the C backend (cc -O2)
   --aot=llvm           pure native binary via the LLVM backend (clang -O2)
   --aot=wasm           freestanding wasm32 module, typed tier (clang, node-verified)
