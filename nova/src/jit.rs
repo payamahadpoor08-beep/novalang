@@ -2988,57 +2988,121 @@ fn const_arg(e: &Expr) -> Option<ArgConst> {
     }
 }
 
-// A compile-time-constant string value: string literals, string concatenation
-// (`"a" + "b"`), f-strings with constant holes (`f"n={3}"`), and `str(...)` over
-// constants. Each piece is formatted exactly as Nova's own `print`/`to_string`
-// (decimal ints, `true`/`false`, raw strings), so the emitted bytes are
-// byte-identical by construction; the build's oracle gate is the backstop.
-// Returns `None` for anything not a decidable constant string — those take the
-// numeric path or fall back to the C/embed build (never wrong output). Note the
-// entry rejects any `main` that isn't purely `print(...)` statements, so an
-// f-string hole referencing a local variable never reaches here.
-fn const_str(e: &Expr) -> Option<String> {
+// A compile-time-constant value in the string surface. Kept as its own enum
+// (not interp's `Value`) so the analysis stays interp-independent.
+#[derive(Clone)]
+enum CV { I(i64), F(f64), B(bool), S(String) }
+
+// The string form of a constant, byte-identical to the interpreter's `Display`:
+// decimal ints, `float_str` floats, `true`/`false`, raw strings.
+fn cv_str(v: &CV) -> String {
+    match v {
+        CV::I(n) => n.to_string(),
+        CV::F(x) => float_str(*x),
+        CV::B(b) => if *b { "true".into() } else { "false".into() },
+        CV::S(s) => s.clone(),
+    }
+}
+
+// Evaluate an expression to a compile-time constant, if it is one: literals,
+// parameters bound in `env`, `+ - *` arithmetic (checked — overflow yields `None`
+// so the program falls back, matching the interpreter's BigInt promotion),
+// string concatenation with coercion, f-strings, the string builtins
+// (`str`/`to_str`/`upper`/`lower`/`len`), and calls to user functions whose body
+// is a single tail expression, with constant arguments. Byte-identical to the
+// interpreter for this subset; the oracle gate backs everything. `depth` bounds
+// nested-call recursion so a pathological program can't loop the compiler.
+fn const_eval(e: &Expr, env: &HashMap<String, CV>, funcs: &HashMap<&str, &Func>, depth: u32) -> Option<CV> {
+    if depth > 64 { return None; }
     match unwrap_at(e) {
-        Expr::Str(s) => Some(s.clone()),
-        Expr::Binary { op: BinOp::Add, lhs, rhs } =>
-            Some(format!("{}{}", const_str(lhs)?, const_str(rhs)?)),
+        Expr::Str(s) => Some(CV::S(s.clone())),
+        Expr::Int(n) => Some(CV::I(*n)),
+        Expr::Float(x) => Some(CV::F(*x)),
+        Expr::Bool(b) => Some(CV::B(*b)),
+        Expr::Ident(p) => env.get(p).cloned(),
+        Expr::Unary { op: UnOp::Neg, expr } => match const_eval(expr, env, funcs, depth)? {
+            CV::I(n) => n.checked_neg().map(CV::I),
+            CV::F(x) => Some(CV::F(-x)),
+            _ => None,
+        },
+        Expr::Binary { op, lhs, rhs } => {
+            let a = const_eval(lhs, env, funcs, depth)?;
+            let b = const_eval(rhs, env, funcs, depth)?;
+            // string context: `+` with a string operand concatenates (the other
+            // side coerced to its string form), exactly like the interpreter.
+            if matches!(op, BinOp::Add) && matches!((&a, &b), (CV::S(_), _) | (_, CV::S(_))) {
+                return Some(CV::S(format!("{}{}", cv_str(&a), cv_str(&b))));
+            }
+            match (a, b) {
+                (CV::I(x), CV::I(y)) => match op {
+                    BinOp::Add => x.checked_add(y).map(CV::I),
+                    BinOp::Sub => x.checked_sub(y).map(CV::I),
+                    BinOp::Mul => x.checked_mul(y).map(CV::I),
+                    _ => None, // div/mod/pow: leave to the fallback
+                },
+                (CV::F(x), CV::F(y)) => match op {
+                    BinOp::Add => Some(CV::F(x + y)),
+                    BinOp::Sub => Some(CV::F(x - y)),
+                    BinOp::Mul => Some(CV::F(x * y)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         Expr::FmtStr(parts) => {
             let mut out = String::new();
             for p in parts {
                 match p {
                     FmtPart::Lit(s) => out.push_str(s),
-                    FmtPart::Expr(h) => out.push_str(&const_hole(h)?),
+                    FmtPart::Expr(h) => out.push_str(&cv_str(&const_eval(h, env, funcs, depth)?)),
                 }
             }
-            Some(out)
+            Some(CV::S(out))
         }
-        Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 =>
-            const_hole(&args[0]),
-        // constant case folding uses Rust's Unicode `to_uppercase`/`to_lowercase`
-        // — exactly what the interpreter calls — so it is byte-identical for any
-        // input (unlike the ASCII-only runtime used for a dynamic parameter).
-        Expr::Call { callee, args } if callee == "upper" && args.len() == 1 =>
-            Some(const_str(&args[0])?.to_uppercase()),
-        Expr::Call { callee, args } if callee == "lower" && args.len() == 1 =>
-            Some(const_str(&args[0])?.to_lowercase()),
+        Expr::Call { callee, args } => match callee.as_str() {
+            "str" | "to_str" if args.len() == 1 =>
+                Some(CV::S(cv_str(&const_eval(&args[0], env, funcs, depth)?))),
+            "upper" if args.len() == 1 => match const_eval(&args[0], env, funcs, depth)? {
+                CV::S(s) => Some(CV::S(s.to_uppercase())), _ => None },
+            "lower" if args.len() == 1 => match const_eval(&args[0], env, funcs, depth)? {
+                CV::S(s) => Some(CV::S(s.to_lowercase())), _ => None },
+            "len" if args.len() == 1 => match const_eval(&args[0], env, funcs, depth)? {
+                CV::S(s) => Some(CV::I(s.chars().count() as i64)), _ => None },
+            // a user function with a single tail-expression body, constant args.
+            _ => {
+                let f = funcs.get(callee.as_str())?;
+                if f.params.len() != args.len() || f.body.len() != 1 { return None; }
+                let tail = match &f.body[0] {
+                    Stmt::Expr(t) | Stmt::Return(Some(t)) => t,
+                    _ => return None,
+                };
+                let mut nenv: HashMap<String, CV> = HashMap::new();
+                for (p, a) in f.params.iter().zip(args) {
+                    nenv.insert(p.clone(), const_eval(a, env, funcs, depth + 1)?);
+                }
+                const_eval(tail, &nenv, funcs, depth + 1)
+            }
+        },
         _ => None,
     }
 }
 
-// Format a constant interpolation hole / `str()` argument exactly as Nova prints
-// it. Ints -> decimal, floats -> `float_str`, bools -> `true`/`false`, strings ->
-// raw. Anything not a decidable constant returns `None` (leave that program to the
-// C/embed fallback; the oracle gate would catch any mismatch regardless).
+// A compile-time-constant *string* value (only). Thin wrapper over `const_eval`
+// with the program's functions available so a `print(f(<consts>))` folds to bytes.
+fn const_str_f(e: &Expr, funcs: &HashMap<&str, &Func>) -> Option<String> {
+    match const_eval(e, &HashMap::new(), funcs, 0)? { CV::S(s) => Some(s), _ => None }
+}
+
+// The no-functions form, kept for callers that fold only literal composition.
+fn const_str(e: &Expr) -> Option<String> {
+    const_str_f(e, &HashMap::new())
+}
+
+// The string form of a constant interpolation hole / `str()` argument (no user
+// functions). Delegates to `const_eval`, so it now also folds constant arithmetic
+// (`f"{2*3}"` -> "6"). `None` for anything not a decidable constant.
 fn const_hole(e: &Expr) -> Option<String> {
-    match unwrap_at(e) {
-        Expr::Str(s) => Some(s.clone()),
-        Expr::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
-        other => match const_arg(other) {
-            Some(ArgConst::I(n)) => Some(n.to_string()),
-            Some(ArgConst::F(x)) => Some(float_str(x)),
-            None => None,
-        },
-    }
+    const_eval(e, &HashMap::new(), &HashMap::new(), 0).map(|v| cv_str(&v))
 }
 
 // A Nova float's string form, byte-identical to `impl Display for Value`
@@ -3343,6 +3407,10 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     let mut slots: Vec<Slot> = Vec::new();
     let mut producers: Vec<(String, Vec<ArgConst>)> = Vec::new();
     let mut str_producers: Vec<(String, Vec<String>)> = Vec::new(); // (fn, const-string args)
+    // user functions by name, for constant-folding `print(f(<consts>))`.
+    let ufuncs: HashMap<&str, &Func> = prog.items.iter()
+        .filter_map(|it| match it { Item::Func(f) => Some((f.name.as_str(), f)), _ => None })
+        .collect();
     let mut aug = prog.clone();
     for (i, expr) in printed.iter().enumerate() {
         // a constant string prints via baked bytes — no producer function needed.
@@ -3364,6 +3432,11 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
                 }
             }
         }
+        // a user string-function call the StrGen track can't take (e.g. it does
+        // arithmetic like `str(n*2)`) but whose result is a compile-time constant:
+        // evaluate it and bake the bytes. Covers arithmetic + builtins over the
+        // constant call-site arguments; the oracle gate verifies the bytes.
+        if let Some(s) = const_str_f(expr, &ufuncs) { slots.push(Slot::Str(s)); continue; }
         let direct = match unwrap_at(expr) {
             Expr::Call { callee, args } if user_fn(callee) =>
                 args.iter().map(const_arg).collect::<Option<Vec<_>>>()
@@ -4413,8 +4486,8 @@ mod jit_tests {
         for src in [
             "fn main(){ print(true) }",                          // bool arg (boxed tier)
             "fn main(){ let x=1; print(x) }",                    // non-print statement
-            "fn f(n){ \"v=\" + str(n * 2) } fn main(){ print(f(5)) }", // arithmetic in string
-            "fn greet(n){ n } fn main(){ print(greet(\"hi\")) }", // runtime string via fn
+            "fn f(){ s = \"a\"; s + \"b\" } fn main(){ print(f()) }", // string local (multi-stmt)
+            "fn f(n){ \"v=\" + str(n / 2) } fn main(){ print(f(9)) }", // division in string (not folded)
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
@@ -4432,6 +4505,9 @@ mod jit_tests {
             "fn main(){ print(f\"n={42}\") }",                   // f-string, const hole
             "fn main(){ print(\"x=\" + str(7)) }",               // str() of a constant
             "fn main(){ print(upper(\"hi\") + lower(\"BYE\")) }", // constant case fold
+            // arithmetic inside a string folds to a constant (str(n*2), f-string)
+            "fn label(n){ \"v=\" + str(n*2) } fn main(){ print(label(5)) }",
+            "fn area(w,h){ f\"a={w*h}\" } fn main(){ print(area(3,4)) }",
             "fn main(){ print(\"result:\"); print(6*7) }",       // mixed string + number
         ] {
             let mut prog = parse_program(src).expect("parse");
