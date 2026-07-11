@@ -1159,7 +1159,7 @@ impl Jit {
                 let arrays = array_vars(f);
                 let structs = struct_vars(f, &sdefs);
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params);
+                let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params, false);
                 g.lower(&f.body)?;
                 b.finalize();
             }
@@ -2245,6 +2245,10 @@ struct FnGen<'a, 'b> {
     deopt_block: Block,
     loops: Vec<LoopCtx>,
     returned: bool,
+    // emit the overflow check without the `sadd_overflow`/`ssub_overflow`
+    // intrinsics (Cranelift's riscv64 backend doesn't lower them) — the portable
+    // sign-bit test instead, byte-identical in which inputs it flags.
+    manual_ovf: bool,
 }
 
 impl<'a, 'b> FnGen<'a, 'b> {
@@ -2252,7 +2256,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
            ids: &'a HashMap<String, (FuncId, usize)>,
            helpers: &'a HashMap<&'static str, FuncId>,
            arrays: HashSet<String>, structs: HashMap<String, Vec<String>>,
-           params: &[String]) -> Self {
+           params: &[String], manual_ovf: bool) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -2261,7 +2265,7 @@ impl<'a, 'b> FnGen<'a, 'b> {
         let deopt_block = b.create_block();
         let mut g = FnGen {
             b, module, ids, helpers, arrays, structs, vars: HashMap::new(), n_vars: 0,
-            deopt_ptr, deopt_block, loops: Vec::new(), returned: false,
+            deopt_ptr, deopt_block, loops: Vec::new(), returned: false, manual_ovf,
         };
         for (i, p) in params.iter().enumerate() {
             let v = g.declare(p);
@@ -2793,12 +2797,34 @@ impl<'a, 'b> FnGen<'a, 'b> {
     // return None, so this is byte-identical to the interpreter (which promotes to
     // BigInt on overflow) while replacing the 5-instruction sign-bit trick.
     fn add_checked(&mut self, a: Value, b: Value) -> Value {
+        if self.manual_ovf {
+            // s = a + b; overflow iff a,b share a sign but s differs:
+            // ((a ^ s) & (b ^ s)) < 0.
+            let s = self.b.ins().iadd(a, b);
+            let axs = self.b.ins().bxor(a, s);
+            let bxs = self.b.ins().bxor(b, s);
+            let both = self.b.ins().band(axs, bxs);
+            let ovf = self.b.ins().icmp_imm(IntCC::SignedLessThan, both, 0);
+            self.guard_deopt(ovf);
+            return s;
+        }
         let (r, ovf) = self.b.ins().sadd_overflow(a, b);
         self.guard_deopt(ovf);
         r
     }
 
     fn sub_checked(&mut self, a: Value, b: Value) -> Value {
+        if self.manual_ovf {
+            // d = a - b; overflow iff a,b differ in sign and d differs from a:
+            // ((a ^ b) & (a ^ d)) < 0.
+            let d = self.b.ins().isub(a, b);
+            let axb = self.b.ins().bxor(a, b);
+            let axd = self.b.ins().bxor(a, d);
+            let both = self.b.ins().band(axb, axd);
+            let ovf = self.b.ins().icmp_imm(IntCC::SignedLessThan, both, 0);
+            self.guard_deopt(ovf);
+            return d;
+        }
         let (r, ovf) = self.b.ins().ssub_overflow(a, b);
         self.guard_deopt(ovf);
         r
@@ -2957,7 +2983,7 @@ fn const_arg(e: &Expr) -> Option<ArgConst> {
 // target — the entry's itoa/`write` is arch-independent — so nothing here is
 // arch-specific; only the ISA and the object's binary format differ.
 #[derive(Clone, Copy, PartialEq)]
-pub enum NativeTarget { Host, Aarch64 }
+pub enum NativeTarget { Host, Aarch64, Riscv64 }
 
 impl NativeTarget {
     // the target triple string, or None for the host (uses cranelift_native).
@@ -2965,6 +2991,7 @@ impl NativeTarget {
         match self {
             NativeTarget::Host => None,
             NativeTarget::Aarch64 => Some("aarch64-unknown-linux-gnu"),
+            NativeTarget::Riscv64 => Some("riscv64gc-unknown-linux-gnu"),
         }
     }
 }
@@ -3072,15 +3099,26 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     // 4) build the object module for the requested ISA (host, or a cross target)
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
-    // the host binary is a PIE (linked with plain `cc`); the aarch64 cross binary
-    // links static non-PIE, so it emits non-PIC code.
+    // the host binary is a PIE (linked with plain `cc`); the cross binaries link
+    // static non-PIE, so they emit non-PIC code.
     flags.set("is_pic", if target == NativeTarget::Host { "true" } else { "false" }).ok()?;
     let isa = match target.triple() {
         None => cranelift_native::builder().ok()?
             .finish(settings::Flags::new(flags)).ok()?,
         Some(triple) => {
             let t = triple.parse::<target_lexicon::Triple>().ok()?;
-            isa::lookup(t).ok()?.finish(settings::Flags::new(flags)).ok()?
+            let mut b = isa::lookup(t).ok()?;
+            // riscv64gc: enable the G ISA extensions (IMAFD + Zicsr/Zifencei) and
+            // the C compressed set — Cranelift's riscv64 backend has these OFF by
+            // default, so integer mul/div (the itoa's sdiv/srem) and float ops
+            // wouldn't lower without them.
+            if target == NativeTarget::Riscv64 {
+                for ext in ["has_m", "has_a", "has_f", "has_d", "has_c",
+                            "has_zicsr", "has_zifencei"] {
+                    b.enable(ext).ok()?;
+                }
+            }
+            b.finish(settings::Flags::new(flags)).ok()?
         }
     };
     let builder = ObjectBuilder::new(
@@ -3144,7 +3182,8 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
             let arrays = array_vars(f);
             let structs = struct_vars(f, &sdefs);
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-            let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params);
+            let mut g = FnGen::new(&mut b, &mut module, &ids, &helpers, arrays, structs, &f.params,
+                                   target == NativeTarget::Riscv64);
             g.lower(&f.body)?;
             b.finalize();
         }
@@ -3809,15 +3848,17 @@ mod jit_tests {
         same_jit(&src);
     }
     #[test] fn native_object_cross_arch() {
-        // the same Cranelift IR emits a real object for the aarch64 cross target —
-        // proves the aarch64 backend is compiled in (independent of a linker or
-        // qemu, which the build's oracle gate needs but this test does not).
+        // the same Cranelift IR emits a real object for each cross target — proves
+        // the aarch64 + riscv64 backends are compiled in and lower our IR (incl. the
+        // riscv64 manual overflow path). Independent of a linker or qemu, which the
+        // build's oracle gate needs but this test does not.
         let src = "fn fib(n){ if n<2 {n} else {fib(n-1)+fib(n-2)} } fn main(){ print(fib(10)) }";
         let mut prog = parse_program(src).expect("parse");
         fold_program(&mut prog);
         for (t, label) in [
             (super::NativeTarget::Host, "host"),
             (super::NativeTarget::Aarch64, "aarch64"),
+            (super::NativeTarget::Riscv64, "riscv64"),
         ] {
             let (obj, _) = super::compile_object(&prog, t)
                 .unwrap_or_else(|| panic!("{} target must emit an object", label));

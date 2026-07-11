@@ -38,6 +38,7 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
     let native_target = match backend {
         crate::aot::Backend::Native => Some(NativeArch::Host),
         crate::aot::Backend::NativeArm64 => Some(NativeArch::Aarch64),
+        crate::aot::Backend::NativeRiscv64 => Some(NativeArch::Riscv64),
         _ => None,
     };
     if let Some(arch) = native_target {
@@ -67,8 +68,8 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
         // ARMv7 (32-bit hard-float): older / weaker phones.
         crate::aot::Backend::Arm32 => ("c", "arm-linux-gnueabihf-gcc"),
         crate::aot::Backend::Wasm => unreachable!("wasm handled by build_wasm above"),
-        crate::aot::Backend::Native
-        | crate::aot::Backend::NativeArm64 => unreachable!("native handled by build_native above"),
+        crate::aot::Backend::Native | crate::aot::Backend::NativeArm64
+        | crate::aot::Backend::NativeRiscv64 => unreachable!("native handled by build_native above"),
     };
     let tmp = out.with_extension(ext);
     std::fs::write(&tmp, &code).map_err(|e| e.to_string())?;
@@ -134,7 +135,7 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
 // C-backend ARM path already uses).
 #[cfg(feature = "jit")]
 #[derive(Clone, Copy, PartialEq)]
-enum NativeArch { Host, Aarch64 }
+enum NativeArch { Host, Aarch64, Riscv64 }
 
 #[cfg(feature = "jit")]
 impl NativeArch {
@@ -142,14 +143,16 @@ impl NativeArch {
         match self {
             NativeArch::Host => crate::jit::NativeTarget::Host,
             NativeArch::Aarch64 => crate::jit::NativeTarget::Aarch64,
+            NativeArch::Riscv64 => crate::jit::NativeTarget::Riscv64,
         }
     }
-    // (C compiler / linker, qemu runner or None for host). The cross target links
+    // (C compiler / linker, qemu runner or None for host). Cross targets link
     // static so qemu needs no target sysroot at run time.
     fn tools(self) -> (&'static str, Option<&'static str>) {
         match self {
             NativeArch::Host => ("cc", None),
             NativeArch::Aarch64 => ("aarch64-linux-gnu-gcc", Some("qemu-aarch64")),
+            NativeArch::Riscv64 => ("riscv64-linux-gnu-gcc", Some("qemu-riscv64")),
         }
     }
 }
@@ -237,7 +240,7 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
 // unavailable — fall back to the embed build honestly.
 #[cfg(not(feature = "jit"))]
 #[derive(Clone, Copy)]
-enum NativeArch { Host, Aarch64 }
+enum NativeArch { Host, Aarch64, Riscv64 }
 
 #[cfg(not(feature = "jit"))]
 fn build_native(_entry: &str, _out: &Path, _program: &crate::ast::Program, _arch: NativeArch)
