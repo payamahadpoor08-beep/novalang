@@ -1004,6 +1004,18 @@ impl Interp {
                 return Err(format!("struct {} has no field: {}", name, given));
             }
         }
+        // Enforce any refinement type declared on a field, so the predicate holds
+        // for every constructed instance. Shared by the interpreter and the VM's
+        // MakeStruct, so both tiers reject the same values (cheap `is_empty` skip).
+        if !self.refinements.is_empty() {
+            for (i, declared) in def.fields.iter().enumerate() {
+                if let Some(Some(tn)) = def.field_types.get(i) {
+                    if let Some(v) = field_map.get(declared) {
+                        self.refine_check(tn, v, &Scope::new())?;
+                    }
+                }
+            }
+        }
         Ok(Value::Struct(Rc::new(RefCell::new(StructInstance {
             type_name: name.to_string(),
             fields: field_map,
@@ -1186,6 +1198,28 @@ impl Interp {
         Ok(())
     }
 
+    // Re-check a field's refinement on write `base.field = v`, so a refined field
+    // stays an invariant for the value's whole life (not just at construction).
+    // Shared by the interpreter's `FieldAssign` and the VM's `SetField`, so a
+    // violating write is rejected identically on every tier. Cheap: skips entirely
+    // when the program declares no refinements or the target isn't a refined field.
+    pub(crate) fn refine_check_field(&self, target: &Value, field: &str, v: &Value)
+        -> Result<(), String>
+    {
+        if self.refinements.is_empty() { return Ok(()); }
+        if let Value::Struct(inst) = target {
+            let tname = inst.borrow().type_name.clone();
+            if let Some(def) = self.structs.get(&tname) {
+                if let Some(pos) = def.fields.iter().position(|f| f == field) {
+                    if let Some(Some(tn)) = def.field_types.get(pos) {
+                        self.refine_check(tn, v, &Scope::new())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Compile-time refinement checking: a refined `let x: T = <constant>` whose
     // constant value violates T's predicate is rejected before the program ever
     // runs (reported by `nova check`), rather than crashing at runtime. Only fires
@@ -1206,12 +1240,41 @@ impl Interp {
     // left to the runtime check, avoiding any false compile-time rejection.
     fn scan_refined_consts(&self, body: &[Stmt], errs: &mut Vec<String>) {
         for s in body {
-            if let Stmt::Let { ty: Some(tn), value, .. } = s {
-                if self.refinements.contains_key(tn) {
+            match s {
+                Stmt::Let { ty: Some(tn), value, .. } if self.refinements.contains_key(tn) => {
                     if let Some(v) = Self::const_literal(value) {
                         if self.refine_check(tn, &v, &Scope::new()).is_err() {
                             errs.push(format!(
                                 "refinement `{}` violated at compile time by constant {}", tn, v));
+                        }
+                    }
+                    self.scan_struct_lit(value, errs);
+                }
+                Stmt::Let { value, .. } => self.scan_struct_lit(value, errs),
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => self.scan_struct_lit(e, errs),
+                _ => {}
+            }
+        }
+    }
+
+    // A `Name { field: <constant> }` whose constant violates that field's declared
+    // refinement type is rejected at compile time, mirroring the refined-`let`
+    // check. Only decidable constants fire, so there is never a false positive.
+    fn scan_struct_lit(&self, e: &Expr, errs: &mut Vec<String>) {
+        // unwrap the position marker the parser wraps expressions in (as const_literal does)
+        if let Expr::At { expr, .. } = e { return self.scan_struct_lit(expr, errs); }
+        if let Expr::StructLit { name, fields } = e {
+            if let Some(def) = self.structs.get(name) {
+                for (fname, fval) in fields {
+                    if let Some(pos) = def.fields.iter().position(|f| f == fname) {
+                        if let Some(Some(tn)) = def.field_types.get(pos) {
+                            if let Some(v) = Self::const_literal(fval) {
+                                if self.refine_check(tn, &v, &Scope::new()).is_err() {
+                                    errs.push(format!(
+                                        "refinement `{}` on field `{}.{}` violated at compile time by constant {}",
+                                        tn, name, fname, v));
+                                }
+                            }
                         }
                     }
                 }
@@ -2705,6 +2768,7 @@ impl Interp {
             Stmt::FieldAssign { base, field, value } => {
                 let target = self.eval(base, scope)?;
                 let v = self.eval(value, scope)?;
+                self.refine_check_field(&target, field, &v)?;
                 field_set(&target, field, v)?;
                 Ok(Flow::Normal)
             }
@@ -5016,6 +5080,22 @@ mod fold_tests {
         let mut u = Expr::Unary { op: UnOp::Neg, expr: Box::new(Expr::Int(7)) };
         fold_expr(&mut u);
         assert!(matches!(u, Expr::Int(-7)));
+    }
+
+    // A struct literal whose constant field value violates the field's refinement
+    // type is rejected at compile time by `static_refinement_errors` (mirroring the
+    // refined-`let` check), while a valid constant produces no error.
+    fn static_errs(src: &str) -> Vec<String> {
+        let mut prog = crate::parser::parse_program(src).expect("parse");
+        fold_program(&mut prog);
+        Interp::new(&prog).expect("interp").static_refinement_errors(&prog)
+    }
+    #[test] fn static_struct_field_violation() {
+        let e = static_errs("type Pos = Int if it > 0; struct P { x: Pos } fn main(){ let p = P { x: 0-1 }; p }");
+        assert!(e.iter().any(|m| m.contains("P.x") && m.contains("Pos")), "got {:?}", e);
+    }
+    #[test] fn static_struct_field_ok() {
+        assert!(static_errs("type Pos = Int if it > 0; struct P { x: Pos } fn main(){ let p = P { x: 9 }; p }").is_empty());
     }
 }
 

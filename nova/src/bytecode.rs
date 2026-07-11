@@ -1890,7 +1890,9 @@ impl<'a> Vm<'a> {
                 Op::SetField(n) => {
                     let v = stack.pop().unwrap();
                     let base = stack.pop().unwrap();
-                    field_set(&base, &self.c.names[*n as usize], v)?;
+                    let field = &self.c.names[*n as usize];
+                    self.interp.refine_check_field(&base, field, &v)?;
+                    field_set(&base, field, v)?;
                 }
                 Op::MatchTest(i, scrut, fail) => {
                     let (pat, binds) = &chunk.match_tests[*i as usize];
@@ -2067,6 +2069,24 @@ mod vm_tests {
         // a refined-parameter violation throws a catchable error, same on both tiers
         assert!(matches!(
             same("type Pos = Int if it > 0; fn f(x: Pos){ x } fn main(){ r=0; try { f(0-1) } catch e { r=1 }; r }"),
+            Value::Int(1)));
+    }
+    // A refinement type on a struct field is enforced on construction (shared
+    // make_struct) and on field write (shared refine_check_field), so the VM and
+    // the interpreter reject the same values.
+    #[test] fn refinement_struct_field_ok() {
+        assert!(matches!(
+            same("type Pos = Int if it > 0; struct P { x: Pos } fn main(){ p = P { x: 5 }; p.x }"),
+            Value::Int(5)));
+    }
+    #[test] fn refinement_struct_field_construct_violation() {
+        assert!(matches!(
+            same("type Pos = Int if it > 0; struct P { x: Pos } fn main(){ r=0; try { P { x: 0-1 } } catch e { r=1 }; r }"),
+            Value::Int(1)));
+    }
+    #[test] fn refinement_struct_field_write_violation() {
+        assert!(matches!(
+            same("type Pos = Int if it > 0; struct P { x: Pos } fn main(){ p = P { x: 5 }; r=0; try { p.x = 0-9 } catch e { r=1 }; r }"),
             Value::Int(1)));
     }
     #[test] fn short_circuit() { same("fn main(){ (1<2) && (3>1) }"); same("fn main(){ false || (2==2) }"); }
