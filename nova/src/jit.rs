@@ -3014,6 +3014,13 @@ fn const_str(e: &Expr) -> Option<String> {
         }
         Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 =>
             const_hole(&args[0]),
+        // constant case folding uses Rust's Unicode `to_uppercase`/`to_lowercase`
+        // — exactly what the interpreter calls — so it is byte-identical for any
+        // input (unlike the ASCII-only runtime used for a dynamic parameter).
+        Expr::Call { callee, args } if callee == "upper" && args.len() == 1 =>
+            Some(const_str(&args[0])?.to_uppercase()),
+        Expr::Call { callee, args } if callee == "lower" && args.len() == 1 =>
+            Some(const_str(&args[0])?.to_lowercase()),
         _ => None,
     }
 }
@@ -3137,30 +3144,40 @@ fn str_calls(e: &Expr, out: &mut Vec<String>) {
         Expr::FmtStr(parts) =>
             for p in parts { if let FmtPart::Expr(h) = p { str_calls(h, out); } },
         Expr::Call { callee, args } => {
-            // str()/to_str() are builtins, not user functions the fixpoint validates.
-            if callee != "str" && callee != "to_str" { out.push(callee.clone()); }
+            // string builtins are not user functions the fixpoint validates.
+            if !is_str_builtin(callee) { out.push(callee.clone()); }
             for a in args { str_calls(a, out); }
         }
         _ => {}
     }
 }
 
+// String-returning builtins the native string track lowers directly (rather than
+// as a user-function call): value formatting (`str`/`to_str`) and ASCII case
+// folding (`upper`/`lower`).
+fn is_str_builtin(name: &str) -> bool {
+    matches!(name, "str" | "to_str" | "upper" | "lower")
+}
+
 // Lowers a string-composition function body to an i64 string handle. Simpler than
 // FnGen: one value kind (handle), no deopt (concat can't fail). C-ABI
 // `(i64 handles...) -> i64`.
+// The runtime string helpers StrGen calls (all imports from nova_native_rt.c).
+#[derive(Clone, Copy)]
+struct StrRt { lit: FuncId, concat: FuncId, upper: FuncId, lower: FuncId }
+
 struct StrGen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     module: &'a mut dyn Module,
     ids: &'a HashMap<String, (FuncId, usize)>, // other string functions
-    str_lit: FuncId,
-    str_concat: FuncId,
+    rt: StrRt,
     params: HashMap<String, Value>,
 }
 
 impl<'a, 'b> StrGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut dyn Module,
            ids: &'a HashMap<String, (FuncId, usize)>,
-           str_lit: FuncId, str_concat: FuncId, params: &[String]) -> Self {
+           rt: StrRt, params: &[String]) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -3168,7 +3185,14 @@ impl<'a, 'b> StrGen<'a, 'b> {
         let pv: Vec<Value> = b.block_params(entry).to_vec();
         let mut pm = HashMap::new();
         for (i, p) in params.iter().enumerate() { pm.insert(p.clone(), pv[i]); }
-        StrGen { b, module, ids, str_lit, str_concat, params: pm }
+        StrGen { b, module, ids, rt, params: pm }
+    }
+
+    // call a runtime string helper (name -> FuncId) on already-lowered args.
+    fn rt_call(&mut self, id: FuncId, args: &[Value]) -> Value {
+        let f = self.module.declare_func_in_func(id, self.b.func);
+        let call = self.b.ins().call(f, args);
+        self.b.inst_results(call)[0]
     }
 
     // box literal bytes into an NStr handle via nova_str_lit(ptr, len).
@@ -3180,15 +3204,11 @@ impl<'a, 'b> StrGen<'a, 'b> {
         let gv = self.module.declare_data_in_func(data, self.b.func);
         let ptr = self.b.ins().global_value(I64, gv);
         let n = self.b.ins().iconst(I64, bytes.len() as i64);
-        let f = self.module.declare_func_in_func(self.str_lit, self.b.func);
-        let call = self.b.ins().call(f, &[ptr, n]);
-        Some(self.b.inst_results(call)[0])
+        Some(self.rt_call(self.rt.lit, &[ptr, n]))
     }
 
     fn concat(&mut self, a: Value, c: Value) -> Value {
-        let f = self.module.declare_func_in_func(self.str_concat, self.b.func);
-        let call = self.b.ins().call(f, &[a, c]);
-        self.b.inst_results(call)[0]
+        self.rt_call(self.rt.concat, &[a, c])
     }
 
     fn lower_str(&mut self, e: &Expr) -> Option<Value> {
@@ -3204,6 +3224,12 @@ impl<'a, 'b> StrGen<'a, 'b> {
             // arrive boxed to their string form, so this is the identity).
             Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 =>
                 self.lower_str(&args[0]),
+            // ASCII case folding via the runtime.
+            Expr::Call { callee, args } if (callee == "upper" || callee == "lower") && args.len() == 1 => {
+                let s = self.lower_str(&args[0])?;
+                let id = if callee == "upper" { self.rt.upper } else { self.rt.lower };
+                Some(self.rt_call(id, &[s]))
+            }
             Expr::Binary { op: BinOp::Add, lhs, rhs } => {
                 let a = self.lower_str(lhs)?;
                 let c = self.lower_str(rhs)?;
@@ -3585,6 +3611,16 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
             sig.params.push(AbiParam::new(I64));
             module.declare_function("nova_str_print", Linkage::Import, &sig).ok()?
         };
+        // (i64 handle) -> i64 handle unary runtime string helpers.
+        let mut unary = |name: &str| -> Option<FuncId> {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64));
+            sig.returns.push(AbiParam::new(I64));
+            module.declare_function(name, Linkage::Import, &sig).ok()
+        };
+        let upp = unary("nova_str_upper")?;
+        let low = unary("nova_str_lower")?;
+        let rt = StrRt { lit, concat: cat, upper: upp, lower: low };
         let mut snames: Vec<&str> = str_set.iter().map(|s| s.as_str()).collect();
         snames.sort();
         let mut str_ids: HashMap<String, (FuncId, usize)> = HashMap::new();
@@ -3604,7 +3640,7 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
             ctx.func.signature.returns.push(AbiParam::new(I64));
             {
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let mut g = StrGen::new(&mut b, &mut module, &str_ids, lit, cat, &f.params);
+                let mut g = StrGen::new(&mut b, &mut module, &str_ids, rt, &f.params);
                 g.lower(&f.body)?;
                 b.finalize();
             }
@@ -4385,6 +4421,7 @@ mod jit_tests {
             "fn main(){ print(\"a\" + \"b\") }",                  // concatenation
             "fn main(){ print(f\"n={42}\") }",                   // f-string, const hole
             "fn main(){ print(\"x=\" + str(7)) }",               // str() of a constant
+            "fn main(){ print(upper(\"hi\") + lower(\"BYE\")) }", // constant case fold
             "fn main(){ print(\"result:\"); print(6*7) }",       // mixed string + number
         ] {
             let mut prog = parse_program(src).expect("parse");
@@ -4414,6 +4451,8 @@ mod jit_tests {
             // increment 2b: float parameters / literals, formatted via float_str.
             "fn dim(w){ \"w=\" + str(w) } fn main(){ print(dim(2.5)) }",
             "fn pt(name, x){ f\"{name}={x} (pi {3.14})\" } fn main(){ print(pt(\"r\", 1.5)) }",
+            // upper/lower: ASCII case folding on a string parameter (runtime).
+            "fn shout(s){ upper(s) + \"!\" } fn main(){ print(shout(\"go\")) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
