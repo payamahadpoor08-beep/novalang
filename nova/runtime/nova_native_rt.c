@@ -128,6 +128,34 @@ i64 nova_str_lower(i64 h) {
     return (i64)(intptr_t)r;
 }
 
+/* Nova `len(s)` on a string: the number of Unicode scalar values, byte-identical
+ * to the interpreter's `s.chars().count()`. For valid UTF-8 that is the count of
+ * bytes that are not continuation bytes (top bits != 10). */
+i64 nova_str_len(i64 h) {
+    NStr *s = (NStr *)(intptr_t)h;
+    i64 n = 0;
+    for (i64 i = 0; i < s->len; i++) {
+        if (((unsigned char)s->data[i] & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+
+/* box a machine integer as its decimal string (matching the interpreter's Int
+ * Display), so a computed number can join a native string. */
+i64 nova_str_i64(i64 v) {
+    char tmp[24];
+    int o = (int)sizeof tmp;
+    unsigned long long m = v < 0 ? -(unsigned long long)v : (unsigned long long)v;
+    do { tmp[--o] = (char)('0' + (int)(m % 10)); m /= 10; } while (m);
+    if (v < 0) tmp[--o] = '-';
+    i64 len = (i64)((int)sizeof tmp - o);
+    NStr *r = (NStr *)malloc(sizeof(NStr));
+    r->len = len;
+    r->data = (char *)malloc((size_t)len);
+    memcpy(r->data, tmp + o, (size_t)len);
+    return (i64)(intptr_t)r;
+}
+
 /* print a Nova string value: its bytes + trailing newline, one write(2). */
 void nova_str_print(i64 h) {
     NStr *s = (NStr *)(intptr_t)h;

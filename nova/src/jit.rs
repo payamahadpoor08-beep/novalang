@@ -3156,7 +3156,7 @@ fn str_calls(e: &Expr, out: &mut Vec<String>) {
 // as a user-function call): value formatting (`str`/`to_str`) and ASCII case
 // folding (`upper`/`lower`).
 fn is_str_builtin(name: &str) -> bool {
-    matches!(name, "str" | "to_str" | "upper" | "lower")
+    matches!(name, "str" | "to_str" | "upper" | "lower" | "len")
 }
 
 // Lowers a string-composition function body to an i64 string handle. Simpler than
@@ -3164,7 +3164,7 @@ fn is_str_builtin(name: &str) -> bool {
 // `(i64 handles...) -> i64`.
 // The runtime string helpers StrGen calls (all imports from nova_native_rt.c).
 #[derive(Clone, Copy)]
-struct StrRt { lit: FuncId, concat: FuncId, upper: FuncId, lower: FuncId }
+struct StrRt { lit: FuncId, concat: FuncId, upper: FuncId, lower: FuncId, len: FuncId, i64: FuncId }
 
 struct StrGen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
@@ -3229,6 +3229,14 @@ impl<'a, 'b> StrGen<'a, 'b> {
                 let s = self.lower_str(&args[0])?;
                 let id = if callee == "upper" { self.rt.upper } else { self.rt.lower };
                 Some(self.rt_call(id, &[s]))
+            }
+            // `len(s)` -> the char count boxed as its decimal string. In this
+            // string track the result is only ever printed, and `print(<int>)`
+            // and `print(str-of-int)` emit the same bytes, so boxing is exact.
+            Expr::Call { callee, args } if callee == "len" && args.len() == 1 => {
+                let s = self.lower_str(&args[0])?;
+                let n = self.rt_call(self.rt.len, &[s]);
+                Some(self.rt_call(self.rt.i64, &[n]))
             }
             Expr::Binary { op: BinOp::Add, lhs, rhs } => {
                 let a = self.lower_str(lhs)?;
@@ -3620,7 +3628,9 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
         };
         let upp = unary("nova_str_upper")?;
         let low = unary("nova_str_lower")?;
-        let rt = StrRt { lit, concat: cat, upper: upp, lower: low };
+        let slen = unary("nova_str_len")?;
+        let si64 = unary("nova_str_i64")?;
+        let rt = StrRt { lit, concat: cat, upper: upp, lower: low, len: slen, i64: si64 };
         let mut snames: Vec<&str> = str_set.iter().map(|s| s.as_str()).collect();
         snames.sort();
         let mut str_ids: HashMap<String, (FuncId, usize)> = HashMap::new();
@@ -4453,6 +4463,8 @@ mod jit_tests {
             "fn pt(name, x){ f\"{name}={x} (pi {3.14})\" } fn main(){ print(pt(\"r\", 1.5)) }",
             // upper/lower: ASCII case folding on a string parameter (runtime).
             "fn shout(s){ upper(s) + \"!\" } fn main(){ print(shout(\"go\")) }",
+            // len: char count boxed as its decimal string (byte-exact, incl. UTF-8).
+            "fn info(s){ s + \" has \" + str(len(s)) } fn main(){ print(info(\"hi\")) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
