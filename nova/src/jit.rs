@@ -848,6 +848,8 @@ mod cl {
 use super::*;
 use cranelift::prelude::*;
 use cranelift::prelude::types::{I64, I128, I32, I8};
+use cranelift::codegen::Context;
+use cranelift::codegen::control::ControlPlane;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Module, Linkage, FuncId};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -945,6 +947,70 @@ fn jit_arena_reset() {
 // results are bit-identical to the interpreter's `as_f(l) % as_f(r)` / powf.
 extern "C" fn nova_fmod(a: f64, b: f64) -> f64 { a % b }
 extern "C" fn nova_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
+
+// Minimum function count before parallel compilation pays for its thread setup.
+const PAR_MIN: usize = 6;
+
+// Multicore compilation: lower a batch of already-IR-generated functions to
+// machine code across the host's cores, then define them into `module` serially.
+//
+// This is the honest, buildable form of "compile n× faster with n units": each
+// function's back end (legalization, register allocation, encoding — the
+// expensive step) is independent, so it fans out across threads. Cranelift
+// codegen is deterministic per function (thread-independent), and this mirrors
+// exactly what `Module::define_function` does serially — `ctx.compile(isa,
+// ControlPlane::default())` then `define_function_bytes(...)` — so the emitted
+// machine code, and hence program output, is byte-identical to the serial path.
+// The corpus (×4) and AOT oracle gates still verify every tier.
+//
+// Falls back to serial for a single core or a small batch (thread setup would
+// cost more than it saves). Returns None on any compile/define failure — the
+// caller then disables that tier and runs the correct VM/interpreter, never
+// shipping wrong code.
+fn define_parallel<M: Module>(module: &mut M, mut jobs: Vec<(FuncId, Context)>) -> Option<()> {
+    // Thread count: the host's core count, overridable via NOVA_COMPILE_THREADS
+    // (1 forces the serial path — handy for benchmarking the n× speedup and as an
+    // escape hatch). Clamped to at least 1.
+    let ncpu = std::env::var("NOVA_COMPILE_THREADS").ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let timing = std::env::var("NOVA_COMPILE_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
+    if ncpu <= 1 || jobs.len() < PAR_MIN {
+        for (id, ctx) in &mut jobs { module.define_function(*id, ctx).ok()?; }
+        if timing { eprintln!("nova: compiled {} fns serially in {:?}", jobs.len(), t0.elapsed()); }
+        return Some(());
+    }
+    // 1) parallel: compile each function to machine code (disjoint &mut chunks;
+    //    the ISA is Send+Sync, each thread uses its own ControlPlane).
+    {
+        let isa = module.isa();
+        let nthreads = ncpu.min(jobs.len());
+        let chunk = jobs.len().div_ceil(nthreads);
+        let ok = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs.chunks_mut(chunk).map(|slice| {
+                s.spawn(move || {
+                    let mut cp = ControlPlane::default();
+                    slice.iter_mut().all(|(_, ctx)| ctx.compile(isa, &mut cp).is_ok())
+                })
+            }).collect();
+            handles.into_iter().all(|h| h.join().unwrap_or(false))
+        });
+        if !ok { return None; }
+    }
+    // 2) serial: ingest each function's pre-compiled bytes + relocations.
+    for (id, ctx) in &jobs {
+        let cc = ctx.compiled_code()?;
+        module.define_function_bytes(*id, &ctx.func, cc.buffer.alignment as u64,
+            cc.code_buffer(), cc.buffer.relocs()).ok()?;
+    }
+    if timing {
+        eprintln!("nova: compiled {} fns across {} threads in {:?}",
+            jobs.len(), ncpu.min(jobs.len()), t0.elapsed());
+    }
+    Some(())
+}
 
 impl Drop for Jit {
     fn drop(&mut self) {
@@ -1061,13 +1127,15 @@ impl Jit {
             ids.insert(name.to_string(), (id, f.params.len()));
         }
 
-        // 2) define each function body
-        let mut ctx = module.make_context();
+        // 2) generate each function body's IR (serial), collecting Contexts to
+        //    compile across cores below.
         let mut fctx = FunctionBuilderContext::new();
         let mut ir = HashMap::new();
+        let mut jobs: Vec<(FuncId, Context)> = Vec::new();
         for name in &names {
             let f = funcs[*name];
             let (id, _) = ids[*name];
+            let mut ctx = module.make_context();
             ctx.func.signature.params.push(AbiParam::new(I64));
             for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
             ctx.func.signature.returns.push(AbiParam::new(I64));
@@ -1080,10 +1148,7 @@ impl Jit {
                 b.finalize();
             }
             ir.insert(name.to_string(), format!("{}", ctx.func));
-            // a compile failure disables the JIT entirely; the VM still runs the
-            // program correctly, so this only ever costs speed, never correctness
-            module.define_function(id, &mut ctx).ok()?;
-            module.clear_context(&mut ctx);
+            jobs.push((id, ctx));
         }
 
         // 3) the f64 track: declare, then define via FloatGen (no deopt path —
@@ -1102,6 +1167,7 @@ impl Jit {
         for name in &fnames {
             let f = funcs[*name];
             let (id, _) = fids[*name];
+            let mut ctx = module.make_context();
             for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(types::F64)); }
             ctx.func.signature.returns.push(AbiParam::new(types::F64));
             {
@@ -1111,8 +1177,7 @@ impl Jit {
                 b.finalize();
             }
             ir.insert(name.to_string(), format!("{}", ctx.func));
-            module.define_function(id, &mut ctx).ok()?;
-            module.clear_context(&mut ctx);
+            jobs.push((id, ctx));
         }
 
         // 4) the numeric (mixed int/float) track: same all-i64 ABI as track 1
@@ -1133,6 +1198,7 @@ impl Jit {
             let f = funcs[*name];
             let (id, _) = nids[*name];
             let rk = nret[*name];
+            let mut ctx = module.make_context();
             ctx.func.signature.params.push(AbiParam::new(I64));
             for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
             ctx.func.signature.returns.push(AbiParam::new(I64));
@@ -1143,10 +1209,11 @@ impl Jit {
                 b.finalize();
             }
             ir.insert(name.to_string(), format!("{}", ctx.func));
-            module.define_function(id, &mut ctx).ok()?;
-            module.clear_context(&mut ctx);
+            jobs.push((id, ctx));
         }
 
+        // compile every collected function across the host's cores, then finalize.
+        define_parallel(&mut module, jobs)?;
         module.finalize_definitions().ok()?;
         let mut code = HashMap::new();
         for (name, (id, arity)) in &ids {
@@ -3000,8 +3067,10 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
         ("fmod", helpers["nova_fmod"]), ("fpow", helpers["nova_fpow"]),
     ].into_iter().collect();
 
-    let mut ctx = module.make_context();
     let mut fctx = FunctionBuilderContext::new();
+    // IR-generation is serial (it declares call refs into the shared module), but
+    // each function's Context is collected and compiled in parallel below.
+    let mut jobs: Vec<(FuncId, Context)> = Vec::new();
 
     // 5a) integer track (FnGen): (deopt_ptr, i64 args...) -> i64, incl. arrays
     let mut names: Vec<&str> = eligible.iter().map(|s| s.as_str()).collect();
@@ -3019,6 +3088,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
     for name in &names {
         let f = funcs[*name];
         let (id, _) = ids[*name];
+        let mut ctx = module.make_context();
         ctx.func.signature.params.push(AbiParam::new(I64));
         for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
         ctx.func.signature.returns.push(AbiParam::new(I64));
@@ -3030,8 +3100,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
             g.lower(&f.body)?;
             b.finalize();
         }
-        module.define_function(id, &mut ctx).ok()?;
-        module.clear_context(&mut ctx);
+        jobs.push((id, ctx));
     }
 
     // 5b) float track (FloatGen): (f64 args...) -> f64, no deopt
@@ -3049,6 +3118,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
     for name in &fnames {
         let f = funcs[*name];
         let (id, _) = fids[*name];
+        let mut ctx = module.make_context();
         for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(types::F64)); }
         ctx.func.signature.returns.push(AbiParam::new(types::F64));
         {
@@ -3057,8 +3127,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
             g.lower(&f.body)?;
             b.finalize();
         }
-        module.define_function(id, &mut ctx).ok()?;
-        module.clear_context(&mut ctx);
+        jobs.push((id, ctx));
     }
 
     // 5c) numeric-mixed track (NumGen): same i64 ABI as the integer track
@@ -3078,6 +3147,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
         let f = funcs[*name];
         let (id, _) = nids[*name];
         let rk = nret[*name];
+        let mut ctx = module.make_context();
         ctx.func.signature.params.push(AbiParam::new(I64));
         for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
         ctx.func.signature.returns.push(AbiParam::new(I64));
@@ -3087,8 +3157,7 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
             g.lower(&f.body)?;
             b.finalize();
         }
-        module.define_function(id, &mut ctx).ok()?;
-        module.clear_context(&mut ctx);
+        jobs.push((id, ctx));
     }
 
     // 6) the C-ABI entry point: `int main(void)` that calls __nova_main_val and
@@ -3117,16 +3186,18 @@ pub fn compile_object(prog: &Program) -> Option<(Vec<u8>, bool)> {
         sig.returns.push(AbiParam::new(I32));
         module.declare_function("main", Linkage::Export, &sig).ok()?
     };
+    let mut ctx = module.make_context();
     ctx.func.signature.returns.push(AbiParam::new(I32));
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
         build_native_entry(&mut b, &mut module, mv_id, track, &producer_args, write_id, print_f64_id);
         b.finalize();
     }
-    module.define_function(main_id, &mut ctx).ok()?;
-    module.clear_context(&mut ctx);
+    jobs.push((main_id, ctx));
 
-    // 7) emit the relocatable object bytes
+    // 7) compile all collected functions across the host's cores, then emit the
+    //    relocatable object bytes.
+    define_parallel(&mut module, jobs)?;
     Some((module.finish().emit().ok()?, needs_runtime))
 }
 
@@ -3598,6 +3669,17 @@ mod jit_tests {
             assert!(!obj.is_empty());
             assert!(needs_rt, "numeric/array program links the runtime: {}", src);
         }
+    }
+    // Exercises the multicore compile path: >= PAR_MIN functions so define_parallel
+    // fans out across the test host's cores. JIT output must still equal the VM
+    // (byte-identical), proving parallel compilation is correctness-preserving.
+    #[test] fn parallel_compile_many_functions_match_vm() {
+        let mut src = String::new();
+        for i in 0..12 { src.push_str(&format!("fn f{i}(n){{ t=0; for k in 0..n {{ t=t+k*{}-{i} }}; t }}\n", i + 1)); }
+        src.push_str("fn agg(){ ");
+        src.push_str(&(0..12).map(|i| format!("f{i}(9)")).collect::<Vec<_>>().join(" + "));
+        src.push_str(" }\nfn main(){ agg() }");
+        same_jit(&src);
     }
     #[test] fn native_object_declines_nonnumeric() {
         for src in [
