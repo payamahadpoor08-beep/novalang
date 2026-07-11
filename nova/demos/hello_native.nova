@@ -1,0 +1,8 @@
+// Constant-string output compiles to a real native binary (Cranelift -> .o ->
+// linked), printed with a `write` syscall and no linked runtime. Build with:
+//   nova build --aot=native demos/hello_native.nova   (or native-arm64 / native-riscv64)
+fn main() {
+    print("Hello from a native Nova binary!");
+    print("built: " + str(2026));
+    print(f"pi rounds to {3}");
+}

@@ -852,7 +852,7 @@ use cranelift::codegen::Context;
 use cranelift::codegen::control::ControlPlane;
 use cranelift::codegen::isa;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Module, Linkage, FuncId};
+use cranelift_module::{Module, Linkage, FuncId, DataId, DataDescription};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 // ---------------------------------------------------------------------------
@@ -2963,6 +2963,11 @@ enum Track { Int, Float, NumInt, NumFloat }
 #[derive(Clone, Copy)]
 enum ArgConst { I(i64), F(f64) }
 
+// A resolved printed value, in source order: either baked constant-string bytes
+// (a read-only data object + its byte length, printed with a `write` syscall) or
+// a number produced by a compiled function on one of the numeric tracks.
+enum RItem { Str(DataId, usize), Num(FuncId, Track, Vec<ArgConst>) }
+
 // Extract a constant literal argument (post-fold): an Int/Float literal or a
 // negated one. `None` if the expression isn't a decidable numeric constant.
 fn const_arg(e: &Expr) -> Option<ArgConst> {
@@ -2974,6 +2979,51 @@ fn const_arg(e: &Expr) -> Option<ArgConst> {
             ArgConst::F(x) => Some(ArgConst::F(-x)),
         },
         _ => None,
+    }
+}
+
+// A compile-time-constant string value: string literals, string concatenation
+// (`"a" + "b"`), f-strings with constant holes (`f"n={3}"`), and `str(...)` over
+// constants. Each piece is formatted exactly as Nova's own `print`/`to_string`
+// (decimal ints, `true`/`false`, raw strings), so the emitted bytes are
+// byte-identical by construction; the build's oracle gate is the backstop.
+// Returns `None` for anything not a decidable constant string — those take the
+// numeric path or fall back to the C/embed build (never wrong output). Note the
+// entry rejects any `main` that isn't purely `print(...)` statements, so an
+// f-string hole referencing a local variable never reaches here.
+fn const_str(e: &Expr) -> Option<String> {
+    match unwrap_at(e) {
+        Expr::Str(s) => Some(s.clone()),
+        Expr::Binary { op: BinOp::Add, lhs, rhs } =>
+            Some(format!("{}{}", const_str(lhs)?, const_str(rhs)?)),
+        Expr::FmtStr(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    FmtPart::Lit(s) => out.push_str(s),
+                    FmtPart::Expr(h) => out.push_str(&const_hole(h)?),
+                }
+            }
+            Some(out)
+        }
+        Expr::Call { callee, args } if (callee == "str" || callee == "to_str") && args.len() == 1 =>
+            const_hole(&args[0]),
+        _ => None,
+    }
+}
+
+// Format a constant interpolation hole / `str()` argument exactly as Nova prints
+// it. Ints -> decimal, bools -> `true`/`false`, strings -> raw. Floats and
+// anything else return `None` (leave that program to the C/embed fallback rather
+// than risk a formatting mismatch — the oracle gate would catch it regardless).
+fn const_hole(e: &Expr) -> Option<String> {
+    match unwrap_at(e) {
+        Expr::Str(s) => Some(s.clone()),
+        Expr::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
+        other => match const_arg(other) {
+            Some(ArgConst::I(n)) => Some(n.to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -2996,10 +3046,13 @@ impl NativeTarget {
     }
 }
 
-// Build a relocatable object for a numeric `print(<expr>)` program, covering the
-// full surface the JIT compiles: the integer track (`FnGen`, incl. local integer
-// arrays/structs), the float track (`FloatGen`), and the numeric-mixed track
-// (`NumGen`, result int or f64-bits). Returns `(object bytes, needs_runtime)` —
+// Build a relocatable object for a `print(<expr>)` program, covering the full
+// surface the JIT compiles: the integer track (`FnGen`, incl. local integer
+// arrays/structs), the float track (`FloatGen`), the numeric-mixed track
+// (`NumGen`, result int or f64-bits), plus constant-string values (literals,
+// concatenation, f-strings with constant holes, `str()` of a constant) which are
+// folded to bytes and printed with a `write` syscall — no runtime needed for a
+// pure-string program. Returns `(object bytes, needs_runtime)` —
 // `needs_runtime` is true iff the object may reference `runtime/nova_native_rt.c`
 // (arena helpers / fmod-fpow / float printer), so the caller knows whether to
 // link it. `None` when the program isn't numeric-native (→ C/embed fallback).
@@ -3020,16 +3073,24 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     //    `fn __nova_main_val_N() { return <expr> }` and let the analysis type it.
     let user_fn = |name: &str| prog.items.iter().any(|it|
         matches!(it, Item::Func(f) if f.name == name));
-    // (producer name, constant args) per printed value
+    // Each printed value is either a compile-time-constant string (baked to bytes
+    // and written directly — no runtime, libc-only) or a numeric value produced by
+    // a compiled function. `slots` records the source print order; `producers`
+    // (and later `items`) carry only the numeric ones.
+    enum Slot { Str(String), Num(usize) } // Num holds an index into `producers`
+    let mut slots: Vec<Slot> = Vec::new();
     let mut producers: Vec<(String, Vec<ArgConst>)> = Vec::new();
     let mut aug = prog.clone();
     for (i, expr) in printed.iter().enumerate() {
+        // a constant string prints via baked bytes — no producer function needed.
+        if let Some(s) = const_str(expr) { slots.push(Slot::Str(s)); continue; }
         let direct = match unwrap_at(expr) {
             Expr::Call { callee, args } if user_fn(callee) =>
                 args.iter().map(const_arg).collect::<Option<Vec<_>>>()
                     .map(|c| (callee.clone(), c)),
             _ => None,
         };
+        let idx = producers.len();
         match direct {
             Some(nv) => producers.push(nv),
             None => {
@@ -3044,6 +3105,7 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
                 producers.push((name, Vec::new()));
             }
         }
+        slots.push(Slot::Num(idx));
     }
 
     // 3) compute the three JIT tracks and resolve each printed value's track. If
@@ -3089,10 +3151,13 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
         let f = funcs[n.as_str()];
         !array_vars(f).is_empty() || !struct_vars(f, &sdefs).is_empty()
     });
-    // multi-print `main`s print each value through the runtime printers, so they
-    // always link the runtime; a single-print integer program keeps its in-IR
-    // itoa and links only libc.
-    let needs_runtime = items.len() > 1 || uses_arena
+    // Link the runtime object when a numeric value is printed through the runtime
+    // printers: any multi-print `main` that prints at least one number, or any
+    // float/numeric function. A single printed number keeps its in-IR itoa, and a
+    // program that only prints constant strings writes baked bytes — both link
+    // only libc.
+    let multi = slots.len() > 1;
+    let needs_runtime = (multi && !items.is_empty()) || uses_arena
         || !feligible.is_empty() || !numeric.is_empty()
         || items.iter().any(|(_, t, _)| matches!(t, Track::Float | Track::NumFloat));
 
@@ -3268,15 +3333,33 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
         sig.params.push(AbiParam::new(I64));
         module.declare_function("nova_print_i64", Linkage::Import, &sig).ok()?
     };
-    // resolve each printed value's producer FuncId (from the right track's map).
-    let resolved: Vec<(FuncId, Track, Vec<ArgConst>)> = items.iter().map(|(name, track, args)| {
-        let id = match track {
-            Track::Int => ids[name].0,
-            Track::Float => fids[name].0,
-            Track::NumInt | Track::NumFloat => nids[name].0,
-        };
-        (id, *track, args.clone())
-    }).collect();
+    // resolve each printed value in source order: a constant string becomes baked
+    // read-only bytes (a data object + its length), a numeric value resolves its
+    // producer FuncId from the right track's map.
+    let mut resolved: Vec<RItem> = Vec::new();
+    for slot in &slots {
+        match slot {
+            Slot::Str(s) => {
+                // `print` appends a newline; bake the string + '\n' as one blob.
+                let bytes = format!("{}\n", s).into_bytes();
+                let len = bytes.len();
+                let data = module.declare_anonymous_data(false, false).ok()?;
+                let mut desc = DataDescription::new();
+                desc.define(bytes.into_boxed_slice());
+                module.define_data(data, &desc).ok()?;
+                resolved.push(RItem::Str(data, len));
+            }
+            Slot::Num(idx) => {
+                let (name, track, args) = &items[*idx];
+                let id = match track {
+                    Track::Int => ids[name].0,
+                    Track::Float => fids[name].0,
+                    Track::NumInt | Track::NumFloat => nids[name].0,
+                };
+                resolved.push(RItem::Num(id, *track, args.clone()));
+            }
+        }
+    }
     let main_id = {
         let mut sig = module.make_signature();
         sig.returns.push(AbiParam::new(I32));
@@ -3287,11 +3370,16 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
         if resolved.len() == 1 {
-            // single print: keep the in-IR itoa path (pure-int program stays libc-only)
-            let (id, track, args) = &resolved[0];
-            build_native_entry(&mut b, &mut module, *id, *track, args, write_id, print_f64_id);
+            match &resolved[0] {
+                // single constant string: emit bytes + write, libc-only.
+                RItem::Str(data, len) =>
+                    build_native_entry_str(&mut b, &mut module, *data, *len, write_id),
+                // single number: keep the in-IR itoa path (pure-int stays libc-only).
+                RItem::Num(id, track, args) =>
+                    build_native_entry(&mut b, &mut module, *id, *track, args, write_id, print_f64_id),
+            }
         } else {
-            build_native_entry_multi(&mut b, &mut module, &resolved, print_i64_id, print_f64_id);
+            build_native_entry_multi(&mut b, &mut module, &resolved, write_id, print_i64_id, print_f64_id);
         }
         b.finalize();
     }
@@ -3301,6 +3389,24 @@ pub fn compile_object(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, 
     //    relocatable object bytes.
     define_parallel(&mut module, jobs)?;
     Some((module.finish().emit().ok()?, needs_runtime))
+}
+
+// Emit the body of the C-ABI `main` for a single constant-string print: write the
+// baked bytes (string + '\n', already in a read-only data object) to fd 1 and
+// return 0. No producer call, no deopt, no runtime — just libc's `write`.
+fn build_native_entry_str(b: &mut FunctionBuilder, module: &mut ObjectModule,
+                          data: DataId, len: usize, write_id: FuncId) {
+    let entry = b.create_block();
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+    let gv = module.declare_data_in_func(data, b.func);
+    let ptr = b.ins().global_value(I64, gv);
+    let n = b.ins().iconst(I64, len as i64);
+    let fd1 = b.ins().iconst(I32, 1);
+    let wref = module.declare_func_in_func(write_id, b.func);
+    b.ins().call(wref, &[fd1, ptr, n]);
+    let ok = b.ins().iconst(I32, 0);
+    b.ins().return_(&[ok]);
 }
 
 // Emit the body of the C-ABI `main`: call the nullary value producer, then print
@@ -3447,12 +3553,13 @@ fn build_native_entry(b: &mut FunctionBuilder, module: &mut ObjectModule,
     b.ins().return_(&[one]);
 }
 
-// Emit the entry for a multi-`print` main: call each printed value's producer and
-// print it (nova_print_i64 / nova_print_f64 from the runtime) in source order,
-// then return 0. Any producer that deopts jumps to a shared diverge path
-// (return 1, no further output) so the oracle gate falls back — never wrong.
+// Emit the entry for a multi-`print` main: print each value in source order — a
+// constant string via a `write` of its baked bytes, a number via the runtime
+// printers (nova_print_i64 / nova_print_f64) — then return 0. Any producer that
+// deopts jumps to a shared diverge path (return 1, no further output) so the
+// oracle gate falls back — never wrong.
 fn build_native_entry_multi(b: &mut FunctionBuilder, module: &mut ObjectModule,
-                            items: &[(FuncId, Track, Vec<ArgConst>)],
+                            items: &[RItem], write_id: FuncId,
                             print_i64_id: FuncId, print_f64_id: FuncId) {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -3462,8 +3569,21 @@ fn build_native_entry_multi(b: &mut FunctionBuilder, module: &mut ObjectModule,
         StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
     let diverge_blk = b.create_block();
 
-    for (id, track, args) in items {
-        let pref = module.declare_func_in_func(*id, b.func);
+    for it in items {
+        let (id, track, args) = match it {
+            RItem::Str(data, len) => {
+                // constant string: write its baked bytes (string + '\n'), no deopt.
+                let gv = module.declare_data_in_func(*data, b.func);
+                let ptr = b.ins().global_value(I64, gv);
+                let n = b.ins().iconst(I64, *len as i64);
+                let fd1 = b.ins().iconst(I32, 1);
+                let wref = module.declare_func_in_func(write_id, b.func);
+                b.ins().call(wref, &[fd1, ptr, n]);
+                continue;
+            }
+            RItem::Num(id, track, args) => (*id, *track, args),
+        };
+        let pref = module.declare_func_in_func(id, b.func);
         let mut argvals: Vec<Value> = Vec::new();
         for a in args {
             argvals.push(match a {
@@ -3881,15 +4001,33 @@ mod jit_tests {
     }
     #[test] fn native_object_declines_nonnumeric() {
         for src in [
-            "fn main(){ print(\"hi\") }",           // string arg (boxed tier)
-            "fn main(){ print(true) }",             // bool arg
-            "fn main(){ print(1); print(\"x\") }",  // mixed: a string print
-            "fn main(){ let x=1; print(x) }",       // non-print statement
+            "fn main(){ print(true) }",                          // bool arg (boxed tier)
+            "fn main(){ let x=1; print(x) }",                    // non-print statement
+            "fn main(){ print(f\"pi={3.14}\") }",                // float f-string hole
+            "fn greet(n){ n } fn main(){ print(greet(\"hi\")) }", // runtime string via fn
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
             assert!(super::compile_object(&prog, super::NativeTarget::Host).is_none(),
-                    "must decline non-numeric program: {}", src);
+                    "must decline non-native program: {}", src);
+        }
+    }
+    // Constant-string programs compile to a real object: a bare literal, string
+    // concatenation, an f-string with a constant hole, `str()` of a constant, and
+    // a mix of string + numeric prints. The build's oracle gate verifies the bytes.
+    #[test] fn native_object_string_programs() {
+        for src in [
+            "fn main(){ print(\"Hello, World!\") }",             // single literal
+            "fn main(){ print(\"a\" + \"b\") }",                  // concatenation
+            "fn main(){ print(f\"n={42}\") }",                   // f-string, const hole
+            "fn main(){ print(\"x=\" + str(7)) }",               // str() of a constant
+            "fn main(){ print(\"result:\"); print(6*7) }",       // mixed string + number
+        ] {
+            let mut prog = parse_program(src).expect("parse");
+            fold_program(&mut prog);
+            let (obj, _) = super::compile_object(&prog, super::NativeTarget::Host)
+                .unwrap_or_else(|| panic!("must emit an object: {}", src));
+            assert!(!obj.is_empty(), "non-empty object: {}", src);
         }
     }
 }
