@@ -21,6 +21,10 @@ use std::process::Command;
 // falls back to the embed build — never wrong output, only a different tier).
 // the AOT runtime, embedded so built binaries need no Nova installation
 const NOVA_RT: &str = include_str!("../runtime/nova_rt.c");
+// runtime primitives for the native object backend (arena + fmod/fpow + float
+// printer), linked alongside the Cranelift-emitted object — not program logic.
+#[cfg(feature = "jit")]
+const NOVA_NATIVE_RT: &str = include_str!("../runtime/nova_native_rt.c");
 
 pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_flags: &[String])
     -> Result<Option<crate::aot::Tier>, String>
@@ -129,9 +133,9 @@ pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_f
 fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
     -> Result<Option<crate::aot::Tier>, String>
 {
-    let obj = match crate::jit::compile_object(program) {
-        Some(bytes) => bytes,
-        None => return Ok(None), // not integer-native -> fall back
+    let (obj, needs_runtime) = match crate::jit::compile_object(program) {
+        Some(v) => v,
+        None => return Ok(None), // not numeric-native -> fall back
     };
     if let Some(dir) = out.parent() {
         if !dir.as_os_str().is_empty() {
@@ -140,12 +144,33 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
     }
     let objp = out.with_extension("o");
     std::fs::write(&objp, &obj).map_err(|e| e.to_string())?;
-    // link with cc (libc + crt); cc compiles no program logic here.
-    let status = Command::new("cc")
-        .arg("-O2").arg("-o").arg(out).arg(&objp)
-        .status().map_err(|e| format!("cannot run cc: {}", e))?;
+    // For float/array/numeric programs, compile the runtime primitives object
+    // (arena arrays + fmod/fpow + the fmt_f64 float printer) and link it in. This
+    // is runtime, NOT program logic — exactly like the JIT linking Rust helpers.
+    let rtp = out.parent().unwrap_or(Path::new(".")).join("nova_native_rt.o");
+    let rtc = out.parent().unwrap_or(Path::new(".")).join("nova_native_rt.c");
+    if needs_runtime {
+        std::fs::write(&rtc, NOVA_NATIVE_RT).map_err(|e| e.to_string())?;
+        let st = Command::new("cc").arg("-O2").arg("-c").arg(&rtc).arg("-o").arg(&rtp)
+            .status().map_err(|e| format!("cannot run cc: {}", e))?;
+        if !st.success() {
+            let _ = std::fs::remove_file(&objp); let _ = std::fs::remove_file(&rtc);
+            return Ok(None);
+        }
+    }
+    // link with cc (libc + crt; cc compiles no program logic here). `-lm` for the
+    // runtime's fmod/pow when linked.
+    let mut cmd = Command::new("cc");
+    cmd.arg("-O2").arg("-o").arg(out).arg(&objp);
+    if needs_runtime { cmd.arg(&rtp).arg("-lm"); }
+    let status = cmd.status().map_err(|e| format!("cannot run cc: {}", e))?;
+    let cleanup_rt = || {
+        let _ = std::fs::remove_file(&rtp);
+        let _ = std::fs::remove_file(&rtc);
+    };
     if !status.success() {
         let _ = std::fs::remove_file(&objp);
+        cleanup_rt();
         return Ok(None);
     }
     // oracle gate: keep the native binary only on a byte-identical match.
@@ -153,6 +178,7 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program)
     let expect = Command::new(&exe).arg("run").arg(entry).output()
         .map_err(|e| e.to_string())?;
     let got = Command::new(out).output().map_err(|e| e.to_string())?;
+    cleanup_rt();
     if expect.stdout == got.stdout && expect.status.code() == got.status.code() {
         // keep the .o alongside the binary as proof of the object path
         Ok(Some(crate::aot::Tier::Typed))
