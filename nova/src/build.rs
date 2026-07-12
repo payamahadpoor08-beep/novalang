@@ -25,6 +25,10 @@ const NOVA_RT: &str = include_str!("../runtime/nova_rt.c");
 // printer), linked alongside the Cranelift-emitted object — not program logic.
 #[cfg(feature = "jit")]
 const NOVA_NATIVE_RT: &str = include_str!("../runtime/nova_native_rt.c");
+// The general boxed-tier runtime (tagged values over a pointer ABI), linked with
+// the Cranelift-emitted object for arbitrary scalar/string programs.
+#[cfg(feature = "jit")]
+const NOVA_BOX_RT: &str = include_str!("../runtime/nova_box_rt.c");
 
 pub fn build_aot(entry: &str, out: &Path, backend: &crate::aot::Backend, extra_flags: &[String])
     -> Result<Option<crate::aot::Tier>, String>
@@ -169,10 +173,22 @@ impl NativeArch {
 fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: NativeArch)
     -> Result<Option<crate::aot::Tier>, String>
 {
-    let (obj, needs_runtime) = match crate::jit::compile_object(program, arch.target()) {
-        Some(v) => v,
-        None => return Ok(None), // not native-able -> fall back
-    };
+    // Two native paths, tried in order: (1) `compile_object` — the fast typed/
+    // string/const path (fib/mandel/sieve/const-strings on their optimal tiers),
+    // linking nova_native_rt.c only when it uses arena/float/string helpers; on
+    // decline, (2) `compile_object_boxed` — the GENERAL boxed tier (arbitrary
+    // scalar/string programs: locals, loops, conditionals, runtime string
+    // building), always linking nova_box_rt.c. `rt_src` is the runtime C source to
+    // compile+link, or None for a libc-only binary.
+    let (obj, rt_src): (Vec<u8>, Option<&'static str>) =
+        match crate::jit::compile_object(program, arch.target()) {
+            Some((obj, true)) => (obj, Some(NOVA_NATIVE_RT)),
+            Some((obj, false)) => (obj, None),
+            None => match crate::jit::compile_object_boxed(program, arch.target()) {
+                Some((obj, _)) => (obj, Some(NOVA_BOX_RT)),
+                None => return Ok(None), // not native-able -> fall back
+            },
+        };
     let (cc, runner) = arch.tools();
     // a cross target we have no linker for -> fall back (host C/embed AOT).
     if arch != NativeArch::Host && which(cc).is_none() { return Ok(None); }
@@ -193,8 +209,8 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
         let _ = std::fs::remove_file(&rtp);
         let _ = std::fs::remove_file(&rtc);
     };
-    if needs_runtime {
-        std::fs::write(&rtc, NOVA_NATIVE_RT).map_err(|e| e.to_string())?;
+    if let Some(src) = rt_src {
+        std::fs::write(&rtc, src).map_err(|e| e.to_string())?;
         let st = Command::new(cc).arg("-O2").arg("-c").arg(&rtc).arg("-o").arg(&rtp)
             .status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
         if !st.success() {
@@ -209,7 +225,7 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
     cmd.arg("-O2");
     if arch != NativeArch::Host { cmd.arg("-static").arg("-no-pie"); }
     cmd.arg("-o").arg(out).arg(&objp);
-    if needs_runtime { cmd.arg(&rtp).arg("-lm"); }
+    if rt_src.is_some() { cmd.arg(&rtp).arg("-lm"); }
     let status = cmd.status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
     if !status.success() {
         let _ = std::fs::remove_file(&objp);

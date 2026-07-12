@@ -23,7 +23,7 @@ use crate::ast::*;
 // `TieredJit`, and their codegen — simply isn't compiled, and the VM runs pure
 // bytecode. `Jit` and `TieredJit` are re-exported so callers see `jit::Jit` etc.
 #[cfg(feature = "jit")]
-pub use cl::{Jit, TieredJit, compile_object, NativeTarget};
+pub use cl::{Jit, TieredJit, compile_object, compile_object_boxed, NativeTarget};
 
 // functions with more parameters than this stay on the VM (keeps the call ABI
 // dispatch in `raw_call` finite)
@@ -4114,6 +4114,697 @@ fn build_native_entry_multi(b: &mut FunctionBuilder, module: &mut ObjectModule,
     b.ins().return_(&[one]);
 }
 
+// ===========================================================================
+// BoxGen — the GENERAL native tier: compile arbitrary scalar/string programs
+// (locals, loops, conditionals, runtime string building, multi-statement main),
+// not just `print(<const/typed-value>)`. It is the Cranelift port of the C
+// backend's *boxed* tier (src/aot.rs `BxEmit`): every Nova value is an i64 HANDLE
+// to a heap `BV` (runtime/nova_box_rt.c), operators are `nv_*` runtime calls, and
+// control flow is Cranelift blocks gated on `nv_truthy`. `compile_object` (the
+// fast typed/string/const path) is tried first and keeps fib/mandel/sieve on
+// their optimal tiers; BoxGen only catches what that path declines. Correctness
+// is backed by the build's oracle gate (byte-diff vs `nova run`) exactly as the C
+// boxed tier is — an overflowing i64 program simply diverges from the
+// interpreter's BigInt and falls back.
+//
+// Phase 1 surface (a faithful scalar/string subset of `analyze_boxed`, containers
+// deferred): int/float/bool/null/string; let/assign/if/while/for-range/return/
+// expr/break/continue; arithmetic/comparison/logic/bitwise/concat; f-strings;
+// `len`; `print`; and user calls. Anything else (arrays/maps/structs, foreach,
+// match, try, closures, generators) makes the program box-ineligible so it falls
+// back cleanly to the C/embed AOT.
+// ===========================================================================
+
+// Collect every local/loop-var name declared anywhere in a body (mirrors
+// aot.rs::collect_vars) so BoxGen can pre-declare them all as Cranelift Variables
+// initialised to `nv_null`, matching how `BxEmit::func` zero-inits its `NV`s.
+fn box_collect_vars(body: &[Stmt], out: &mut Vec<String>) {
+    for s in body {
+        match s {
+            Stmt::Let { name, .. } | Stmt::Assign { name, .. } => {
+                if !out.contains(name) { out.push(name.clone()); }
+            }
+            Stmt::ForRange { var, body, .. } => {
+                if !out.contains(var) { out.push(var.clone()); }
+                box_collect_vars(body, out);
+            }
+            Stmt::If { then, els, .. } => {
+                box_collect_vars(then, out);
+                if let Some(e) = els { box_collect_vars(e, out); }
+            }
+            Stmt::While { body, .. } => box_collect_vars(body, out),
+            _ => {}
+        }
+    }
+}
+
+// Is `e` a Phase-1 boxed expression? Mirrors `bx_expr` (aot.rs) minus the
+// container forms (Array/Index/RangeLit/StructLit/slice) which are Phase 2.
+fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>) -> bool {
+    match strip_at(e) {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::Ident(n) => scopes.iter().any(|sc| sc.contains(n)),
+        Expr::Unary { op, expr } =>
+            matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && box_expr_ok(expr, funcs, scopes),
+        Expr::Binary { op, lhs, rhs } =>
+            !matches!(op, BinOp::Pow) && box_expr_ok(lhs, funcs, scopes) && box_expr_ok(rhs, funcs, scopes),
+        Expr::If { cond, then, els } =>
+            box_expr_ok(cond, funcs, scopes) && box_expr_ok(then, funcs, scopes) && box_expr_ok(els, funcs, scopes),
+        // if-expression branches are tail-only Blocks; a statement-carrying block
+        // in expression position isn't part of the Phase-1 surface.
+        Expr::Block { stmts, tail } =>
+            stmts.is_empty() && tail.as_ref().map_or(false, |t| box_expr_ok(t, funcs, scopes)),
+        Expr::FmtStr(parts) => parts.iter().all(|p| match p {
+            FmtPart::Lit(_) => true,
+            FmtPart::Expr(e) => box_expr_ok(e, funcs, scopes),
+        }),
+        Expr::Call { callee, args } => {
+            let is_str = (callee == "str" || callee == "to_str") && args.len() == 1;
+            let ok = funcs.contains(callee) || callee == "print" || callee == "len" || is_str;
+            ok && args.iter().all(|a| box_expr_ok(a, funcs, scopes))
+                && !(callee == "print" && args.len() != 1)
+                && !(callee == "len" && args.len() != 1)
+        }
+        _ => false,
+    }
+}
+
+// Is statement `s` Phase-1 boxed? Mirrors `bx_stmt` (aot.rs) minus containers
+// (IndexAssign/FieldAssign/ForEach). The scope tracking matches `bx_stmt` so a
+// use-before-declaration or redeclaration is rejected identically.
+fn box_stmt_ok(s: &Stmt, funcs: &HashSet<String>, scopes: &mut Vec<HashSet<String>>, allow_ret: bool) -> bool {
+    match s {
+        Stmt::Return(Some(e)) => allow_ret && box_expr_ok(e, funcs, scopes),
+        Stmt::Return(None) => true,
+        Stmt::Expr(e) => box_expr_ok(e, funcs, scopes),
+        Stmt::Let { name, value, .. } => {
+            if !box_expr_ok(value, funcs, scopes) { return false; }
+            if scopes.iter().any(|sc| sc.contains(name)) { return false; }
+            scopes.last_mut().unwrap().insert(name.clone());
+            true
+        }
+        Stmt::Assign { name, value } => {
+            if !box_expr_ok(value, funcs, scopes) { return false; }
+            if !scopes.iter().any(|sc| sc.contains(name)) {
+                scopes.last_mut().unwrap().insert(name.clone());
+            }
+            true
+        }
+        Stmt::If { cond, then, els } => {
+            if !box_expr_ok(cond, funcs, scopes) { return false; }
+            scopes.push(HashSet::new());
+            let a = then.iter().all(|s| box_stmt_ok(s, funcs, scopes, allow_ret));
+            scopes.pop();
+            scopes.push(HashSet::new());
+            let b = els.as_ref().map_or(true, |e| e.iter().all(|s| box_stmt_ok(s, funcs, scopes, allow_ret)));
+            scopes.pop();
+            a && b
+        }
+        Stmt::While { cond, body } => {
+            if !box_expr_ok(cond, funcs, scopes) { return false; }
+            scopes.push(HashSet::new());
+            let r = body.iter().all(|s| box_stmt_ok(s, funcs, scopes, allow_ret));
+            scopes.pop();
+            r
+        }
+        Stmt::ForRange { var, start, end, body, .. } => {
+            if !box_expr_ok(start, funcs, scopes) || !box_expr_ok(end, funcs, scopes) { return false; }
+            if scopes.iter().any(|sc| sc.contains(var)) { return false; }
+            scopes.push(HashSet::new());
+            scopes.last_mut().unwrap().insert(var.clone());
+            let r = body.iter().all(|s| box_stmt_ok(s, funcs, scopes, allow_ret));
+            scopes.pop();
+            r
+        }
+        // `break` is Phase 1; `continue` is deferred — correctly compiling a
+        // `continue` inside a for-range needs the counter incremented before the
+        // re-test (else the oracle-gate build would spin), so it falls back
+        // cleanly for now rather than risk it.
+        Stmt::Break(None) => true,
+        _ => false,
+    }
+}
+
+// A whole-program eligibility check: every item is a function (Const/Test are
+// skipped, mirroring `analyze_boxed`), `main` exists and takes no params, and
+// every function body is Phase-1 boxed (non-`main` functions may `return`).
+fn box_eligible(prog: &Program) -> bool {
+    let mut funcs: HashSet<String> = HashSet::new();
+    let mut has_main = false;
+    for it in &prog.items {
+        match it {
+            Item::Func(f) => { funcs.insert(f.name.clone()); if f.name == "main" { has_main = true; } }
+            Item::Const { .. } | Item::Test(_) => {}
+            _ => return false,
+        }
+    }
+    if !has_main { return false; }
+    for it in &prog.items {
+        if let Item::Func(f) = it {
+            if f.name == "main" && !f.params.is_empty() { return false; }
+            // The parser wraps a function's trailing expression as `Return(Some(..))`,
+            // including in `main` (e.g. `print(x)` becomes the tail return). BoxGen
+            // handles a `Return` in main by evaluating it for side effects and then
+            // returning i32 0, so returns are allowed everywhere.
+            let mut scopes = vec![HashSet::new()];
+            for p in &f.params { scopes.last_mut().unwrap().insert(p.clone()); }
+            if !f.body.iter().all(|s| box_stmt_ok(s, &funcs, &mut scopes, true)) { return false; }
+        }
+    }
+    true
+}
+
+// The full nv_* runtime import table BoxGen lowers to (all from nova_box_rt.c).
+#[derive(Clone, Copy)]
+struct BoxRt {
+    int: FuncId, float: FuncId, boolean: FuncId, null: FuncId, str: FuncId,
+    add: FuncId, sub: FuncId, mul: FuncId, div: FuncId, rem: FuncId,
+    lt: FuncId, le: FuncId, gt: FuncId, ge: FuncId, eq: FuncId, ne: FuncId,
+    bit: FuncId, neg: FuncId, not: FuncId, bitnot: FuncId,
+    truthy: FuncId, concat: FuncId, tostr: FuncId, len: FuncId,
+    as_int: FuncId, print: FuncId,
+}
+
+struct BoxGen<'a, 'b> {
+    b: &'a mut FunctionBuilder<'b>,
+    module: &'a mut dyn Module,
+    ids: &'a HashMap<String, (FuncId, usize)>, // user boxed functions
+    rt: BoxRt,
+    vars: HashMap<String, Variable>,
+    n_vars: usize,
+    loops: Vec<LoopCtx>,
+    returned: bool,
+    is_main: bool,
+}
+
+impl<'a, 'b> BoxGen<'a, 'b> {
+    fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut dyn Module,
+           ids: &'a HashMap<String, (FuncId, usize)>, rt: BoxRt,
+           params: &[String], body: &[Stmt], is_main: bool) -> Self {
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let pv: Vec<Value> = b.block_params(entry).to_vec();
+        let mut g = BoxGen {
+            b, module, ids, rt, vars: HashMap::new(), n_vars: 0,
+            loops: Vec::new(), returned: false, is_main,
+        };
+        for (i, p) in params.iter().enumerate() {
+            let v = g.declare(p);
+            g.b.def_var(v, pv[i]);
+        }
+        // pre-declare every other local, initialised to nv_null (mirror BxEmit).
+        let mut vars = Vec::new();
+        box_collect_vars(body, &mut vars);
+        for name in &vars {
+            if !params.contains(name) {
+                let var = g.declare(name);
+                let nul = g.rt_call(g.rt.null, &[]);
+                g.b.def_var(var, nul);
+            }
+        }
+        g
+    }
+
+    fn declare(&mut self, name: &str) -> Variable {
+        if let Some(v) = self.vars.get(name) { return *v; }
+        let v = Variable::new(self.n_vars);
+        self.n_vars += 1;
+        self.b.declare_var(v, I64);
+        self.vars.insert(name.to_string(), v);
+        v
+    }
+    fn fresh_var(&mut self) -> Variable {
+        let v = Variable::new(self.n_vars);
+        self.n_vars += 1;
+        self.b.declare_var(v, I64);
+        v
+    }
+
+    // call a runtime helper that returns an i64 handle.
+    fn rt_call(&mut self, id: FuncId, args: &[Value]) -> Value {
+        let f = self.module.declare_func_in_func(id, self.b.func);
+        let call = self.b.ins().call(f, args);
+        self.b.inst_results(call)[0]
+    }
+    // call a void runtime helper (nv_print).
+    fn rt_void(&mut self, id: FuncId, args: &[Value]) {
+        let f = self.module.declare_func_in_func(id, self.b.func);
+        self.b.ins().call(f, args);
+    }
+
+    // box literal bytes into a string handle via nv_str(ptr, len).
+    fn lit(&mut self, bytes: &[u8]) -> Option<Value> {
+        let data = self.module.declare_anonymous_data(false, false).ok()?;
+        let mut desc = DataDescription::new();
+        desc.define(bytes.to_vec().into_boxed_slice());
+        self.module.define_data(data, &desc).ok()?;
+        let gv = self.module.declare_data_in_func(data, self.b.func);
+        let ptr = self.b.ins().global_value(I64, gv);
+        let n = self.b.ins().iconst(I64, bytes.len() as i64);
+        Some(self.rt_call(self.rt.str, &[ptr, n]))
+    }
+
+    fn lower(&mut self, body: &[Stmt]) -> Option<()> {
+        let n = body.len();
+        for (i, s) in body.iter().enumerate() {
+            if self.returned { break; }
+            // a non-`main` function's trailing expression is its return value
+            // (Nova's implicit return), matching FnGen/the interpreter.
+            if i + 1 == n && !self.is_main {
+                if let Stmt::Expr(e) = s {
+                    let v = self.expr(e)?;
+                    self.b.ins().return_(&[v]);
+                    self.returned = true;
+                    break;
+                }
+            }
+            self.stmt(s)?;
+        }
+        if !self.returned {
+            if self.is_main {
+                let z = self.b.ins().iconst(I32, 0);
+                self.b.ins().return_(&[z]);
+            } else {
+                let nul = self.rt_call(self.rt.null, &[]);
+                self.b.ins().return_(&[nul]);
+            }
+        }
+        Some(())
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        if self.returned { return Some(()); }
+        match s {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+                let v = self.expr(value)?;
+                let var = self.declare(name);
+                self.b.def_var(var, v);
+            }
+            Stmt::Expr(e) => { self.expr(e)?; }
+            Stmt::Return(val) => {
+                if self.is_main {
+                    // main returns i32 0 regardless (its value is never printed).
+                    if let Some(e) = val { self.expr(e)?; }
+                    let z = self.b.ins().iconst(I32, 0);
+                    self.b.ins().return_(&[z]);
+                } else {
+                    let v = match val { Some(e) => self.expr(e)?, None => self.rt_call(self.rt.null, &[]) };
+                    self.b.ins().return_(&[v]);
+                }
+                self.returned = true;
+            }
+            Stmt::If { cond, then, els } => self.if_stmt(cond, then, els.as_deref())?,
+            Stmt::While { cond, body } => self.while_stmt(cond, body)?,
+            Stmt::ForRange { var, start, end, inclusive, body } =>
+                self.for_range(var, start, end, *inclusive, body)?,
+            Stmt::Break(None) => {
+                let exit = self.loops.last()?.exit;
+                self.b.ins().jump(exit, &[]);
+                self.returned = true;
+            }
+            // `continue` is excluded by box eligibility (see box_stmt_ok); reject
+            // defensively so no for-range back-edge can ever skip the increment.
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn if_stmt(&mut self, cond: &Expr, then: &[Stmt], els: Option<&[Stmt]>) -> Option<()> {
+        let c = self.truthy(cond)?;
+        let then_b = self.b.create_block();
+        let else_b = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.ins().brif(c, then_b, &[], else_b, &[]);
+
+        self.b.switch_to_block(then_b);
+        self.b.seal_block(then_b);
+        self.returned = false;
+        for s in then { self.stmt(s)?; }
+        if !self.returned { self.b.ins().jump(merge, &[]); }
+
+        self.b.switch_to_block(else_b);
+        self.b.seal_block(else_b);
+        self.returned = false;
+        if let Some(els) = els { for s in els { self.stmt(s)?; } }
+        if !self.returned { self.b.ins().jump(merge, &[]); }
+
+        self.b.switch_to_block(merge);
+        self.b.seal_block(merge);
+        self.returned = false;
+        Some(())
+    }
+
+    fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> Option<()> {
+        let header = self.b.create_block();
+        let body_b = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        let c = self.truthy(cond)?;
+        self.b.ins().brif(c, body_b, &[], exit, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b);
+        self.loops.push(LoopCtx { header, exit });
+        self.returned = false;
+        for s in body { self.stmt(s)?; }
+        if !self.returned { self.b.ins().jump(header, &[]); }
+        self.loops.pop();
+
+        self.b.seal_block(header);
+        self.b.switch_to_block(exit);
+        self.b.seal_block(exit);
+        self.returned = false;
+        Some(())
+    }
+
+    // for-range with the counter as a Cranelift Variable, incremented inline at
+    // the end of the body (mirrors BxEmit's `for (i64 __c=xint(s); __c<__lim;
+    // __c++) { var = nv_int(__c); ... }`). `continue` is box-ineligible, so there
+    // is no back-edge that could bypass this increment.
+    fn for_range(&mut self, var: &str, start: &Expr, end: &Expr, inclusive: bool, body: &[Stmt]) -> Option<()> {
+        let sv = self.expr(start)?;
+        let ev = self.expr(end)?;
+        let s = self.rt_call(self.rt.as_int, &[sv]);
+        let e = self.rt_call(self.rt.as_int, &[ev]);
+        let ctr = self.fresh_var();
+        self.b.def_var(ctr, s);
+        let limit = self.fresh_var();
+        self.b.def_var(limit, e);
+
+        let header = self.b.create_block();
+        let body_b = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        let i = self.b.use_var(ctr);
+        let lim = self.b.use_var(limit);
+        let cc = if inclusive { IntCC::SignedLessThanOrEqual } else { IntCC::SignedLessThan };
+        let cont = self.b.ins().icmp(cc, i, lim);
+        self.b.ins().brif(cont, body_b, &[], exit, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b);
+        let cur = self.b.use_var(ctr);
+        let boxed = self.rt_call(self.rt.int, &[cur]);
+        let iv = self.declare(var);
+        self.b.def_var(iv, boxed);
+        self.loops.push(LoopCtx { header, exit });
+        self.returned = false;
+        for st in body { self.stmt(st)?; }
+        if !self.returned {
+            let cur = self.b.use_var(ctr);
+            let one = self.b.ins().iconst(I64, 1);
+            let next = self.b.ins().iadd(cur, one);
+            self.b.def_var(ctr, next);
+            self.b.ins().jump(header, &[]);
+        }
+        self.loops.pop();
+
+        self.b.seal_block(header);
+        self.b.switch_to_block(exit);
+        self.b.seal_block(exit);
+        self.returned = false;
+        Some(())
+    }
+
+    // nv_truthy(handle) -> raw i64 (0/1) for brif.
+    fn truthy(&mut self, e: &Expr) -> Option<Value> {
+        let v = self.expr(e)?;
+        Some(self.rt_call(self.rt.truthy, &[v]))
+    }
+
+    // Short-circuit `&&`/`||`, producing nv_bool(...) — matches BxEmit exactly:
+    // `a && b` = a truthy ? nv_bool(truthy(b)) : nv_bool(false);
+    // `a || b` = a truthy ? nv_bool(true) : nv_bool(truthy(b)).
+    fn logic(&mut self, is_and: bool, lhs: &Expr, rhs: &Expr) -> Option<Value> {
+        let a = self.expr(lhs)?;
+        let at = self.rt_call(self.rt.truthy, &[a]);
+        let rhs_b = self.b.create_block();
+        let short_b = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, I64);
+        // for &&, a-truthy -> evaluate rhs; for ||, a-truthy -> short (true).
+        let (t_blk, f_blk) = if is_and { (rhs_b, short_b) } else { (short_b, rhs_b) };
+        self.b.ins().brif(at, t_blk, &[], f_blk, &[]);
+
+        self.b.switch_to_block(rhs_b);
+        self.b.seal_block(rhs_b);
+        let r = self.expr(rhs)?;
+        let rtt = self.rt_call(self.rt.truthy, &[r]);
+        let rb = self.rt_call(self.rt.boolean, &[rtt]);
+        self.b.ins().jump(merge, &[rb]);
+
+        self.b.switch_to_block(short_b);
+        self.b.seal_block(short_b);
+        let konst = self.b.ins().iconst(I64, if is_and { 0 } else { 1 });
+        let cb = self.rt_call(self.rt.boolean, &[konst]);
+        self.b.ins().jump(merge, &[cb]);
+
+        self.b.switch_to_block(merge);
+        self.b.seal_block(merge);
+        Some(self.b.block_params(merge)[0])
+    }
+
+    fn binop(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Value> {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            return self.logic(matches!(op, BinOp::And), lhs, rhs);
+        }
+        let a = self.expr(lhs)?;
+        let b = self.expr(rhs)?;
+        let id = match op {
+            BinOp::Add => self.rt.add, BinOp::Sub => self.rt.sub, BinOp::Mul => self.rt.mul,
+            BinOp::Div => self.rt.div, BinOp::Rem => self.rt.rem,
+            BinOp::Lt => self.rt.lt, BinOp::Le => self.rt.le, BinOp::Gt => self.rt.gt, BinOp::Ge => self.rt.ge,
+            BinOp::Eq => self.rt.eq, BinOp::Ne => self.rt.ne,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                let ch = match op {
+                    BinOp::BitAnd => '&', BinOp::BitOr => '|', BinOp::BitXor => '^',
+                    BinOp::Shl => '<', _ => '>',
+                } as i64;
+                let opc = self.b.ins().iconst(I64, ch);
+                return Some(self.rt_call(self.rt.bit, &[a, b, opc]));
+            }
+            // Pow (box-ineligible) and any other operator -> clean fallback.
+            _ => return None,
+        };
+        Some(self.rt_call(id, &[a, b]))
+    }
+
+    fn expr(&mut self, e: &Expr) -> Option<Value> {
+        match strip_at(e) {
+            Expr::Int(n) => { let c = self.b.ins().iconst(I64, *n); Some(self.rt_call(self.rt.int, &[c])) }
+            Expr::Float(x) => { let f = self.b.ins().f64const(*x); Some(self.rt_call(self.rt.float, &[f])) }
+            Expr::Bool(v) => { let c = self.b.ins().iconst(I64, *v as i64); Some(self.rt_call(self.rt.boolean, &[c])) }
+            Expr::Null => Some(self.rt_call(self.rt.null, &[])),
+            Expr::Str(s) => self.lit(s.as_bytes()),
+            Expr::Ident(name) => { let v = *self.vars.get(name)?; Some(self.b.use_var(v)) }
+            Expr::Unary { op, expr } => {
+                let v = self.expr(expr)?;
+                let id = match op { UnOp::Neg => self.rt.neg, UnOp::Not => self.rt.not, UnOp::BitNot => self.rt.bitnot };
+                Some(self.rt_call(id, &[v]))
+            }
+            Expr::Binary { op, lhs, rhs } => self.binop(*op, lhs, rhs),
+            Expr::If { cond, then, els } => {
+                let c = self.truthy(cond)?;
+                let then_b = self.b.create_block();
+                let else_b = self.b.create_block();
+                let merge = self.b.create_block();
+                self.b.append_block_param(merge, I64);
+                self.b.ins().brif(c, then_b, &[], else_b, &[]);
+                self.b.switch_to_block(then_b);
+                self.b.seal_block(then_b);
+                let tv = self.expr(then)?;
+                self.b.ins().jump(merge, &[tv]);
+                self.b.switch_to_block(else_b);
+                self.b.seal_block(else_b);
+                let ev = self.expr(els)?;
+                self.b.ins().jump(merge, &[ev]);
+                self.b.switch_to_block(merge);
+                self.b.seal_block(merge);
+                Some(self.b.block_params(merge)[0])
+            }
+            Expr::Block { stmts, tail } => {
+                // eligibility guarantees `stmts` is empty in the Phase-1 surface.
+                for s in stmts { self.stmt(s)?; }
+                match tail { Some(t) => self.expr(t), None => Some(self.rt_call(self.rt.null, &[])) }
+            }
+            Expr::FmtStr(parts) => {
+                let mut acc = self.lit(b"")?;
+                for p in parts {
+                    let piece = match p {
+                        FmtPart::Lit(s) => self.lit(s.as_bytes())?,
+                        FmtPart::Expr(h) => { let v = self.expr(h)?; self.rt_call(self.rt.tostr, &[v]) }
+                    };
+                    acc = self.rt_call(self.rt.concat, &[acc, piece]);
+                }
+                Some(acc)
+            }
+            Expr::Call { callee, args } => {
+                if callee == "print" && args.len() == 1 {
+                    let v = self.expr(&args[0])?;
+                    self.rt_void(self.rt.print, &[v]);
+                    return Some(self.rt_call(self.rt.null, &[]));
+                }
+                if callee == "len" && args.len() == 1 {
+                    let v = self.expr(&args[0])?;
+                    return Some(self.rt_call(self.rt.len, &[v]));
+                }
+                // str(x)/to_str(x): x's display string (byte-identical to interp),
+                // via nv_tostr — a no-op on values already strings.
+                if (callee == "str" || callee == "to_str") && args.len() == 1 {
+                    let v = self.expr(&args[0])?;
+                    return Some(self.rt_call(self.rt.tostr, &[v]));
+                }
+                let (id, arity) = self.ids.get(callee).copied()?;
+                if args.len() != arity { return None; }
+                let mut av = Vec::new();
+                for a in args { av.push(self.expr(a)?); }
+                let f = self.module.declare_func_in_func(id, self.b.func);
+                let call = self.b.ins().call(f, &av);
+                Some(self.b.inst_results(call)[0])
+            }
+            _ => None,
+        }
+    }
+}
+
+// Build a fresh ObjectModule for `target` (host/aarch64/riscv64) — the same ISA
+// setup `compile_object` uses, factored out for the boxed path.
+fn make_object_module(target: NativeTarget) -> Option<ObjectModule> {
+    let mut flags = settings::builder();
+    flags.set("opt_level", "speed").ok()?;
+    flags.set("is_pic", if target == NativeTarget::Host { "true" } else { "false" }).ok()?;
+    let isa = match target.triple() {
+        None => cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?,
+        Some(triple) => {
+            let t = triple.parse::<target_lexicon::Triple>().ok()?;
+            let mut b = isa::lookup(t).ok()?;
+            if target == NativeTarget::Riscv64 {
+                for ext in ["has_m", "has_a", "has_f", "has_d", "has_c", "has_zicsr", "has_zifencei"] {
+                    b.enable(ext).ok()?;
+                }
+            }
+            b.finish(settings::Flags::new(flags)).ok()?
+        }
+    };
+    let builder = ObjectBuilder::new(isa, "nova", cranelift_module::default_libcall_names()).ok()?;
+    Some(ObjectModule::new(builder))
+}
+
+// The GENERAL native path: compile an arbitrary Phase-1 boxed program to a
+// relocatable object (every value an i64 handle over nova_box_rt.c). Returns
+// `(object bytes, needs_runtime=true)` — the boxed tier always links the runtime.
+// `None` when the program isn't box-eligible (→ C/embed fallback). Tried by
+// build_native AFTER `compile_object`, so the fast typed/string/const path keeps
+// its programs; this only catches what that path declines. The oracle gate
+// (byte-diff vs `nova run`) backs correctness.
+pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec<u8>, bool)> {
+    if !box_eligible(prog) { return None; }
+    let mut main: Option<&Func> = None;
+    let mut fns: Vec<&Func> = Vec::new();
+    for it in &prog.items {
+        match it {
+            Item::Func(f) if f.name == "main" => main = Some(f),
+            Item::Func(f) => fns.push(f),
+            Item::Const { .. } | Item::Test(_) => {}
+            _ => return None,
+        }
+    }
+    let main = main?;
+
+    let mut module = make_object_module(target)?;
+
+    // 1) declare the nv_* runtime imports (all from nova_box_rt.c).
+    let decl = |module: &mut ObjectModule, name: &str, params: &[Type], ret: bool| -> Option<FuncId> {
+        let mut sig = module.make_signature();
+        for p in params { sig.params.push(AbiParam::new(*p)); }
+        if ret { sig.returns.push(AbiParam::new(I64)); }
+        module.declare_function(name, Linkage::Import, &sig).ok()
+    };
+    let f64t = types::F64;
+    let rt = BoxRt {
+        int: decl(&mut module, "nv_int", &[I64], true)?,
+        float: decl(&mut module, "nv_float", &[f64t], true)?,
+        boolean: decl(&mut module, "nv_bool", &[I64], true)?,
+        null: decl(&mut module, "nv_null", &[], true)?,
+        str: decl(&mut module, "nv_str", &[I64, I64], true)?,
+        add: decl(&mut module, "nv_add", &[I64, I64], true)?,
+        sub: decl(&mut module, "nv_sub", &[I64, I64], true)?,
+        mul: decl(&mut module, "nv_mul", &[I64, I64], true)?,
+        div: decl(&mut module, "nv_div", &[I64, I64], true)?,
+        rem: decl(&mut module, "nv_rem", &[I64, I64], true)?,
+        lt: decl(&mut module, "nv_cmp_lt", &[I64, I64], true)?,
+        le: decl(&mut module, "nv_cmp_le", &[I64, I64], true)?,
+        gt: decl(&mut module, "nv_cmp_gt", &[I64, I64], true)?,
+        ge: decl(&mut module, "nv_cmp_ge", &[I64, I64], true)?,
+        eq: decl(&mut module, "nv_eq", &[I64, I64], true)?,
+        ne: decl(&mut module, "nv_ne", &[I64, I64], true)?,
+        bit: decl(&mut module, "nv_bit", &[I64, I64, I64], true)?,
+        neg: decl(&mut module, "nv_neg", &[I64], true)?,
+        not: decl(&mut module, "nv_not", &[I64], true)?,
+        bitnot: decl(&mut module, "nv_bitnot", &[I64], true)?,
+        truthy: decl(&mut module, "nv_truthy", &[I64], true)?,
+        concat: decl(&mut module, "nv_concat2", &[I64, I64], true)?,
+        tostr: decl(&mut module, "nv_tostr", &[I64], true)?,
+        len: decl(&mut module, "nv_len", &[I64], true)?,
+        as_int: decl(&mut module, "nv_as_int", &[I64], true)?,
+        print: decl(&mut module, "nv_print", &[I64], false)?,
+    };
+
+    // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
+    let mut ids: HashMap<String, (FuncId, usize)> = HashMap::new();
+    for f in &fns {
+        let mut sig = module.make_signature();
+        for _ in 0..f.params.len() { sig.params.push(AbiParam::new(I64)); }
+        sig.returns.push(AbiParam::new(I64));
+        let id = module.declare_function(&f.name, Linkage::Local, &sig).ok()?;
+        ids.insert(f.name.clone(), (id, f.params.len()));
+    }
+
+    let mut fctx = FunctionBuilderContext::new();
+    let mut jobs: Vec<(FuncId, Context)> = Vec::new();
+
+    // 3) codegen each user function.
+    for f in &fns {
+        let (id, _) = ids[&f.name];
+        let mut ctx = module.make_context();
+        for _ in 0..f.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let mut g = BoxGen::new(&mut b, &mut module, &ids, rt, &f.params, &f.body, false);
+            g.lower(&f.body)?;
+            b.finalize();
+        }
+        jobs.push((id, ctx));
+    }
+
+    // 4) codegen `main` -> C-ABI `int main(void)` returning 0.
+    let main_id = {
+        let mut sig = module.make_signature();
+        sig.returns.push(AbiParam::new(I32));
+        module.declare_function("main", Linkage::Export, &sig).ok()?
+    };
+    let mut ctx = module.make_context();
+    ctx.func.signature.returns.push(AbiParam::new(I32));
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let mut g = BoxGen::new(&mut b, &mut module, &ids, rt, &[], &main.body, true);
+        g.lower(&main.body)?;
+        b.finalize();
+    }
+    jobs.push((main_id, ctx));
+
+    // 5) compile all functions (parallel) and emit the object.
+    define_parallel(&mut module, jobs)?;
+    Some((module.finish().emit().ok()?, true))
+}
+
 #[cfg(test)]
 mod jit_tests {
     use super::Jit;
@@ -4560,6 +5251,65 @@ mod jit_tests {
         for t in [super::NativeTarget::Host, super::NativeTarget::Aarch64, super::NativeTarget::Riscv64] {
             let (obj, _) = super::compile_object(&prog, t).expect("must emit for each target");
             assert!(obj.len() > 64);
+        }
+    }
+
+    // BoxGen — the general tier: REAL programs (locals, loops, conditionals,
+    // runtime string building, recursion, multi-statement main) that the fast
+    // typed/string/const path (`compile_object`) declines now compile to a native
+    // object. The build's oracle gate verifies each binary vs `nova run`.
+    #[test] fn native_object_boxed_general() {
+        for src in [
+            // loop accumulation into a local, then print an int
+            "fn main(){ t = 0  for i in 1..=100 { t = t + i }  print(t) }",
+            // runtime string builder (concat + str())
+            "fn main(){ s = \"\"  for i in 0..5 { s = s + str(i) }  print(s)  print(len(s)) }",
+            // recursion with locals + mixed int/string prints
+            "fn fact(n){ if n <= 1 { return 1 }  n * fact(n - 1) } fn main(){ x = 5  print(fact(x))  print(\"done\") }",
+            // FizzBuzz: if/for/%/==/f-string/user string-returning fn
+            "fn label(n){ if n % 15 == 0 { return \"FizzBuzz\" }  if n % 3 == 0 { return \"Fizz\" }  if n % 5 == 0 { return \"Buzz\" }  f\"{n}\" } fn main(){ for i in 1..=15 { print(label(i)) } }",
+            // while loop + break + float
+            "fn main(){ i = 0  x = 1.5  while i < 3 { x = x + 1.0  i = i + 1 }  print(x) }",
+            // boolean logic + comparison
+            "fn main(){ a = 3  b = 5  print(a < b && b < 10)  print(a > b || b == 5) }",
+        ] {
+            let mut prog = parse_program(src).expect("parse");
+            fold_program(&mut prog);
+            // compile_object (the fast path) declines these general programs...
+            assert!(super::compile_object(&prog, super::NativeTarget::Host).is_none(),
+                    "fast path should decline the general program: {}", src);
+            // ...and the boxed tier compiles them.
+            let (obj, needs_rt) = super::compile_object_boxed(&prog, super::NativeTarget::Host)
+                .unwrap_or_else(|| panic!("boxed tier must emit: {}", src));
+            assert!(!obj.is_empty(), "non-empty object: {}", src);
+            assert!(needs_rt, "boxed tier links nova_box_rt.c: {}", src);
+        }
+    }
+    // The boxed tier lowers the same IR for every arch — proves the aarch64 and
+    // riscv64 backends compile a general program (linker/qemu are the build's job).
+    #[test] fn native_object_boxed_cross_arch() {
+        let src = "fn main(){ t = 0  for i in 1..=10 { t = t + i * i }  print(t) }";
+        let mut prog = parse_program(src).expect("parse");
+        fold_program(&mut prog);
+        for t in [super::NativeTarget::Host, super::NativeTarget::Aarch64, super::NativeTarget::Riscv64] {
+            let (obj, _) = super::compile_object_boxed(&prog, t).expect("boxed must emit for each target");
+            assert!(obj.len() > 64);
+        }
+    }
+    // Phase-2 forms (arrays/maps/structs, foreach, match, try, closures,
+    // generators, `continue`) are NOT boxed yet — they decline cleanly so the
+    // build falls back to the C/embed AOT (output still correct via the gate).
+    #[test] fn native_object_boxed_declines_phase2() {
+        for src in [
+            "fn main(){ xs = [1, 2, 3]  print(xs[0]) }",           // array
+            "fn main(){ xs = [1, 2]  for x in xs { print(x) } }",  // foreach
+            "fn main(){ for i in 0..3 { if i == 1 { continue }  print(i) } }", // continue
+            "fn main(){ n = 3  x = n ** 2  print(x) }",             // pow (box-ineligible, unfoldable)
+        ] {
+            let mut prog = parse_program(src).expect("parse");
+            fold_program(&mut prog);
+            assert!(super::compile_object_boxed(&prog, super::NativeTarget::Host).is_none(),
+                    "boxed tier must decline Phase-2 program: {}", src);
         }
     }
 }
