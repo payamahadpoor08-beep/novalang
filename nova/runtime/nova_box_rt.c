@@ -21,7 +21,7 @@
 
 typedef int64_t i64;
 
-enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR, BV_STRUCT, BV_MAP };
+enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR, BV_STRUCT, BV_MAP, BV_ENUM };
 
 typedef struct BStr {
     i64 nchars;      /* Nova indexes strings by Unicode char */
@@ -54,9 +54,16 @@ typedef struct BMap {
     i64 *vals;       /* handles */
 } BMap;
 
+/* enum instance: variant name + tuple payload handles (mirrors EnumVal) */
+typedef struct BEnum {
+    i64 variant;     /* handle to BV_STR */
+    i64 ndata;
+    i64 *data;       /* payload value handles */
+} BEnum;
+
 typedef struct BV {
     uint8_t tag;
-    union { i64 i; double f; BStr *s; BArr *a; BStruct *st; BMap *m; };
+    union { i64 i; double f; BStr *s; BArr *a; BStruct *st; BMap *m; BEnum *en; };
 } BV;
 
 /* handle <-> pointer. Allocate-and-leak: a boxed value lives for the whole run. */
@@ -212,6 +219,53 @@ void nv_field_set(i64 sh, i64 name_h, i64 val_h) {
     v->st->values[i] = val_h;
 }
 
+/* ---- enums (tagged value + tuple payload) ---- */
+i64 nv_enum(i64 variant_h, i64 ndata) {
+    BEnum *e = malloc(sizeof(BEnum));
+    e->variant = variant_h;
+    e->ndata = ndata;
+    e->data = malloc(sizeof(i64) * (ndata > 0 ? ndata : 1));
+    BV x; x.tag = BV_ENUM; x.en = e;
+    return bv_mk(x);
+}
+void nv_enum_set(i64 eh, i64 i, i64 val_h) { bv_h(eh)->en->data[i] = val_h; }
+i64 nv_enum_data(i64 eh, i64 i) { return bv_h(eh)->en->data[i]; }
+i64 nv_enum_arity(i64 eh) { return bv_h(eh)->en->ndata; }
+/* is `eh` an enum whose variant name == the string `name_h`? */
+i64 nv_enum_is(i64 eh, i64 name_h) {
+    BV *v = bv_h(eh);
+    if (v->tag != BV_ENUM) return 0;
+    return bv_eq(bv_h(v->en->variant), bv_h(name_h));
+}
+
+/* ---- pattern-match introspection (used by BoxGen's compiled match) ---- */
+i64 nv_tag(i64 h) { return bv_h(h)->tag; }
+i64 nv_is_arr(i64 h) { return bv_h(h)->tag == BV_ARR; } /* tuple/slice patterns match arrays only */
+/* int value in lo..hi (or lo..=hi); 0 if not an int or out of range */
+i64 nv_in_range(i64 h, i64 lo, i64 hi, i64 inclusive) {
+    BV *v = bv_h(h);
+    if (v->tag != BV_INT) return 0;
+    if (inclusive) return v->i >= lo && v->i <= hi;
+    return v->i >= lo && v->i < hi;
+}
+/* is `h` a struct of type `name_h` (empty name matches any struct)? */
+i64 nv_struct_is(i64 h, i64 name_h) {
+    BV *v = bv_h(h);
+    if (v->tag != BV_STRUCT) return 0;
+    if (bv_h(name_h)->s->nbytes == 0) return 1;
+    return bv_eq(bv_h(v->st->type_name), bv_h(name_h));
+}
+/* does struct `h` have a field named `name_h`? (for struct patterns) */
+i64 nv_has_field(i64 h, i64 name_h) {
+    BV *v = bv_h(h);
+    if (v->tag != BV_STRUCT) return 0;
+    return bstruct_slot(v->st, name_h) >= 0;
+}
+void nv_no_match(void) {
+    fprintf(stderr, "runtime error: no match arm matched (non-exhaustive match)\n");
+    exit(1);
+}
+
 static const char *bv_type_name(BV *v) {
     switch (v->tag) {
         case BV_INT: return "int";
@@ -221,7 +275,8 @@ static const char *bv_type_name(BV *v) {
         case BV_STR: return "string";
         case BV_ARR: return "array";
         case BV_STRUCT: return "struct";
-        default: return "map";
+        case BV_MAP: return "map";
+        default: return "enum";
     }
 }
 
@@ -279,6 +334,14 @@ static i64 bv_eq(BV *a, BV *b) {
                     && bv_eq(bv_h(x->vals[i]), bv_h(y->vals[j]))) break;
             if (j == y->len) return 0;
         }
+        return 1;
+    }
+    if (a->tag == BV_ENUM && b->tag == BV_ENUM) {
+        BEnum *x = a->en, *y = b->en;
+        if (!bv_eq(bv_h(x->variant), bv_h(y->variant))) return 0;
+        if (x->ndata != y->ndata) return 0;
+        for (i64 i = 0; i < x->ndata; i++)
+            if (!bv_eq(bv_h(x->data[i]), bv_h(y->data[i]))) return 0;
         return 1;
     }
     return 0;
@@ -413,6 +476,21 @@ static void bv_fmt(SB *sb, BV *v, int quote_strings) {
                 bv_fmt(sb, bv_h(m->vals[i]), 1);
             }
             sb_puts(sb, "}");
+            break;
+        }
+        case BV_ENUM: {
+            /* unit variant -> `Name`; with payload -> `Name(d0, d1)` (data quoted
+             * like array elements), byte-identical to interp.rs Display. */
+            BEnum *e = v->en;
+            sb_put(sb, bv_h(e->variant)->s->utf8, bv_h(e->variant)->s->nbytes);
+            if (e->ndata > 0) {
+                sb_puts(sb, "(");
+                for (i64 i = 0; i < e->ndata; i++) {
+                    if (i) sb_puts(sb, ", ");
+                    bv_fmt(sb, bv_h(e->data[i]), 1);
+                }
+                sb_puts(sb, ")");
+            }
             break;
         }
     }
