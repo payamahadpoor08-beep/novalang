@@ -4190,6 +4190,8 @@ fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>)
         }
         Expr::RangeLit { lo: Some(lo), hi: Some(hi), .. } =>
             box_expr_ok(lo, funcs, scopes) && box_expr_ok(hi, funcs, scopes),
+        Expr::StructLit { fields, .. } => fields.iter().all(|(_, e)| box_expr_ok(e, funcs, scopes)),
+        Expr::Field { base, .. } => box_expr_ok(base, funcs, scopes),
         Expr::Call { callee, args } => {
             let is_str = (callee == "str" || callee == "to_str") && args.len() == 1;
             let ok = funcs.contains(callee) || callee == "print" || callee == "len" || is_str
@@ -4226,6 +4228,8 @@ fn box_stmt_ok(s: &Stmt, funcs: &HashSet<String>, scopes: &mut Vec<HashSet<Strin
         Stmt::IndexAssign { base, index, value } =>
             box_expr_ok(base, funcs, scopes) && box_expr_ok(index, funcs, scopes)
             && box_expr_ok(value, funcs, scopes),
+        Stmt::FieldAssign { base, value, .. } =>
+            box_expr_ok(base, funcs, scopes) && box_expr_ok(value, funcs, scopes),
         Stmt::ForEach { var, iter, body } => {
             if !box_expr_ok(iter, funcs, scopes) { return false; }
             if scopes.iter().any(|sc| sc.contains(var)) { return false; }
@@ -4279,7 +4283,10 @@ fn box_eligible(prog: &Program) -> bool {
     for it in &prog.items {
         match it {
             Item::Func(f) => { funcs.insert(f.name.clone()); if f.name == "main" { has_main = true; } }
-            Item::Const { .. } | Item::Test(_) => {}
+            // struct defs are just types (fields accessed by name at run time); a
+            // program may declare them and still be boxed. `impl` blocks, enums,
+            // etc. are not supported and fall to `_ => false`.
+            Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
             _ => return false,
         }
     }
@@ -4311,6 +4318,8 @@ struct BoxRt {
     // Phase 2 — arrays
     arr: FuncId, arr_push: FuncId, pop: FuncId, index: FuncId,
     index_set: FuncId, slice: FuncId, range: FuncId, iter: FuncId,
+    // Phase 3 — structs
+    struct_new: FuncId, struct_set: FuncId, field: FuncId, field_set: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
@@ -4448,6 +4457,12 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let i = self.expr(index)?;
                 let v = self.expr(value)?;
                 self.rt_void(self.rt.index_set, &[b, i, v]);
+            }
+            Stmt::FieldAssign { base, field, value } => {
+                let b = self.expr(base)?;
+                let nm = self.lit(field.as_bytes())?;
+                let v = self.expr(value)?;
+                self.rt_void(self.rt.field_set, &[b, nm, v]);
             }
             Stmt::If { cond, then, els } => self.if_stmt(cond, then, els.as_deref())?,
             Stmt::While { cond, body } => self.while_stmt(cond, body)?,
@@ -4798,6 +4813,29 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let inc = self.b.ins().iconst(I64, *inclusive as i64);
                 Some(self.rt_call(self.rt.range, &[lr, hr, inc]))
             }
+            // a struct instance: fields stored in SORTED name order (matching the
+            // interpreter's Display), but their VALUES evaluated in source order
+            // (side effects). Field access is by name at run time.
+            Expr::StructLit { name, fields } => {
+                let tn = self.lit(name.as_bytes())?;
+                let nf = self.b.ins().iconst(I64, fields.len() as i64);
+                let sh = self.rt_call(self.rt.struct_new, &[tn, nf]);
+                let mut order: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+                order.sort();
+                for (k, ve) in fields {
+                    let slot = order.iter().position(|s| *s == k.as_str())? as i64;
+                    let nm = self.lit(k.as_bytes())?;
+                    let v = self.expr(ve)?;
+                    let slotv = self.b.ins().iconst(I64, slot);
+                    self.rt_void(self.rt.struct_set, &[sh, slotv, nm, v]);
+                }
+                Some(sh)
+            }
+            Expr::Field { base, field } => {
+                let b = self.expr(base)?;
+                let nm = self.lit(field.as_bytes())?;
+                Some(self.rt_call(self.rt.field, &[b, nm]))
+            }
             _ => None,
         }
     }
@@ -4859,7 +4897,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         match it {
             Item::Func(f) if f.name == "main" => main = Some(f),
             Item::Func(f) => fns.push(f),
-            Item::Const { .. } | Item::Test(_) => {}
+            Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
             _ => return None,
         }
     }
@@ -4910,6 +4948,10 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         slice: decl(&mut module, "nv_slice", &[I64, I64, I64, I64, I64, I64], true)?,
         range: decl(&mut module, "nv_range", &[I64, I64, I64], true)?,
         iter: decl(&mut module, "nv_iter", &[I64], true)?,
+        struct_new: decl(&mut module, "nv_struct", &[I64, I64], true)?,
+        struct_set: decl(&mut module, "nv_struct_set", &[I64, I64, I64, I64], false)?,
+        field: decl(&mut module, "nv_field", &[I64, I64], true)?,
+        field_set: decl(&mut module, "nv_field_set", &[I64, I64, I64], false)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5434,6 +5476,10 @@ mod jit_tests {
             "fn main(){ xs = []  for i in 0..5 { push(xs, i * i) }  print(xs)  print(pop(xs))  print(xs[0..2]) }",
             // a function that builds and returns an array, iterated by the caller
             "fn squares(n){ out = []  for i in 1..=n { push(out, i * i) }  out } fn main(){ r = squares(4)  for v in r { print(v) }  print(r) }",
+            // Phase 3 structs: literal, field access (incl. through a param), whole-
+            // struct print (fields sorted, matching interp Display), field assignment
+            "struct P { x: Int, y: Int } fn dist(p){ p.x + p.y } fn main(){ p = P { x: 3, y: 4 }  print(dist(p))  print(p.x)  print(p) }",
+            "struct C { n: Int } fn main(){ c = C { n: 0 }  for i in 1..=5 { c.n = c.n + i }  print(c.n)  print(c) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
