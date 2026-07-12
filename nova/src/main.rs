@@ -59,32 +59,76 @@ fn main() {
                 "--aot=arm32" | "--aot=armv7" | "--aot=armhf" => Some(vec![aot::Backend::Arm32]),
                 _ => None,
             });
+            let labels = |bk: &aot::Backend| -> (&'static str, &'static str) {
+                match bk {
+                    aot::Backend::C => ("c", "native"),
+                    aot::Backend::Native => ("native", "native"),
+                    aot::Backend::NativeArm64 => ("native-arm64", "aarch64"),
+                    aot::Backend::NativeRiscv64 => ("native-riscv64", "riscv64"),
+                    aot::Backend::Llvm => ("llvm", "native"),
+                    aot::Backend::Wasm => ("wasm", "wasm32"),
+                    aot::Backend::Arm => ("arm", "aarch64"),
+                    aot::Backend::Arm32 => ("arm32", "armv7"),
+                }
+            };
             if let Some(chain) = aot_chain {
                 let extra: Vec<String> = args.iter().skip(2)
                     .find_map(|a| a.strip_prefix("--aot-flags="))
                     .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
                     .unwrap_or_default();
-                for (idx, bk) in chain.iter().enumerate() {
-                    let last = idx + 1 == chain.len();
+                // Auto chain (plain `--aot` / `--aot=auto` = [Native, C]): build EVERY
+                // backend that succeeds and ship the FASTEST binary. Both are already
+                // correctness-gated (byte-identical to `nova run`), so choosing by
+                // measured wall-time is safe — and it means `nova build --aot` always
+                // ships the fastest of Nova's own Cranelift codegen and the gcc/clang
+                // `-O3 -flto -march=native` backend, whichever wins on this machine.
+                if chain.len() > 1 {
+                    use std::time::Instant;
+                    let mut best: Option<(u128, std::path::PathBuf, &'static str, aot::Tier, &'static str)> = None;
+                    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+                    for (idx, bk) in chain.iter().enumerate() {
+                        let cand = out.with_extension(format!("cand{idx}"));
+                        match build::build_aot(&entry, &cand, bk, &extra) {
+                            Ok(Some(tier)) => {
+                                cands.push(cand.clone());
+                                let mut ms = u128::MAX;
+                                for _ in 0..3 {
+                                    let t = Instant::now();
+                                    let _ = std::process::Command::new(&cand).output();
+                                    ms = ms.min(t.elapsed().as_millis());
+                                }
+                                let (which, kind) = labels(bk);
+                                if best.as_ref().map_or(true, |b| ms < b.0) {
+                                    best = Some((ms, cand.clone(), which, tier, kind));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => { eprintln!("error: {}", e); exit(1); }
+                        }
+                    }
+                    if let Some((ms, path, which, tier, kind)) = best {
+                        let _ = std::fs::rename(&path, &out);
+                        for c in &cands {
+                            let _ = std::fs::remove_file(c.with_extension("o"));
+                            if *c != path { let _ = std::fs::remove_file(c); }
+                        }
+                        println!("built {} (aot-{}, {} tier, {}) — fastest of {} backends @ {}ms",
+                                 out.display(), which, tier.name(), kind, cands.len(), ms);
+                        return;
+                    }
+                    eprintln!("note: program not fully AOT-able (or diverged in verify); using the embedded runtime build");
+                } else {
+                    // a single pinned backend keeps first-that-works + its diagnostics
+                    let bk = &chain[0];
                     match build::build_aot(&entry, &out, bk, &extra) {
                         Ok(Some(tier)) => {
-                            let (which, kind) = match bk {
-                                aot::Backend::C => ("c", "native"),
-                                aot::Backend::Native => ("native", "native"),
-                                aot::Backend::NativeArm64 => ("native-arm64", "aarch64"),
-                                aot::Backend::NativeRiscv64 => ("native-riscv64", "riscv64"),
-                                aot::Backend::Llvm => ("llvm", "native"),
-                                aot::Backend::Wasm => ("wasm", "wasm32"),
-                                aot::Backend::Arm => ("arm", "aarch64"),
-                                aot::Backend::Arm32 => ("arm32", "armv7"),
-                            };
+                            let (which, kind) = labels(bk);
                             let art = if matches!(bk, aot::Backend::Wasm) {
                                 out.with_extension("wasm").display().to_string()
                             } else { out.display().to_string() };
                             println!("built {} (aot-{}, {} tier, {})", art, which, tier.name(), kind);
                             return;
                         }
-                        Ok(None) if !last => continue, // try the next backend in the chain
                         Ok(None) if matches!(bk, aot::Backend::Wasm) => {
                             eprintln!("note: program not WASM-able (typed/boxed tier only, not embed; needs clang wasm32 + a wasi-sysroot + node, verified vs `nova run`); no .wasm emitted");
                             exit(1);
