@@ -75,6 +75,7 @@ static void bv_die(const char *msg) {
     exit(1);
 }
 static i64 bv_eq(BV *a, BV *b); /* forward: map key comparison (values_eq) */
+static const char *bv_type_name(BV *v); /* forward: used in error messages */
 static void bv_dief(const char *fmt, i64 a, i64 b) {
     fprintf(stderr, "runtime error: ");
     fprintf(stderr, fmt, (long long)a, (long long)b);
@@ -263,6 +264,18 @@ i64 nv_has_field(i64 h, i64 name_h) {
 }
 void nv_no_match(void) {
     fprintf(stderr, "runtime error: no match arm matched (non-exhaustive match)\n");
+    exit(1);
+}
+/* optional-chained field `base?.name`: null -> null, struct -> field or null if
+ * absent, anything else -> error (mirrors interp safe_field_get) */
+i64 nv_safe_field(i64 h, i64 name_h) {
+    BV *v = bv_h(h);
+    if (v->tag == BV_NULL) return h;
+    if (v->tag == BV_STRUCT) {
+        i64 i = bstruct_slot(v->st, name_h);
+        return i < 0 ? nv_null() : v->st->values[i];
+    }
+    fprintf(stderr, "runtime error: cannot access field '%s' on %s\n", bv_h(name_h)->s->utf8, bv_type_name(v));
     exit(1);
 }
 
