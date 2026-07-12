@@ -21,17 +21,24 @@
 
 typedef int64_t i64;
 
-enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR };
+enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR };
 
 typedef struct BStr {
     i64 nchars;      /* Nova indexes strings by Unicode char */
     i64 nbytes;
+    i64 *coff;       /* byte offset of each char (nchars+1 entries) */
     char *utf8;
 } BStr;
 
+/* dynamic array of value handles (arena-allocated; grows, never freed) */
+typedef struct BArr {
+    i64 len, cap;
+    i64 *items;      /* each element is a value handle (i64) */
+} BArr;
+
 typedef struct BV {
     uint8_t tag;
-    union { i64 i; double f; BStr *s; };
+    union { i64 i; double f; BStr *s; BArr *a; };
 } BV;
 
 /* handle <-> pointer. Allocate-and-leak: a boxed value lives for the whole run. */
@@ -40,6 +47,12 @@ static i64 bv_mk(BV v) { BV *p = malloc(sizeof(BV)); *p = v; return (i64)(intptr
 
 static void bv_die(const char *msg) {
     fprintf(stderr, "runtime error: %s\n", msg);
+    exit(1);
+}
+static void bv_dief(const char *fmt, i64 a, i64 b) {
+    fprintf(stderr, "runtime error: ");
+    fprintf(stderr, fmt, (long long)a, (long long)b);
+    fprintf(stderr, "\n");
     exit(1);
 }
 
@@ -60,11 +73,40 @@ static BStr *bstr_new(const char *bytes, i64 nbytes) {
     for (i64 i = 0; i < nbytes; i++)
         if (((unsigned char)bytes[i] & 0xC0) != 0x80) nchars++;
     s->nchars = nchars;
+    s->coff = malloc(sizeof(i64) * (nchars + 1));
+    i64 c = 0;
+    for (i64 i = 0; i < nbytes; i++)
+        if (((unsigned char)bytes[i] & 0xC0) != 0x80) s->coff[c++] = i;
+    s->coff[nchars] = nbytes;
     return s;
 }
 i64 nv_str(i64 ptr, i64 len) {
     BV x; x.tag = BV_STR; x.s = bstr_new((const char *)(intptr_t)ptr, len);
     return bv_mk(x);
+}
+
+/* ---- arrays (arena; handle elements) ---- */
+i64 nv_arr(i64 cap) {
+    BArr *a = malloc(sizeof(BArr));
+    a->len = 0;
+    a->cap = cap > 4 ? cap : 4;
+    a->items = malloc(sizeof(i64) * a->cap);
+    BV x; x.tag = BV_ARR; x.a = a;
+    return bv_mk(x);
+}
+void nv_arr_push(i64 arrh, i64 itemh) {
+    BV *v = bv_h(arrh);
+    if (v->tag != BV_ARR) bv_die("push expects array");
+    BArr *a = v->a;
+    if (a->len == a->cap) { a->cap *= 2; a->items = realloc(a->items, sizeof(i64) * a->cap); }
+    a->items[a->len++] = itemh;
+}
+i64 nv_pop(i64 arrh) {
+    BV *v = bv_h(arrh);
+    if (v->tag != BV_ARR) bv_die("pop expects array");
+    BArr *a = v->a;
+    if (a->len == 0) return nv_null();
+    return a->items[--a->len];
 }
 
 static const char *bv_type_name(BV *v) {
@@ -73,7 +115,8 @@ static const char *bv_type_name(BV *v) {
         case BV_FLOAT: return "float";
         case BV_BOOL: return "bool";
         case BV_NULL: return "null";
-        default: return "string";
+        case BV_STR: return "string";
+        default: return "array";
     }
 }
 
@@ -89,6 +132,7 @@ i64 nv_truthy(i64 h) {
 
 i64 nv_len(i64 h) {
     BV *v = bv_h(h);
+    if (v->tag == BV_ARR) return nv_int(v->a->len);
     if (v->tag == BV_STR) return nv_int(v->s->nchars);
     fprintf(stderr, "runtime error: len expects array or string, got %s\n", bv_type_name(v));
     exit(1);
@@ -103,6 +147,12 @@ static i64 bv_eq(BV *a, BV *b) {
     if (a->tag == BV_NULL && b->tag == BV_NULL) return 1;
     if (a->tag == BV_STR && b->tag == BV_STR)
         return a->s->nbytes == b->s->nbytes && memcmp(a->s->utf8, b->s->utf8, a->s->nbytes) == 0;
+    if (a->tag == BV_ARR && b->tag == BV_ARR) {
+        if (a->a->len != b->a->len) return 0;
+        for (i64 i = 0; i < a->a->len; i++)
+            if (!bv_eq(bv_h(a->a->items[i]), bv_h(b->a->items[i]))) return 0;
+        return 1;
+    }
     return 0;
 }
 i64 nv_eq(i64 a, i64 b) { return nv_bool(bv_eq(bv_h(a), bv_h(b))); }
@@ -186,7 +236,7 @@ static void fmt_f64(SB *sb, double x) {
     sb_puts(sb, out);
 }
 
-static void bv_fmt(SB *sb, BV *v) {
+static void bv_fmt(SB *sb, BV *v, int quote_strings) {
     char tmp[32];
     switch (v->tag) {
         case BV_INT:
@@ -196,13 +246,24 @@ static void bv_fmt(SB *sb, BV *v) {
         case BV_FLOAT: fmt_f64(sb, v->f); break;
         case BV_BOOL: sb_puts(sb, v->i ? "true" : "false"); break;
         case BV_NULL: sb_puts(sb, "null"); break;
-        case BV_STR: sb_put(sb, v->s->utf8, v->s->nbytes); break;
+        case BV_STR:
+            if (quote_strings) { sb_puts(sb, "\""); sb_put(sb, v->s->utf8, v->s->nbytes); sb_puts(sb, "\""); }
+            else sb_put(sb, v->s->utf8, v->s->nbytes);
+            break;
+        case BV_ARR:
+            sb_puts(sb, "[");
+            for (i64 i = 0; i < v->a->len; i++) {
+                if (i) sb_puts(sb, ", ");
+                bv_fmt(sb, bv_h(v->a->items[i]), 1); /* strings inside arrays get quotes */
+            }
+            sb_puts(sb, "]");
+            break;
     }
 }
 
 void nv_print(i64 h) {
     SB sb; sb_init(&sb);
-    bv_fmt(&sb, bv_h(h));
+    bv_fmt(&sb, bv_h(h), 0);
     fwrite(sb.buf, 1, sb.len, stdout);
     fputc('\n', stdout);
     free(sb.buf);
@@ -213,7 +274,7 @@ i64 nv_tostr(i64 h) {
     BV *v = bv_h(h);
     if (v->tag == BV_STR) return h; /* already a string: same handle */
     SB sb; sb_init(&sb);
-    bv_fmt(&sb, v);
+    bv_fmt(&sb, v, 0);
     i64 r = nv_str((i64)(intptr_t)sb.buf, sb.len);
     free(sb.buf);
     return r;
@@ -337,6 +398,76 @@ i64 nv_bitnot(i64 h) {
     BV *v = bv_h(h);
     if (v->tag != BV_INT) bv_die("cannot apply BitNot to non-int");
     return nv_int(~v->i);
+}
+
+/* index read: mirror index_get (array int / str char); result is a handle */
+i64 nv_index(i64 baseh, i64 idxh) {
+    BV *base = bv_h(baseh), *idx = bv_h(idxh);
+    if (base->tag == BV_ARR) {
+        if (idx->tag != BV_INT) bv_die("expected integer, got non-int index");
+        i64 i = idx->i;
+        if (i < 0 || i >= base->a->len) bv_dief("index %lld out of bounds (len %lld)", i, base->a->len);
+        return base->a->items[i]; /* shared handle, like the interp's Rc element */
+    }
+    if (base->tag == BV_STR) {
+        if (idx->tag != BV_INT) bv_die("expected integer, got non-int index");
+        i64 i = idx->i;
+        if (i < 0 || i >= base->s->nchars) bv_dief("string index %lld out of bounds (len %lld)", i, base->s->nchars);
+        i64 lo = base->s->coff[i], hi = base->s->coff[i + 1];
+        return nv_str((i64)(intptr_t)(base->s->utf8 + lo), hi - lo);
+    }
+    fprintf(stderr, "runtime error: cannot index into %s\n", bv_type_name(base));
+    exit(1);
+}
+
+/* base[idx] = v (array only); consumes nothing (handles) */
+void nv_index_set(i64 baseh, i64 idxh, i64 vh) {
+    BV *base = bv_h(baseh), *idx = bv_h(idxh);
+    if (base->tag != BV_ARR) { fprintf(stderr, "runtime error: cannot index-assign into %s\n", bv_type_name(base)); exit(1); }
+    if (idx->tag != BV_INT) bv_die("expected integer, got non-int index");
+    i64 i = idx->i;
+    if (i < 0 || i >= base->a->len) bv_dief("index %lld out of bounds (len %lld)", i, base->a->len);
+    base->a->items[i] = vh;
+}
+
+/* slice with Nova clamping (mirror nova_rt.c do_slice); has_lo/has_hi flag open ends */
+i64 nv_slice(i64 baseh, i64 lo, i64 has_lo, i64 hi, i64 has_hi, i64 inclusive) {
+    BV *base = bv_h(baseh);
+    i64 len;
+    if (base->tag == BV_ARR) len = base->a->len;
+    else if (base->tag == BV_STR) len = base->s->nchars;
+    else { fprintf(stderr, "runtime error: cannot slice %s\n", bv_type_name(base)); exit(1); }
+    i64 start = 0, end = len;
+    if (has_lo) { start = lo < 0 ? (len + lo > 0 ? len + lo : 0) : (lo < len ? lo : len); }
+    if (has_hi) {
+        i64 x = hi < 0 ? len + hi : hi;
+        if (inclusive) x += 1;
+        end = x < 0 ? 0 : (x > len ? len : x);
+    }
+    if (end < start) end = start;
+    if (base->tag == BV_ARR) {
+        i64 out = nv_arr(end - start + 1);
+        for (i64 i = start; i < end; i++) nv_arr_push(out, base->a->items[i]);
+        return out;
+    }
+    i64 b0 = base->s->coff[start], b1 = base->s->coff[end];
+    return nv_str((i64)(intptr_t)(base->s->utf8 + b0), b1 - b0);
+}
+
+/* integer range lo..hi / lo..=hi as an array (mirror build_range) */
+i64 nv_range(i64 lo, i64 hi, i64 inclusive) {
+    i64 last = inclusive ? hi : hi - 1;
+    i64 out = nv_arr(last >= lo ? last - lo + 1 : 1);
+    for (i64 i = lo; i <= last; i++) nv_arr_push(out, nv_int(i));
+    return out;
+}
+
+/* iteration snapshot for foreach: a shallow copy of an array (so body mutation
+ * doesn't affect the loop), or the value itself for strings/ranges. */
+i64 nv_iter(i64 h) {
+    BV *v = bv_h(h);
+    if (v->tag == BV_ARR) return nv_slice(h, 0, 0, 0, 0, 0);
+    return h;
 }
 
 i64 nv_as_int(i64 h) {
