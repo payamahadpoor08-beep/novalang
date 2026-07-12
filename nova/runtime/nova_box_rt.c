@@ -21,7 +21,7 @@
 
 typedef int64_t i64;
 
-enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR, BV_STRUCT };
+enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR, BV_STRUCT, BV_MAP };
 
 typedef struct BStr {
     i64 nchars;      /* Nova indexes strings by Unicode char */
@@ -46,9 +46,17 @@ typedef struct BStruct {
     i64 *values;     /* value handles, parallel to names */
 } BStruct;
 
+/* insertion-ordered key/value pairs with linear lookup — mirrors the
+ * interpreter's Value::Map (a Vec<(Value, Value)>), NOT a hash map. */
+typedef struct BMap {
+    i64 len, cap;
+    i64 *keys;       /* handles */
+    i64 *vals;       /* handles */
+} BMap;
+
 typedef struct BV {
     uint8_t tag;
-    union { i64 i; double f; BStr *s; BArr *a; BStruct *st; };
+    union { i64 i; double f; BStr *s; BArr *a; BStruct *st; BMap *m; };
 } BV;
 
 /* handle <-> pointer. Allocate-and-leak: a boxed value lives for the whole run. */
@@ -59,6 +67,7 @@ static void bv_die(const char *msg) {
     fprintf(stderr, "runtime error: %s\n", msg);
     exit(1);
 }
+static i64 bv_eq(BV *a, BV *b); /* forward: map key comparison (values_eq) */
 static void bv_dief(const char *fmt, i64 a, i64 b) {
     fprintf(stderr, "runtime error: ");
     fprintf(stderr, fmt, (long long)a, (long long)b);
@@ -119,6 +128,49 @@ i64 nv_pop(i64 arrh) {
     return a->items[--a->len];
 }
 
+/* ---- maps (insertion-ordered pairs; linear lookup by key, values_eq) ---- */
+i64 nv_map(i64 cap) {
+    BMap *m = malloc(sizeof(BMap));
+    m->len = 0;
+    m->cap = cap > 4 ? cap : 4;
+    m->keys = malloc(sizeof(i64) * m->cap);
+    m->vals = malloc(sizeof(i64) * m->cap);
+    BV x; x.tag = BV_MAP; x.m = m;
+    return bv_mk(x);
+}
+/* insert or overwrite key -> value (mirrors interp map insert / index_set) */
+void nv_map_put(i64 mh, i64 kh, i64 vh) {
+    BV *v = bv_h(mh);
+    if (v->tag != BV_MAP) bv_die("expected map");
+    BMap *m = v->m;
+    for (i64 i = 0; i < m->len; i++)
+        if (bv_eq(bv_h(m->keys[i]), bv_h(kh))) { m->vals[i] = vh; return; }
+    if (m->len == m->cap) {
+        m->cap *= 2;
+        m->keys = realloc(m->keys, sizeof(i64) * m->cap);
+        m->vals = realloc(m->vals, sizeof(i64) * m->cap);
+    }
+    m->keys[m->len] = kh;
+    m->vals[m->len] = vh;
+    m->len++;
+}
+/* key lookup -> value, or null if absent (mirrors index_get for maps) */
+i64 nv_map_get(i64 mh, i64 kh) {
+    BMap *m = bv_h(mh)->m;
+    for (i64 i = 0; i < m->len; i++)
+        if (bv_eq(bv_h(m->keys[i]), bv_h(kh))) return m->vals[i];
+    return nv_null();
+}
+/* the map's keys as an array, in insertion order (for foreach / keys()) */
+i64 nv_keys(i64 mh) {
+    BV *v = bv_h(mh);
+    if (v->tag != BV_MAP) bv_die("keys expects map");
+    BMap *m = v->m;
+    i64 out = nv_arr(m->len);
+    for (i64 i = 0; i < m->len; i++) nv_arr_push(out, m->keys[i]);
+    return out;
+}
+
 /* ---- structs (handle name/value slots; field access by name) ---- */
 i64 nv_struct(i64 type_name_h, i64 nfields) {
     BStruct *s = malloc(sizeof(BStruct));
@@ -168,7 +220,8 @@ static const char *bv_type_name(BV *v) {
         case BV_NULL: return "null";
         case BV_STR: return "string";
         case BV_ARR: return "array";
-        default: return "struct";
+        case BV_STRUCT: return "struct";
+        default: return "map";
     }
 }
 
@@ -186,6 +239,7 @@ i64 nv_len(i64 h) {
     BV *v = bv_h(h);
     if (v->tag == BV_ARR) return nv_int(v->a->len);
     if (v->tag == BV_STR) return nv_int(v->s->nchars);
+    /* like interp.rs, len() does NOT accept a map — it errors */
     fprintf(stderr, "runtime error: len expects array or string, got %s\n", bv_type_name(v));
     exit(1);
 }
@@ -212,6 +266,18 @@ static i64 bv_eq(BV *a, BV *b) {
         for (i64 i = 0; i < x->nfields; i++) {
             if (!bv_eq(bv_h(x->names[i]), bv_h(y->names[i]))) return 0;
             if (!bv_eq(bv_h(x->values[i]), bv_h(y->values[i]))) return 0;
+        }
+        return 1;
+    }
+    if (a->tag == BV_MAP && b->tag == BV_MAP) {
+        BMap *x = a->m, *y = b->m;
+        if (x->len != y->len) return 0;
+        for (i64 i = 0; i < x->len; i++) {   /* order-insensitive: each a-key in b */
+            i64 j = 0;
+            for (; j < y->len; j++)
+                if (bv_eq(bv_h(x->keys[i]), bv_h(y->keys[j]))
+                    && bv_eq(bv_h(x->vals[i]), bv_h(y->vals[j]))) break;
+            if (j == y->len) return 0;
         }
         return 1;
     }
@@ -333,6 +399,20 @@ static void bv_fmt(SB *sb, BV *v, int quote_strings) {
                 bv_fmt(sb, bv_h(s->values[i]), 1);
             }
             sb_puts(sb, " }");
+            break;
+        }
+        case BV_MAP: {
+            /* `{k: v, ...}` in insertion order, keys and string values quoted,
+             * byte-identical to interp.rs Display. */
+            BMap *m = v->m;
+            sb_puts(sb, "{");
+            for (i64 i = 0; i < m->len; i++) {
+                if (i) sb_puts(sb, ", ");
+                bv_fmt(sb, bv_h(m->keys[i]), 1);
+                sb_puts(sb, ": ");
+                bv_fmt(sb, bv_h(m->vals[i]), 1);
+            }
+            sb_puts(sb, "}");
             break;
         }
     }
@@ -477,9 +557,10 @@ i64 nv_bitnot(i64 h) {
     return nv_int(~v->i);
 }
 
-/* index read: mirror index_get (array int / str char); result is a handle */
+/* index read: mirror index_get (map key / array int / str char); handle result */
 i64 nv_index(i64 baseh, i64 idxh) {
     BV *base = bv_h(baseh), *idx = bv_h(idxh);
+    if (base->tag == BV_MAP) return nv_map_get(baseh, idxh); /* missing key -> null */
     if (base->tag == BV_ARR) {
         if (idx->tag != BV_INT) bv_die("expected integer, got non-int index");
         i64 i = idx->i;
@@ -497,9 +578,10 @@ i64 nv_index(i64 baseh, i64 idxh) {
     exit(1);
 }
 
-/* base[idx] = v (array only); consumes nothing (handles) */
+/* base[idx] = v (array positional / map key insert-or-update) */
 void nv_index_set(i64 baseh, i64 idxh, i64 vh) {
     BV *base = bv_h(baseh), *idx = bv_h(idxh);
+    if (base->tag == BV_MAP) { nv_map_put(baseh, idxh, vh); return; }
     if (base->tag != BV_ARR) { fprintf(stderr, "runtime error: cannot index-assign into %s\n", bv_type_name(base)); exit(1); }
     if (idx->tag != BV_INT) bv_die("expected integer, got non-int index");
     i64 i = idx->i;
@@ -544,6 +626,7 @@ i64 nv_range(i64 lo, i64 hi, i64 inclusive) {
 i64 nv_iter(i64 h) {
     BV *v = bv_h(h);
     if (v->tag == BV_ARR) return nv_slice(h, 0, 0, 0, 0, 0);
+    if (v->tag == BV_MAP) return nv_keys(h); /* foreach over a map iterates its keys */
     return h;
 }
 
