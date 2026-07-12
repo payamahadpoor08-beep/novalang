@@ -4158,12 +4158,47 @@ fn box_collect_vars(body: &[Stmt], out: &mut Vec<String>) {
     }
 }
 
-// Is `e` a Phase-1 boxed expression? Mirrors `bx_expr` (aot.rs) minus the
-// container forms (Array/Index/RangeLit/StructLit/slice) which are Phase 2.
+// Collect the binding names a pattern introduces (Binding + Slice rest name +
+// nested), so match arms can extend the scope for their guard/body.
+fn pattern_binds(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Binding(n) => { out.insert(n.clone()); }
+        Pattern::EnumVariant { sub, .. } | Pattern::Tuple(sub) => { for s in sub { pattern_binds(s, out); } }
+        Pattern::Struct { fields, .. } => { for (_, s) in fields { pattern_binds(s, out); } }
+        Pattern::Slice { prefix, rest, suffix } => {
+            for s in prefix { pattern_binds(s, out); }
+            for s in suffix { pattern_binds(s, out); }
+            if let Some(Some(n)) = rest { out.insert(n.clone()); }
+        }
+        Pattern::Or(alts) => { for a in alts { pattern_binds(a, out); } }
+        _ => {}
+    }
+}
+fn pattern_has_bind(p: &Pattern) -> bool {
+    let mut s = HashSet::new();
+    pattern_binds(p, &mut s);
+    !s.is_empty()
+}
+// Which patterns BoxGen can compile. All forms are supported EXCEPT an `Or` whose
+// alternatives bind variables (the native Or doesn't merge divergent bindings).
+fn pattern_ok(p: &Pattern) -> bool {
+    match p {
+        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Str(_)
+        | Pattern::Bool(_) | Pattern::Null | Pattern::Binding(_) | Pattern::Range { .. } => true,
+        Pattern::EnumVariant { sub, .. } | Pattern::Tuple(sub) => sub.iter().all(pattern_ok),
+        Pattern::Struct { fields, .. } => fields.iter().all(|(_, p)| pattern_ok(p)),
+        Pattern::Slice { prefix, suffix, .. } => prefix.iter().all(pattern_ok) && suffix.iter().all(pattern_ok),
+        Pattern::Or(alts) => alts.iter().all(|a| pattern_ok(a) && !pattern_has_bind(a)),
+    }
+}
+
+// Is `e` a boxed expression? `funcs` holds user-function AND enum-variant names
+// (so a variant constructor call / unit-variant ident is accepted).
 fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>) -> bool {
     match strip_at(e) {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
-        Expr::Ident(n) => scopes.iter().any(|sc| sc.contains(n)),
+        // an in-scope local, or a unit enum variant (`None`, `Dot`) resolved via funcs
+        Expr::Ident(n) => scopes.iter().any(|sc| sc.contains(n)) || funcs.contains(n),
         Expr::Unary { op, expr } =>
             matches!(op, UnOp::Neg | UnOp::Not | UnOp::BitNot) && box_expr_ok(expr, funcs, scopes),
         Expr::Binary { op, lhs, rhs } =>
@@ -4201,6 +4236,20 @@ fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>)
             ok && args.iter().all(|a| box_expr_ok(a, funcs, scopes))
                 && !(callee == "print" && args.len() != 1)
                 && !(callee == "len" && args.len() != 1)
+        }
+        // match: scrutinee + every arm (supported pattern; guard/body eligible in a
+        // scope extended with the pattern's bindings).
+        Expr::Match { scrutinee, arms } => {
+            if !box_expr_ok(scrutinee, funcs, scopes) { return false; }
+            arms.iter().all(|arm| {
+                if !pattern_ok(&arm.pattern) { return false; }
+                let mut binds = HashSet::new();
+                pattern_binds(&arm.pattern, &mut binds);
+                let mut sc = scopes.clone();
+                sc.push(binds);
+                arm.guard.as_ref().map_or(true, |g| box_expr_ok(g, funcs, &sc))
+                    && box_expr_ok(&arm.body, funcs, &sc)
+            })
         }
         _ => false,
     }
@@ -4280,14 +4329,18 @@ fn box_stmt_ok(s: &Stmt, funcs: &HashSet<String>, scopes: &mut Vec<HashSet<Strin
 // skipped, mirroring `analyze_boxed`), `main` exists and takes no params, and
 // every function body is Phase-1 boxed (non-`main` functions may `return`).
 fn box_eligible(prog: &Program) -> bool {
+    // `funcs` doubles as the "callable/constructible name" set: user functions AND
+    // enum variant names (a variant call constructs an enum; a unit-variant ident
+    // resolves to a value).
     let mut funcs: HashSet<String> = HashSet::new();
     let mut has_main = false;
     for it in &prog.items {
         match it {
             Item::Func(f) => { funcs.insert(f.name.clone()); if f.name == "main" { has_main = true; } }
-            // struct defs are just types (fields accessed by name at run time); a
-            // program may declare them and still be boxed. `impl` blocks, enums,
-            // etc. are not supported and fall to `_ => false`.
+            // struct/enum defs are just types (fields accessed by name, variants
+            // constructed by name at run time); a program may declare them and
+            // still be boxed. `impl` blocks etc. are not supported (-> `_ => false`).
+            Item::Enum(e) => { for v in &e.variants { funcs.insert(v.name.clone()); } }
             Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
             _ => return false,
         }
@@ -4324,12 +4377,17 @@ struct BoxRt {
     struct_new: FuncId, struct_set: FuncId, field: FuncId, field_set: FuncId,
     // Phase 4 — maps (index get/set dispatch on tag inside nv_index/nv_index_set)
     map: FuncId, map_put: FuncId,
+    // Phase 5 — enums + match introspection
+    enum_new: FuncId, enum_set: FuncId, enum_is: FuncId, enum_arity: FuncId,
+    enum_data: FuncId, in_range: FuncId, struct_is: FuncId, has_field: FuncId,
+    is_arr: FuncId, no_match: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     module: &'a mut dyn Module,
     ids: &'a HashMap<String, (FuncId, usize)>, // user boxed functions
+    variants: &'a HashMap<String, usize>,      // enum variant name -> arity
     rt: BoxRt,
     vars: HashMap<String, Variable>,
     n_vars: usize,
@@ -4340,7 +4398,8 @@ struct BoxGen<'a, 'b> {
 
 impl<'a, 'b> BoxGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut dyn Module,
-           ids: &'a HashMap<String, (FuncId, usize)>, rt: BoxRt,
+           ids: &'a HashMap<String, (FuncId, usize)>,
+           variants: &'a HashMap<String, usize>, rt: BoxRt,
            params: &[String], body: &[Stmt], is_main: bool) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -4348,7 +4407,7 @@ impl<'a, 'b> BoxGen<'a, 'b> {
         b.seal_block(entry);
         let pv: Vec<Value> = b.block_params(entry).to_vec();
         let mut g = BoxGen {
-            b, module, ids, rt, vars: HashMap::new(), n_vars: 0,
+            b, module, ids, variants, rt, vars: HashMap::new(), n_vars: 0,
             loops: Vec::new(), returned: false, is_main,
         };
         for (i, p) in params.iter().enumerate() {
@@ -4711,7 +4770,12 @@ impl<'a, 'b> BoxGen<'a, 'b> {
             Expr::Bool(v) => { let c = self.b.ins().iconst(I64, *v as i64); Some(self.rt_call(self.rt.boolean, &[c])) }
             Expr::Null => Some(self.rt_call(self.rt.null, &[])),
             Expr::Str(s) => self.lit(s.as_bytes()),
-            Expr::Ident(name) => { let v = *self.vars.get(name)?; Some(self.b.use_var(v)) }
+            Expr::Ident(name) => {
+                if let Some(v) = self.vars.get(name) { return Some(self.b.use_var(*v)); }
+                // a unit enum variant (`None`, `Dot`) used as a value
+                if self.variants.get(name) == Some(&0) { return self.enum_ctor(name, &[]); }
+                None
+            }
             Expr::Unary { op, expr } => {
                 let v = self.expr(expr)?;
                 let id = match op { UnOp::Neg => self.rt.neg, UnOp::Not => self.rt.not, UnOp::BitNot => self.rt.bitnot };
@@ -4778,6 +4842,11 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 if callee == "pop" && args.len() == 1 {
                     let a = self.expr(&args[0])?;
                     return Some(self.rt_call(self.rt.pop, &[a]));
+                }
+                // enum variant constructor: `Some(x)`, `Rect(w, h)`, ...
+                if let Some(&ar) = self.variants.get(callee) {
+                    if args.len() != ar { return None; }
+                    return self.enum_ctor(callee, args);
                 }
                 let (id, arity) = self.ids.get(callee).copied()?;
                 if args.len() != arity { return None; }
@@ -4864,8 +4933,206 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 }
                 Some(mh)
             }
+            Expr::Match { scrutinee, arms } => self.lower_match(scrutinee, arms),
             _ => None,
         }
+    }
+
+    // build an enum value: `nv_enum(variant, ndata)` then set each payload slot.
+    fn enum_ctor(&mut self, variant: &str, args: &[Expr]) -> Option<Value> {
+        let nm = self.lit(variant.as_bytes())?;
+        let nd = self.b.ins().iconst(I64, args.len() as i64);
+        let eh = self.rt_call(self.rt.enum_new, &[nm, nd]);
+        for (i, a) in args.iter().enumerate() {
+            let v = self.expr(a)?;
+            let slot = self.b.ins().iconst(I64, i as i64);
+            self.rt_void(self.rt.enum_set, &[eh, slot, v]);
+        }
+        Some(eh)
+    }
+
+    // Compile `match scrut { arms }` (mirrors interp's eval): evaluate the
+    // scrutinee once; try each arm in order — test the pattern (jumping to the
+    // arm's `fail` block on mismatch, binding vars on match), then the guard;
+    // on success evaluate the body into the shared `merge` result. If no arm
+    // matches, `nv_no_match` errors, exactly like the interpreter.
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> Option<Value> {
+        let scrut = self.expr(scrutinee)?;
+        let sv = self.fresh_var();
+        self.b.def_var(sv, scrut);
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, I64);
+        for arm in arms {
+            let fail = self.b.create_block();
+            let val = self.b.use_var(sv);
+            self.match_pat(&arm.pattern, val, fail)?;
+            if let Some(g) = &arm.guard {
+                let gv = self.truthy(g)?;
+                let cont = self.b.create_block();
+                self.b.ins().brif(gv, cont, &[], fail, &[]);
+                self.b.switch_to_block(cont);
+                self.b.seal_block(cont);
+            }
+            let body = self.expr(&arm.body)?;
+            self.b.ins().jump(merge, &[body]);
+            self.b.switch_to_block(fail);
+            self.b.seal_block(fail);
+        }
+        // fell through every arm -> runtime error (non-exhaustive), then a dead
+        // jump so `merge` has a terminator/predecessor.
+        self.rt_void(self.rt.no_match, &[]);
+        let nul = self.rt_call(self.rt.null, &[]);
+        self.b.ins().jump(merge, &[nul]);
+        self.b.switch_to_block(merge);
+        self.b.seal_block(merge);
+        Some(self.b.block_params(merge)[0])
+    }
+
+    // if `cond` (i64 bool) is false, jump to `fail`; else continue in a fresh block.
+    fn brif_fail(&mut self, cond: Value, fail: Block) {
+        let cont = self.b.create_block();
+        self.b.ins().brif(cond, cont, &[], fail, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+    // pattern equality against a literal value: `nv_truthy(nv_eq(val, lit))`.
+    fn pat_eq(&mut self, val: Value, lit: Value, fail: Block) {
+        let eq = self.rt_call(self.rt.eq, &[val, lit]);
+        let t = self.rt_call(self.rt.truthy, &[eq]);
+        self.brif_fail(t, fail);
+    }
+
+    // Emit a test for `pat` against `val`: on mismatch jump to `fail`; on match
+    // bind pattern variables and fall through. Mirrors interp `match_pattern`.
+    fn match_pat(&mut self, pat: &Pattern, val: Value, fail: Block) -> Option<()> {
+        match pat {
+            Pattern::Wildcard => {}
+            Pattern::Binding(name) => { let v = self.declare(name); self.b.def_var(v, val); }
+            Pattern::Int(n) => { let l = self.b.ins().iconst(I64, *n); let l = self.rt_call(self.rt.int, &[l]); self.pat_eq(val, l, fail); }
+            Pattern::Float(x) => { let f = self.b.ins().f64const(*x); let l = self.rt_call(self.rt.float, &[f]); self.pat_eq(val, l, fail); }
+            Pattern::Bool(b) => { let l = self.b.ins().iconst(I64, *b as i64); let l = self.rt_call(self.rt.boolean, &[l]); self.pat_eq(val, l, fail); }
+            Pattern::Str(s) => { let l = self.lit(s.as_bytes())?; self.pat_eq(val, l, fail); }
+            Pattern::Null => { let l = self.rt_call(self.rt.null, &[]); self.pat_eq(val, l, fail); }
+            Pattern::Range { lo, hi, inclusive } => {
+                let lo = self.b.ins().iconst(I64, *lo);
+                let hi = self.b.ins().iconst(I64, *hi);
+                let inc = self.b.ins().iconst(I64, *inclusive as i64);
+                let t = self.rt_call(self.rt.in_range, &[val, lo, hi, inc]);
+                self.brif_fail(t, fail);
+            }
+            Pattern::EnumVariant { name, sub } => {
+                let nm = self.lit(name.as_bytes())?;
+                let isv = self.rt_call(self.rt.enum_is, &[val, nm]);
+                self.brif_fail(isv, fail);
+                let ar = self.rt_call(self.rt.enum_arity, &[val]);
+                let want = self.b.ins().iconst(I64, sub.len() as i64);
+                let aok = self.b.ins().icmp(IntCC::Equal, ar, want);
+                let aok = self.b.ins().uextend(I64, aok);
+                self.brif_fail(aok, fail);
+                for (i, sp) in sub.iter().enumerate() {
+                    let idx = self.b.ins().iconst(I64, i as i64);
+                    let di = self.rt_call(self.rt.enum_data, &[val, idx]);
+                    self.match_pat(sp, di, fail)?;
+                }
+            }
+            Pattern::Tuple(subs) => {
+                let isa = self.rt_call(self.rt.is_arr, &[val]);
+                self.brif_fail(isa, fail);
+                let nh = self.rt_call(self.rt.len, &[val]);
+                let n = self.rt_call(self.rt.as_int, &[nh]);
+                let want = self.b.ins().iconst(I64, subs.len() as i64);
+                let lok = self.b.ins().icmp(IntCC::Equal, n, want);
+                let lok = self.b.ins().uextend(I64, lok);
+                self.brif_fail(lok, fail);
+                for (i, sp) in subs.iter().enumerate() {
+                    let idx = self.b.ins().iconst(I64, i as i64);
+                    let ib = self.rt_call(self.rt.int, &[idx]);
+                    let el = self.rt_call(self.rt.index, &[val, ib]);
+                    self.match_pat(sp, el, fail)?;
+                }
+            }
+            Pattern::Slice { prefix, rest, suffix } => {
+                let isa = self.rt_call(self.rt.is_arr, &[val]);
+                self.brif_fail(isa, fail);
+                let nh = self.rt_call(self.rt.len, &[val]);
+                let n = self.rt_call(self.rt.as_int, &[nh]);
+                match rest {
+                    None => {
+                        // exact length
+                        let want = self.b.ins().iconst(I64, prefix.len() as i64);
+                        let lok = self.b.ins().icmp(IntCC::Equal, n, want);
+                        let lok = self.b.ins().uextend(I64, lok);
+                        self.brif_fail(lok, fail);
+                        for (i, sp) in prefix.iter().enumerate() {
+                            let idx = self.b.ins().iconst(I64, i as i64);
+                            let ib = self.rt_call(self.rt.int, &[idx]);
+                            let el = self.rt_call(self.rt.index, &[val, ib]);
+                            self.match_pat(sp, el, fail)?;
+                        }
+                    }
+                    Some(rest_name) => {
+                        // n >= prefix.len() + suffix.len()
+                        let minlen = self.b.ins().iconst(I64, (prefix.len() + suffix.len()) as i64);
+                        let lok = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, n, minlen);
+                        let lok = self.b.ins().uextend(I64, lok);
+                        self.brif_fail(lok, fail);
+                        for (i, sp) in prefix.iter().enumerate() {
+                            let idx = self.b.ins().iconst(I64, i as i64);
+                            let ib = self.rt_call(self.rt.int, &[idx]);
+                            let el = self.rt_call(self.rt.index, &[val, ib]);
+                            self.match_pat(sp, el, fail)?;
+                        }
+                        // suffix from the back: index n - suffix.len() + i
+                        let sl = self.b.ins().iconst(I64, suffix.len() as i64);
+                        let sstart = self.b.ins().isub(n, sl);
+                        for (i, sp) in suffix.iter().enumerate() {
+                            let off = self.b.ins().iconst(I64, i as i64);
+                            let idx = self.b.ins().iadd(sstart, off);
+                            let ib = self.rt_call(self.rt.int, &[idx]);
+                            let el = self.rt_call(self.rt.index, &[val, ib]);
+                            self.match_pat(sp, el, fail)?;
+                        }
+                        if let Some(name) = rest_name {
+                            // bind the middle slice arr[prefix.len() .. n-suffix.len()]
+                            let plen = self.b.ins().iconst(I64, prefix.len() as i64);
+                            let one = self.b.ins().iconst(I64, 1);
+                            let zero = self.b.ins().iconst(I64, 0);
+                            let mid = self.rt_call(self.rt.slice, &[val, plen, one, sstart, one, zero]);
+                            let v = self.declare(name);
+                            self.b.def_var(v, mid);
+                        }
+                    }
+                }
+            }
+            Pattern::Struct { name, fields } => {
+                let nm = self.lit(name.as_bytes())?;
+                let iss = self.rt_call(self.rt.struct_is, &[val, nm]);
+                self.brif_fail(iss, fail);
+                for (fname, fpat) in fields {
+                    let fh = self.lit(fname.as_bytes())?;
+                    let has = self.rt_call(self.rt.has_field, &[val, fh]);
+                    self.brif_fail(has, fail);
+                    let fh2 = self.lit(fname.as_bytes())?;
+                    let fv = self.rt_call(self.rt.field, &[val, fh2]);
+                    self.match_pat(fpat, fv, fail)?;
+                }
+            }
+            Pattern::Or(alts) => {
+                // non-binding alts (guaranteed by pattern_ok): match if ANY alt matches.
+                let matched = self.b.create_block();
+                for alt in alts {
+                    let next = self.b.create_block();
+                    self.match_pat(alt, val, next)?;
+                    self.b.ins().jump(matched, &[]);
+                    self.b.switch_to_block(next);
+                    self.b.seal_block(next);
+                }
+                self.b.ins().jump(fail, &[]);
+                self.b.switch_to_block(matched);
+                self.b.seal_block(matched);
+            }
+        }
+        Some(())
     }
 
     // a slice endpoint: (raw i64 value, has-flag). An open end -> (0, 0), matching
@@ -4921,10 +5188,13 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
     if !box_eligible(prog) { return None; }
     let mut main: Option<&Func> = None;
     let mut fns: Vec<&Func> = Vec::new();
+    // enum variant name -> arity, for construction + arity checks.
+    let mut variants: HashMap<String, usize> = HashMap::new();
     for it in &prog.items {
         match it {
             Item::Func(f) if f.name == "main" => main = Some(f),
             Item::Func(f) => fns.push(f),
+            Item::Enum(e) => { for v in &e.variants { variants.insert(v.name.clone(), v.arity); } }
             Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
             _ => return None,
         }
@@ -4982,6 +5252,16 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         field_set: decl(&mut module, "nv_field_set", &[I64, I64, I64], false)?,
         map: decl(&mut module, "nv_map", &[I64], true)?,
         map_put: decl(&mut module, "nv_map_put", &[I64, I64, I64], false)?,
+        enum_new: decl(&mut module, "nv_enum", &[I64, I64], true)?,
+        enum_set: decl(&mut module, "nv_enum_set", &[I64, I64, I64], false)?,
+        enum_is: decl(&mut module, "nv_enum_is", &[I64, I64], true)?,
+        enum_arity: decl(&mut module, "nv_enum_arity", &[I64], true)?,
+        enum_data: decl(&mut module, "nv_enum_data", &[I64, I64], true)?,
+        in_range: decl(&mut module, "nv_in_range", &[I64, I64, I64, I64], true)?,
+        struct_is: decl(&mut module, "nv_struct_is", &[I64, I64], true)?,
+        has_field: decl(&mut module, "nv_has_field", &[I64, I64], true)?,
+        is_arr: decl(&mut module, "nv_is_arr", &[I64], true)?,
+        no_match: decl(&mut module, "nv_no_match", &[], false)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5005,7 +5285,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         ctx.func.signature.returns.push(AbiParam::new(I64));
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-            let mut g = BoxGen::new(&mut b, &mut module, &ids, rt, &f.params, &f.body, false);
+            let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, rt, &f.params, &f.body, false);
             g.lower(&f.body)?;
             b.finalize();
         }
@@ -5022,7 +5302,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
     ctx.func.signature.returns.push(AbiParam::new(I32));
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mut g = BoxGen::new(&mut b, &mut module, &ids, rt, &[], &main.body, true);
+        let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, rt, &[], &main.body, true);
         g.lower(&main.body)?;
         b.finalize();
     }
@@ -5514,6 +5794,11 @@ mod jit_tests {
             // set (insert + overwrite), whole-map print (insertion order), set literal
             "fn main(){ m = #{\"a\": 1, \"b\": 2}  m[\"c\"] = 3  m[\"a\"] = 10  print(m[\"a\"])  print(m[\"z\"])  print(m) }",
             "fn main(){ s = #(1, 2, 2, 3)  print(s)  print(#{\"k\": s}) }",
+            // Phase 5 enums + match: variant construction (unit + tuple), match with
+            // enum-variant patterns + guards + bindings + wildcard, whole-enum print
+            "enum Shape { Dot, Line(i32), Rect(i32, i32) } fn area(s){ match s { Dot => 0, Line(_) => 0, Rect(w, h) if w == h => w * w, Rect(w, h) => w * h } } fn main(){ print(area(Dot))  print(area(Line(9)))  print(area(Rect(3, 4)))  print(area(Rect(5, 5)))  print(Rect(2, 3)) }",
+            // match with slice, range, and or-patterns over a literal scrutinee
+            "fn main(){ p = [1, 2, 3]  match p { [a, b, c] => print(a + b + c), _ => print(0) }  match 42 { 0..=10 => print(\"small\"), 11 | 42 => print(\"magic\"), _ => print(\"big\") } }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
@@ -5545,7 +5830,7 @@ mod jit_tests {
         for src in [
             "fn main(){ for i in 0..3 { if i == 1 { continue }  print(i) } }", // continue
             "fn main(){ n = 3  x = n ** 2  print(x) }",             // pow (box-ineligible, unfoldable)
-            "fn main(){ x = 5  match x { 1 => print(\"one\"), _ => print(\"other\") } }", // match
+            "fn main(){ print(map([1, 2, 3], (x) => x * 2)) }",    // closure / higher-order
             "fn main(){ try { print(1) } catch e { print(2) } }",  // try/catch
         ] {
             let mut prog = parse_program(src).expect("parse");
