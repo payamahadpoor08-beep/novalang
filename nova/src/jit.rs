@@ -4227,6 +4227,10 @@ fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>)
             box_expr_ok(lo, funcs, scopes) && box_expr_ok(hi, funcs, scopes),
         Expr::StructLit { fields, .. } => fields.iter().all(|(_, e)| box_expr_ok(e, funcs, scopes)),
         Expr::Field { base, .. } => box_expr_ok(base, funcs, scopes),
+        Expr::SafeField { base, .. } => box_expr_ok(base, funcs, scopes),
+        // a method call `recv.m(args)` — resolution (unique method name) is codegen's job.
+        Expr::MethodCall { base, args, .. } =>
+            box_expr_ok(base, funcs, scopes) && args.iter().all(|a| box_expr_ok(a, funcs, scopes)),
         Expr::MapLit(pairs) => pairs.iter().all(|(k, v)| box_expr_ok(k, funcs, scopes) && box_expr_ok(v, funcs, scopes)),
         Expr::SetLit(elems) => elems.iter().all(|e| box_expr_ok(e, funcs, scopes)),
         Expr::Call { callee, args } => {
@@ -4328,6 +4332,29 @@ fn box_stmt_ok(s: &Stmt, funcs: &HashSet<String>, scopes: &mut Vec<HashSet<Strin
 // A whole-program eligibility check: every item is a function (Const/Test are
 // skipped, mirroring `analyze_boxed`), `main` exists and takes no params, and
 // every function body is Phase-1 boxed (non-`main` functions may `return`).
+// All methods a program defines as (type_name, &Func) — every `impl` method plus
+// the trait default methods an `impl Trait for Type {}` inherits without override
+// (mirrors the interpreter's method table build).
+fn box_methods(prog: &Program) -> Vec<(String, &Func)> {
+    let mut traits: HashMap<&str, &TraitDef> = HashMap::new();
+    for it in &prog.items { if let Item::Trait(t) = it { traits.insert(&t.name, t); } }
+    let mut out: Vec<(String, &Func)> = Vec::new();
+    for it in &prog.items {
+        if let Item::Impl(imp) = it {
+            let mut have: HashSet<&str> = HashSet::new();
+            for m in &imp.methods { out.push((imp.type_name.clone(), m)); have.insert(m.name.as_str()); }
+            if let Some(tn) = &imp.trait_name {
+                if let Some(t) = traits.get(tn.as_str()) {
+                    for d in &t.defaults {
+                        if !have.contains(d.name.as_str()) { out.push((imp.type_name.clone(), d)); }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn box_eligible(prog: &Program) -> bool {
     // `funcs` doubles as the "callable/constructible name" set: user functions AND
     // enum variant names (a variant call constructs an enum; a unit-variant ident
@@ -4337,26 +4364,32 @@ fn box_eligible(prog: &Program) -> bool {
     for it in &prog.items {
         match it {
             Item::Func(f) => { funcs.insert(f.name.clone()); if f.name == "main" { has_main = true; } }
-            // struct/enum defs are just types (fields accessed by name, variants
-            // constructed by name at run time); a program may declare them and
-            // still be boxed. `impl` blocks etc. are not supported (-> `_ => false`).
+            // struct/enum defs are types; `impl`/`trait` bring methods (checked
+            // below). A program may declare all of these and still be boxed.
             Item::Enum(e) => { for v in &e.variants { funcs.insert(v.name.clone()); } }
-            Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
+            Item::Const { .. } | Item::Test(_) | Item::Struct(_) | Item::Impl(_) | Item::Trait(_) => {}
             _ => return false,
         }
     }
     if !has_main { return false; }
+    let check_body = |f: &Func| -> bool {
+        // The parser wraps a function's trailing expression as `Return(Some(..))`,
+        // including in `main`. BoxGen handles a `Return` in main by evaluating it
+        // for side effects and returning i32 0, so returns are allowed everywhere.
+        let mut scopes = vec![HashSet::new()];
+        for p in &f.params { scopes.last_mut().unwrap().insert(p.clone()); }
+        f.body.iter().all(|s| box_stmt_ok(s, &funcs, &mut scopes, true))
+    };
     for it in &prog.items {
         if let Item::Func(f) = it {
             if f.name == "main" && !f.params.is_empty() { return false; }
-            // The parser wraps a function's trailing expression as `Return(Some(..))`,
-            // including in `main` (e.g. `print(x)` becomes the tail return). BoxGen
-            // handles a `Return` in main by evaluating it for side effects and then
-            // returning i32 0, so returns are allowed everywhere.
-            let mut scopes = vec![HashSet::new()];
-            for p in &f.params { scopes.last_mut().unwrap().insert(p.clone()); }
-            if !f.body.iter().all(|s| box_stmt_ok(s, &funcs, &mut scopes, true)) { return false; }
+            if !check_body(f) { return false; }
         }
+    }
+    // every impl / trait-default method body must also be boxed (all methods a
+    // program declares are compiled, since dispatch is monomorphic by name).
+    for (_, m) in box_methods(prog) {
+        if !check_body(m) { return false; }
     }
     true
 }
@@ -4381,6 +4414,8 @@ struct BoxRt {
     enum_new: FuncId, enum_set: FuncId, enum_is: FuncId, enum_arity: FuncId,
     enum_data: FuncId, in_range: FuncId, struct_is: FuncId, has_field: FuncId,
     is_arr: FuncId, no_match: FuncId,
+    // Phase 6 — methods / safe-field
+    safe_field: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
@@ -4388,6 +4423,7 @@ struct BoxGen<'a, 'b> {
     module: &'a mut dyn Module,
     ids: &'a HashMap<String, (FuncId, usize)>, // user boxed functions
     variants: &'a HashMap<String, usize>,      // enum variant name -> arity
+    methods: &'a HashMap<String, (FuncId, usize)>, // unique method name -> (id, nparams incl self)
     rt: BoxRt,
     vars: HashMap<String, Variable>,
     n_vars: usize,
@@ -4399,7 +4435,8 @@ struct BoxGen<'a, 'b> {
 impl<'a, 'b> BoxGen<'a, 'b> {
     fn new(b: &'a mut FunctionBuilder<'b>, module: &'a mut dyn Module,
            ids: &'a HashMap<String, (FuncId, usize)>,
-           variants: &'a HashMap<String, usize>, rt: BoxRt,
+           variants: &'a HashMap<String, usize>,
+           methods: &'a HashMap<String, (FuncId, usize)>, rt: BoxRt,
            params: &[String], body: &[Stmt], is_main: bool) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -4407,7 +4444,7 @@ impl<'a, 'b> BoxGen<'a, 'b> {
         b.seal_block(entry);
         let pv: Vec<Value> = b.block_params(entry).to_vec();
         let mut g = BoxGen {
-            b, module, ids, variants, rt, vars: HashMap::new(), n_vars: 0,
+            b, module, ids, variants, methods, rt, vars: HashMap::new(), n_vars: 0,
             loops: Vec::new(), returned: false, is_main,
         };
         for (i, p) in params.iter().enumerate() {
@@ -4909,6 +4946,24 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let nm = self.lit(field.as_bytes())?;
                 Some(self.rt_call(self.rt.field, &[b, nm]))
             }
+            // optional-chained field `base?.field` -> nv_safe_field (null on null).
+            Expr::SafeField { base, field } => {
+                let b = self.expr(base)?;
+                let nm = self.lit(field.as_bytes())?;
+                Some(self.rt_call(self.rt.safe_field, &[b, nm]))
+            }
+            // method call `recv.m(args)`: monomorphic dispatch by unique method
+            // name to the compiled `type$method`, with `recv` as the `self` arg.
+            Expr::MethodCall { base, method, args } => {
+                let (id, nparams) = self.methods.get(method).copied()?;
+                if args.len() + 1 != nparams { return None; }
+                let b = self.expr(base)?;
+                let mut av = vec![b];
+                for a in args { av.push(self.expr(a)?); }
+                let f = self.module.declare_func_in_func(id, self.b.func);
+                let call = self.b.ins().call(f, &av);
+                Some(self.b.inst_results(call)[0])
+            }
             // a map literal: insertion-ordered pairs, keys/values evaluated in
             // source order; nv_map_put dedups (last write wins), matching interp.
             Expr::MapLit(pairs) => {
@@ -5195,7 +5250,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
             Item::Func(f) if f.name == "main" => main = Some(f),
             Item::Func(f) => fns.push(f),
             Item::Enum(e) => { for v in &e.variants { variants.insert(v.name.clone(), v.arity); } }
-            Item::Const { .. } | Item::Test(_) | Item::Struct(_) => {}
+            Item::Const { .. } | Item::Test(_) | Item::Struct(_) | Item::Impl(_) | Item::Trait(_) => {}
             _ => return None,
         }
     }
@@ -5262,6 +5317,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         has_field: decl(&mut module, "nv_has_field", &[I64, I64], true)?,
         is_arr: decl(&mut module, "nv_is_arr", &[I64], true)?,
         no_match: decl(&mut module, "nv_no_match", &[], false)?,
+        safe_field: decl(&mut module, "nv_safe_field", &[I64, I64], true)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5272,6 +5328,27 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         sig.returns.push(AbiParam::new(I64));
         let id = module.declare_function(&f.name, Linkage::Local, &sig).ok()?;
         ids.insert(f.name.clone(), (id, f.params.len()));
+    }
+
+    // 2b) declare every impl / trait-default method as `type$method` (self is the
+    //     first param). Dispatch is monomorphic by method NAME: a name unique
+    //     across all types goes in `methods`; an ambiguous name is omitted so its
+    //     call sites decline (fall back) rather than pick the wrong method.
+    let method_list = box_methods(prog);
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for (_, m) in &method_list { *name_count.entry(m.name.as_str()).or_insert(0) += 1; }
+    let mut method_jobs: Vec<(FuncId, &Func)> = Vec::new();
+    let mut methods: HashMap<String, (FuncId, usize)> = HashMap::new();
+    for (ty, m) in &method_list {
+        let mangled = format!("{}${}", ty, m.name);
+        let mut sig = module.make_signature();
+        for _ in 0..m.params.len() { sig.params.push(AbiParam::new(I64)); }
+        sig.returns.push(AbiParam::new(I64));
+        let id = module.declare_function(&mangled, Linkage::Local, &sig).ok()?;
+        method_jobs.push((id, m));
+        if name_count[m.name.as_str()] == 1 {
+            methods.insert(m.name.clone(), (id, m.params.len()));
+        }
     }
 
     let mut fctx = FunctionBuilderContext::new();
@@ -5285,11 +5362,25 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         ctx.func.signature.returns.push(AbiParam::new(I64));
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-            let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, rt, &f.params, &f.body, false);
+            let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, &methods, rt, &f.params, &f.body, false);
             g.lower(&f.body)?;
             b.finalize();
         }
         jobs.push((id, ctx));
+    }
+
+    // 3b) codegen each method (self + params -> handle).
+    for (id, m) in &method_jobs {
+        let mut ctx = module.make_context();
+        for _ in 0..m.params.len() { ctx.func.signature.params.push(AbiParam::new(I64)); }
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, &methods, rt, &m.params, &m.body, false);
+            g.lower(&m.body)?;
+            b.finalize();
+        }
+        jobs.push((*id, ctx));
     }
 
     // 4) codegen `main` -> C-ABI `int main(void)` returning 0.
@@ -5302,7 +5393,7 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
     ctx.func.signature.returns.push(AbiParam::new(I32));
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, rt, &[], &main.body, true);
+        let mut g = BoxGen::new(&mut b, &mut module, &ids, &variants, &methods, rt, &[], &main.body, true);
         g.lower(&main.body)?;
         b.finalize();
     }
@@ -5799,6 +5890,11 @@ mod jit_tests {
             "enum Shape { Dot, Line(i32), Rect(i32, i32) } fn area(s){ match s { Dot => 0, Line(_) => 0, Rect(w, h) if w == h => w * w, Rect(w, h) => w * h } } fn main(){ print(area(Dot))  print(area(Line(9)))  print(area(Rect(3, 4)))  print(area(Rect(5, 5)))  print(Rect(2, 3)) }",
             // match with slice, range, and or-patterns over a literal scrutinee
             "fn main(){ p = [1, 2, 3]  match p { [a, b, c] => print(a + b + c), _ => print(0) }  match 42 { 0..=10 => print(\"small\"), 11 | 42 => print(\"magic\"), _ => print(\"big\") } }",
+            // Phase 6 impl methods: method dispatch by unique name (self + args),
+            // methods returning int/string, and a trait default method
+            "struct C { n: Int } impl C { fn bump(self, k){ self.n + k } fn label(self){ \"n=\" + str(self.n) } } trait D { fn describe(self){ \"a thing\" } } struct W { id: Int } impl D for W {} fn main(){ c = C { n: 7 }  print(c.bump(2))  print(c.label())  w = W { id: 1 }  print(w.describe()) }",
+            // safe-field: `?.` returns null on a null base
+            "struct P { x: Int } fn get(b){ if b { P { x: 5 } } else { null } } fn main(){ print(get(true)?.x)  print(get(false)?.x) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
