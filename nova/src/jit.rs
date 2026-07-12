@@ -4144,7 +4144,7 @@ fn box_collect_vars(body: &[Stmt], out: &mut Vec<String>) {
             Stmt::Let { name, .. } | Stmt::Assign { name, .. } => {
                 if !out.contains(name) { out.push(name.clone()); }
             }
-            Stmt::ForRange { var, body, .. } => {
+            Stmt::ForRange { var, body, .. } | Stmt::ForEach { var, body, .. } => {
                 if !out.contains(var) { out.push(var.clone()); }
                 box_collect_vars(body, out);
             }
@@ -4178,9 +4178,22 @@ fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>)
             FmtPart::Lit(_) => true,
             FmtPart::Expr(e) => box_expr_ok(e, funcs, scopes),
         }),
+        Expr::Array(xs) => xs.iter().all(|x| box_expr_ok(x, funcs, scopes)),
+        Expr::Index { base, index } => {
+            if !box_expr_ok(base, funcs, scopes) { return false; }
+            if let Expr::RangeLit { lo, hi, .. } = strip_at(index) {
+                lo.as_ref().map_or(true, |e| box_expr_ok(e, funcs, scopes))
+                    && hi.as_ref().map_or(true, |e| box_expr_ok(e, funcs, scopes))
+            } else {
+                box_expr_ok(index, funcs, scopes)
+            }
+        }
+        Expr::RangeLit { lo: Some(lo), hi: Some(hi), .. } =>
+            box_expr_ok(lo, funcs, scopes) && box_expr_ok(hi, funcs, scopes),
         Expr::Call { callee, args } => {
             let is_str = (callee == "str" || callee == "to_str") && args.len() == 1;
-            let ok = funcs.contains(callee) || callee == "print" || callee == "len" || is_str;
+            let ok = funcs.contains(callee) || callee == "print" || callee == "len" || is_str
+                || (callee == "push" && args.len() == 2) || (callee == "pop" && args.len() == 1);
             ok && args.iter().all(|a| box_expr_ok(a, funcs, scopes))
                 && !(callee == "print" && args.len() != 1)
                 && !(callee == "len" && args.len() != 1)
@@ -4209,6 +4222,18 @@ fn box_stmt_ok(s: &Stmt, funcs: &HashSet<String>, scopes: &mut Vec<HashSet<Strin
                 scopes.last_mut().unwrap().insert(name.clone());
             }
             true
+        }
+        Stmt::IndexAssign { base, index, value } =>
+            box_expr_ok(base, funcs, scopes) && box_expr_ok(index, funcs, scopes)
+            && box_expr_ok(value, funcs, scopes),
+        Stmt::ForEach { var, iter, body } => {
+            if !box_expr_ok(iter, funcs, scopes) { return false; }
+            if scopes.iter().any(|sc| sc.contains(var)) { return false; }
+            scopes.push(HashSet::new());
+            scopes.last_mut().unwrap().insert(var.clone());
+            let r = body.iter().all(|s| box_stmt_ok(s, funcs, scopes, allow_ret));
+            scopes.pop();
+            r
         }
         Stmt::If { cond, then, els } => {
             if !box_expr_ok(cond, funcs, scopes) { return false; }
@@ -4283,6 +4308,9 @@ struct BoxRt {
     bit: FuncId, neg: FuncId, not: FuncId, bitnot: FuncId,
     truthy: FuncId, concat: FuncId, tostr: FuncId, len: FuncId,
     as_int: FuncId, print: FuncId,
+    // Phase 2 — arrays
+    arr: FuncId, arr_push: FuncId, pop: FuncId, index: FuncId,
+    index_set: FuncId, slice: FuncId, range: FuncId, iter: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
@@ -4415,10 +4443,17 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 }
                 self.returned = true;
             }
+            Stmt::IndexAssign { base, index, value } => {
+                let b = self.expr(base)?;
+                let i = self.expr(index)?;
+                let v = self.expr(value)?;
+                self.rt_void(self.rt.index_set, &[b, i, v]);
+            }
             Stmt::If { cond, then, els } => self.if_stmt(cond, then, els.as_deref())?,
             Stmt::While { cond, body } => self.while_stmt(cond, body)?,
             Stmt::ForRange { var, start, end, inclusive, body } =>
                 self.for_range(var, start, end, *inclusive, body)?,
+            Stmt::ForEach { var, iter, body } => self.for_each(var, iter, body)?,
             Stmt::Break(None) => {
                 let exit = self.loops.last()?.exit;
                 self.b.ins().jump(exit, &[]);
@@ -4513,6 +4548,61 @@ impl<'a, 'b> BoxGen<'a, 'b> {
         let boxed = self.rt_call(self.rt.int, &[cur]);
         let iv = self.declare(var);
         self.b.def_var(iv, boxed);
+        self.loops.push(LoopCtx { header, exit });
+        self.returned = false;
+        for st in body { self.stmt(st)?; }
+        if !self.returned {
+            let cur = self.b.use_var(ctr);
+            let one = self.b.ins().iconst(I64, 1);
+            let next = self.b.ins().iadd(cur, one);
+            self.b.def_var(ctr, next);
+            self.b.ins().jump(header, &[]);
+        }
+        self.loops.pop();
+
+        self.b.seal_block(header);
+        self.b.switch_to_block(exit);
+        self.b.seal_block(exit);
+        self.returned = false;
+        Some(())
+    }
+
+    // foreach over an array/string/range: snapshot the iterable (nv_iter, so body
+    // mutation is invisible, matching the interpreter), then index 0..len,
+    // rebinding `var` to each element. `continue` is box-ineligible, so the
+    // increment can never be bypassed.
+    fn for_each(&mut self, var: &str, iter: &Expr, body: &[Stmt]) -> Option<()> {
+        let it0 = self.expr(iter)?;
+        let it = self.rt_call(self.rt.iter, &[it0]);
+        let itv = self.fresh_var();
+        self.b.def_var(itv, it);
+        let nh = self.rt_call(self.rt.len, &[it]);
+        let n = self.rt_call(self.rt.as_int, &[nh]);
+        let limit = self.fresh_var();
+        self.b.def_var(limit, n);
+        let ctr = self.fresh_var();
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.def_var(ctr, zero);
+
+        let header = self.b.create_block();
+        let body_b = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        let i = self.b.use_var(ctr);
+        let lim = self.b.use_var(limit);
+        let cont = self.b.ins().icmp(IntCC::SignedLessThan, i, lim);
+        self.b.ins().brif(cont, body_b, &[], exit, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b);
+        let cur = self.b.use_var(ctr);
+        let curbox = self.rt_call(self.rt.int, &[cur]);
+        let ith = self.b.use_var(itv);
+        let elem = self.rt_call(self.rt.index, &[ith, curbox]);
+        let iv = self.declare(var);
+        self.b.def_var(iv, elem);
         self.loops.push(LoopCtx { header, exit });
         self.returned = false;
         for st in body { self.stmt(st)?; }
@@ -4660,6 +4750,16 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                     let v = self.expr(&args[0])?;
                     return Some(self.rt_call(self.rt.tostr, &[v]));
                 }
+                if callee == "push" && args.len() == 2 {
+                    let a = self.expr(&args[0])?;
+                    let v = self.expr(&args[1])?;
+                    self.rt_void(self.rt.arr_push, &[a, v]);
+                    return Some(self.rt_call(self.rt.null, &[]));
+                }
+                if callee == "pop" && args.len() == 1 {
+                    let a = self.expr(&args[0])?;
+                    return Some(self.rt_call(self.rt.pop, &[a]));
+                }
                 let (id, arity) = self.ids.get(callee).copied()?;
                 if args.len() != arity { return None; }
                 let mut av = Vec::new();
@@ -4668,7 +4768,55 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let call = self.b.ins().call(f, &av);
                 Some(self.b.inst_results(call)[0])
             }
+            Expr::Array(xs) => {
+                let cap = self.b.ins().iconst(I64, (xs.len().max(1)) as i64);
+                let h = self.rt_call(self.rt.arr, &[cap]);
+                for x in xs {
+                    let v = self.expr(x)?;
+                    self.rt_void(self.rt.arr_push, &[h, v]);
+                }
+                Some(h)
+            }
+            Expr::Index { base, index } => {
+                if let Expr::RangeLit { lo, hi, inclusive } = strip_at(index) {
+                    let b = self.expr(base)?;
+                    let (lo_v, has_lo) = self.slice_bound(lo)?;
+                    let (hi_v, has_hi) = self.slice_bound(hi)?;
+                    let inc = self.b.ins().iconst(I64, *inclusive as i64);
+                    Some(self.rt_call(self.rt.slice, &[b, lo_v, has_lo, hi_v, has_hi, inc]))
+                } else {
+                    let b = self.expr(base)?;
+                    let i = self.expr(index)?;
+                    Some(self.rt_call(self.rt.index, &[b, i]))
+                }
+            }
+            Expr::RangeLit { lo: Some(lo), hi: Some(hi), inclusive } => {
+                let l = self.expr(lo)?;
+                let lr = self.rt_call(self.rt.as_int, &[l]);
+                let h = self.expr(hi)?;
+                let hr = self.rt_call(self.rt.as_int, &[h]);
+                let inc = self.b.ins().iconst(I64, *inclusive as i64);
+                Some(self.rt_call(self.rt.range, &[lr, hr, inc]))
+            }
             _ => None,
+        }
+    }
+
+    // a slice endpoint: (raw i64 value, has-flag). An open end -> (0, 0), matching
+    // nv_slice's `l = has_lo ? nv_as_int(lo) : 0`.
+    fn slice_bound(&mut self, e: &Option<Box<Expr>>) -> Option<(Value, Value)> {
+        match e {
+            Some(x) => {
+                let v = self.expr(x)?;
+                let raw = self.rt_call(self.rt.as_int, &[v]);
+                let one = self.b.ins().iconst(I64, 1);
+                Some((raw, one))
+            }
+            None => {
+                let zero = self.b.ins().iconst(I64, 0);
+                let z2 = self.b.ins().iconst(I64, 0);
+                Some((zero, z2))
+            }
         }
     }
 }
@@ -4754,6 +4902,14 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         len: decl(&mut module, "nv_len", &[I64], true)?,
         as_int: decl(&mut module, "nv_as_int", &[I64], true)?,
         print: decl(&mut module, "nv_print", &[I64], false)?,
+        arr: decl(&mut module, "nv_arr", &[I64], true)?,
+        arr_push: decl(&mut module, "nv_arr_push", &[I64, I64], false)?,
+        pop: decl(&mut module, "nv_pop", &[I64], true)?,
+        index: decl(&mut module, "nv_index", &[I64, I64], true)?,
+        index_set: decl(&mut module, "nv_index_set", &[I64, I64, I64], false)?,
+        slice: decl(&mut module, "nv_slice", &[I64, I64, I64, I64, I64, I64], true)?,
+        range: decl(&mut module, "nv_range", &[I64, I64, I64], true)?,
+        iter: decl(&mut module, "nv_iter", &[I64], true)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5272,6 +5428,12 @@ mod jit_tests {
             "fn main(){ i = 0  x = 1.5  while i < 3 { x = x + 1.0  i = i + 1 }  print(x) }",
             // boolean logic + comparison
             "fn main(){ a = 3  b = 5  print(a < b && b < 10)  print(a > b || b == 5) }",
+            // Phase 2 arrays: literal, index-assign, foreach, len, whole-array print
+            "fn main(){ xs = [1, 2, 3]  xs[1] = 20  s = 0  for x in xs { s = s + x }  print(xs)  print(s)  print(len(xs)) }",
+            // push into an empty array, pop, slice
+            "fn main(){ xs = []  for i in 0..5 { push(xs, i * i) }  print(xs)  print(pop(xs))  print(xs[0..2]) }",
+            // a function that builds and returns an array, iterated by the caller
+            "fn squares(n){ out = []  for i in 1..=n { push(out, i * i) }  out } fn main(){ r = squares(4)  for v in r { print(v) }  print(r) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
@@ -5296,20 +5458,20 @@ mod jit_tests {
             assert!(obj.len() > 64);
         }
     }
-    // Phase-2 forms (arrays/maps/structs, foreach, match, try, closures,
-    // generators, `continue`) are NOT boxed yet — they decline cleanly so the
-    // build falls back to the C/embed AOT (output still correct via the gate).
-    #[test] fn native_object_boxed_declines_phase2() {
+    // Remaining unsupported forms (maps/structs, match, try, closures, generators,
+    // `continue`, `pow`) decline cleanly so the build falls back to the C/embed AOT
+    // (output still correct via the gate).
+    #[test] fn native_object_boxed_declines_unsupported() {
         for src in [
-            "fn main(){ xs = [1, 2, 3]  print(xs[0]) }",           // array
-            "fn main(){ xs = [1, 2]  for x in xs { print(x) } }",  // foreach
             "fn main(){ for i in 0..3 { if i == 1 { continue }  print(i) } }", // continue
             "fn main(){ n = 3  x = n ** 2  print(x) }",             // pow (box-ineligible, unfoldable)
+            "fn main(){ x = 5  match x { 1 => print(\"one\"), _ => print(\"other\") } }", // match
+            "fn main(){ try { print(1) } catch e { print(2) } }",  // try/catch
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
             assert!(super::compile_object_boxed(&prog, super::NativeTarget::Host).is_none(),
-                    "boxed tier must decline Phase-2 program: {}", src);
+                    "boxed tier must decline unsupported program: {}", src);
         }
     }
 }
