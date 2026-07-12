@@ -21,7 +21,7 @@
 
 typedef int64_t i64;
 
-enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR };
+enum { BV_INT, BV_FLOAT, BV_BOOL, BV_NULL, BV_STR, BV_ARR, BV_STRUCT };
 
 typedef struct BStr {
     i64 nchars;      /* Nova indexes strings by Unicode char */
@@ -36,9 +36,19 @@ typedef struct BArr {
     i64 *items;      /* each element is a value handle (i64) */
 } BArr;
 
+/* struct instance: type name + field-name/value handles, in SORTED field order
+ * (matching the interpreter's Display, which sorts keys). Field access is by
+ * name (linear scan over the few fields) so no compile-time slot map is needed. */
+typedef struct BStruct {
+    i64 type_name;   /* handle to a BV_STR */
+    i64 nfields;
+    i64 *names;      /* handles to BV_STR field names (sorted) */
+    i64 *values;     /* value handles, parallel to names */
+} BStruct;
+
 typedef struct BV {
     uint8_t tag;
-    union { i64 i; double f; BStr *s; BArr *a; };
+    union { i64 i; double f; BStr *s; BArr *a; BStruct *st; };
 } BV;
 
 /* handle <-> pointer. Allocate-and-leak: a boxed value lives for the whole run. */
@@ -109,6 +119,47 @@ i64 nv_pop(i64 arrh) {
     return a->items[--a->len];
 }
 
+/* ---- structs (handle name/value slots; field access by name) ---- */
+i64 nv_struct(i64 type_name_h, i64 nfields) {
+    BStruct *s = malloc(sizeof(BStruct));
+    s->type_name = type_name_h;
+    s->nfields = nfields;
+    s->names = malloc(sizeof(i64) * (nfields > 0 ? nfields : 1));
+    s->values = malloc(sizeof(i64) * (nfields > 0 ? nfields : 1));
+    BV x; x.tag = BV_STRUCT; x.st = s;
+    return bv_mk(x);
+}
+/* set slot `i` during construction: field name + value */
+void nv_struct_set(i64 sh, i64 i, i64 name_h, i64 val_h) {
+    BStruct *s = bv_h(sh)->st;
+    s->names[i] = name_h;
+    s->values[i] = val_h;
+}
+/* find the slot whose name equals `name_h` (both BV_STR); -1 if absent */
+static i64 bstruct_slot(BStruct *s, i64 name_h) {
+    BStr *want = bv_h(name_h)->s;
+    for (i64 i = 0; i < s->nfields; i++) {
+        BStr *have = bv_h(s->names[i])->s;
+        if (have->nbytes == want->nbytes && memcmp(have->utf8, want->utf8, want->nbytes) == 0)
+            return i;
+    }
+    return -1;
+}
+i64 nv_field(i64 sh, i64 name_h) {
+    BV *v = bv_h(sh);
+    if (v->tag != BV_STRUCT) { fprintf(stderr, "runtime error: cannot access field of non-struct\n"); exit(1); }
+    i64 i = bstruct_slot(v->st, name_h);
+    if (i < 0) { fprintf(stderr, "runtime error: no such field: %s\n", bv_h(name_h)->s->utf8); exit(1); }
+    return v->st->values[i];
+}
+void nv_field_set(i64 sh, i64 name_h, i64 val_h) {
+    BV *v = bv_h(sh);
+    if (v->tag != BV_STRUCT) { fprintf(stderr, "runtime error: cannot assign field of non-struct\n"); exit(1); }
+    i64 i = bstruct_slot(v->st, name_h);
+    if (i < 0) { fprintf(stderr, "runtime error: no such field: %s\n", bv_h(name_h)->s->utf8); exit(1); }
+    v->st->values[i] = val_h;
+}
+
 static const char *bv_type_name(BV *v) {
     switch (v->tag) {
         case BV_INT: return "int";
@@ -116,7 +167,8 @@ static const char *bv_type_name(BV *v) {
         case BV_BOOL: return "bool";
         case BV_NULL: return "null";
         case BV_STR: return "string";
-        default: return "array";
+        case BV_ARR: return "array";
+        default: return "struct";
     }
 }
 
@@ -151,6 +203,16 @@ static i64 bv_eq(BV *a, BV *b) {
         if (a->a->len != b->a->len) return 0;
         for (i64 i = 0; i < a->a->len; i++)
             if (!bv_eq(bv_h(a->a->items[i]), bv_h(b->a->items[i]))) return 0;
+        return 1;
+    }
+    if (a->tag == BV_STRUCT && b->tag == BV_STRUCT) {
+        BStruct *x = a->st, *y = b->st;
+        if (x->nfields != y->nfields) return 0;
+        if (!bv_eq(bv_h(x->type_name), bv_h(y->type_name))) return 0;
+        for (i64 i = 0; i < x->nfields; i++) {
+            if (!bv_eq(bv_h(x->names[i]), bv_h(y->names[i]))) return 0;
+            if (!bv_eq(bv_h(x->values[i]), bv_h(y->values[i]))) return 0;
+        }
         return 1;
     }
     return 0;
@@ -258,6 +320,21 @@ static void bv_fmt(SB *sb, BV *v, int quote_strings) {
             }
             sb_puts(sb, "]");
             break;
+        case BV_STRUCT: {
+            /* `TypeName { name: value, ... }` — fields already in sorted order,
+             * inner strings quoted, byte-identical to interp.rs Display. */
+            BStruct *s = v->st;
+            sb_put(sb, bv_h(s->type_name)->s->utf8, bv_h(s->type_name)->s->nbytes);
+            sb_puts(sb, " { ");
+            for (i64 i = 0; i < s->nfields; i++) {
+                if (i) sb_puts(sb, ", ");
+                sb_put(sb, bv_h(s->names[i])->s->utf8, bv_h(s->names[i])->s->nbytes);
+                sb_puts(sb, ": ");
+                bv_fmt(sb, bv_h(s->values[i]), 1);
+            }
+            sb_puts(sb, " }");
+            break;
+        }
     }
 }
 
