@@ -76,6 +76,7 @@ static void bv_die(const char *msg) {
 }
 static i64 bv_eq(BV *a, BV *b); /* forward: map key comparison (values_eq) */
 static const char *bv_type_name(BV *v); /* forward: used in error messages */
+i64 nv_as_int(i64 h); /* forward: used by nv_get before its definition */
 static void bv_dief(const char *fmt, i64 a, i64 b) {
     fprintf(stderr, "runtime error: ");
     fprintf(stderr, fmt, (long long)a, (long long)b);
@@ -719,6 +720,45 @@ i64 nv_iter(i64 h) {
     if (v->tag == BV_ARR) return nv_slice(h, 0, 0, 0, 0, 0);
     if (v->tag == BV_MAP) return nv_keys(h); /* foreach over a map iterates its keys */
     return h;
+}
+
+/* ---- built-in string / array methods (s.upper(), a.get(i), ...) ---- */
+/* ASCII case fold: matches Rust to_uppercase/to_lowercase for ASCII strings
+ * (multi-byte UTF-8 bytes are >= 0x80 so they're left untouched); a string with
+ * non-ASCII letters diverges from the interpreter and the oracle gate falls back. */
+i64 nv_upper(i64 h) {
+    BV *v = bv_h(h);
+    if (v->tag != BV_STR) { fprintf(stderr, "runtime error: upper expects a string, got %s\n", bv_type_name(v)); exit(1); }
+    i64 n = v->s->nbytes;
+    char *buf = malloc(n);
+    for (i64 i = 0; i < n; i++) {
+        char c = v->s->utf8[i];
+        buf[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+    }
+    i64 r = nv_str((i64)(intptr_t)buf, n);
+    free(buf);
+    return r;
+}
+i64 nv_lower(i64 h) {
+    BV *v = bv_h(h);
+    if (v->tag != BV_STR) { fprintf(stderr, "runtime error: lower expects a string, got %s\n", bv_type_name(v)); exit(1); }
+    i64 n = v->s->nbytes;
+    char *buf = malloc(n);
+    for (i64 i = 0; i < n; i++) {
+        char c = v->s->utf8[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    }
+    i64 r = nv_str((i64)(intptr_t)buf, n);
+    free(buf);
+    return r;
+}
+/* array .get(i): element at i, or null if out of bounds (mirrors interp) */
+i64 nv_get(i64 arrh, i64 idxh) {
+    BV *v = bv_h(arrh);
+    if (v->tag != BV_ARR) { fprintf(stderr, "runtime error: get expects an array, got %s\n", bv_type_name(v)); exit(1); }
+    i64 i = nv_as_int(idxh);
+    if (i < 0 || i >= v->a->len) return nv_null();
+    return v->a->items[i];
 }
 
 i64 nv_as_int(i64 h) {
