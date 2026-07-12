@@ -4416,6 +4416,8 @@ struct BoxRt {
     is_arr: FuncId, no_match: FuncId,
     // Phase 6 — methods / safe-field
     safe_field: FuncId,
+    // Phase 7 — built-in string/array methods
+    upper: FuncId, lower: FuncId, get: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
@@ -4952,10 +4954,33 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let nm = self.lit(field.as_bytes())?;
                 Some(self.rt_call(self.rt.safe_field, &[b, nm]))
             }
-            // method call `recv.m(args)`: monomorphic dispatch by unique method
-            // name to the compiled `type$method`, with `recv` as the `self` arg.
+            // method call `recv.m(args)`. Built-in string/array methods (checked by
+            // the interpreter before user methods) dispatch to the runtime; a
+            // user-defined method dispatches monomorphically by unique name with
+            // `recv` as `self`. A name that is BOTH declines (needs runtime type
+            // dispatch) rather than guess.
             Expr::MethodCall { base, method, args } => {
-                let (id, nparams) = self.methods.get(method).copied()?;
+                let user = self.methods.get(method).copied();
+                let builtin = matches!(method.as_str(),
+                    "len" | "upper" | "lower" | "push" | "pop" | "get");
+                if builtin && user.is_some() { return None; }
+                if builtin {
+                    let recv = self.expr(base)?;
+                    return match (method.as_str(), args.len()) {
+                        ("len", 0) => Some(self.rt_call(self.rt.len, &[recv])),
+                        ("upper", 0) => Some(self.rt_call(self.rt.upper, &[recv])),
+                        ("lower", 0) => Some(self.rt_call(self.rt.lower, &[recv])),
+                        ("pop", 0) => Some(self.rt_call(self.rt.pop, &[recv])),
+                        ("push", 1) => {
+                            let v = self.expr(&args[0])?;
+                            self.rt_void(self.rt.arr_push, &[recv, v]);
+                            Some(self.rt_call(self.rt.null, &[]))
+                        }
+                        ("get", 1) => { let i = self.expr(&args[0])?; Some(self.rt_call(self.rt.get, &[recv, i])) }
+                        _ => None,
+                    };
+                }
+                let (id, nparams) = user?;
                 if args.len() + 1 != nparams { return None; }
                 let b = self.expr(base)?;
                 let mut av = vec![b];
@@ -5318,6 +5343,9 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         is_arr: decl(&mut module, "nv_is_arr", &[I64], true)?,
         no_match: decl(&mut module, "nv_no_match", &[], false)?,
         safe_field: decl(&mut module, "nv_safe_field", &[I64, I64], true)?,
+        upper: decl(&mut module, "nv_upper", &[I64], true)?,
+        lower: decl(&mut module, "nv_lower", &[I64], true)?,
+        get: decl(&mut module, "nv_get", &[I64, I64], true)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5895,6 +5923,9 @@ mod jit_tests {
             "struct C { n: Int } impl C { fn bump(self, k){ self.n + k } fn label(self){ \"n=\" + str(self.n) } } trait D { fn describe(self){ \"a thing\" } } struct W { id: Int } impl D for W {} fn main(){ c = C { n: 7 }  print(c.bump(2))  print(c.label())  w = W { id: 1 }  print(w.describe()) }",
             // safe-field: `?.` returns null on a null base
             "struct P { x: Int } fn get(b){ if b { P { x: 5 } } else { null } } fn main(){ print(get(true)?.x)  print(get(false)?.x) }",
+            // Phase 7 built-in string/array methods + foreach over a string
+            "fn main(){ s = \"hello world\"  print(s.len())  print(s.upper())  print(s[0..5])  for c in \"abc\" { print(c) } }",
+            "fn main(){ a = [1, 2, 3]  a.push(4)  print(a.pop())  print(a.len())  print(a.get(0))  print(a.get(9)) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
