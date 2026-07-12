@@ -4192,6 +4192,8 @@ fn box_expr_ok(e: &Expr, funcs: &HashSet<String>, scopes: &Vec<HashSet<String>>)
             box_expr_ok(lo, funcs, scopes) && box_expr_ok(hi, funcs, scopes),
         Expr::StructLit { fields, .. } => fields.iter().all(|(_, e)| box_expr_ok(e, funcs, scopes)),
         Expr::Field { base, .. } => box_expr_ok(base, funcs, scopes),
+        Expr::MapLit(pairs) => pairs.iter().all(|(k, v)| box_expr_ok(k, funcs, scopes) && box_expr_ok(v, funcs, scopes)),
+        Expr::SetLit(elems) => elems.iter().all(|e| box_expr_ok(e, funcs, scopes)),
         Expr::Call { callee, args } => {
             let is_str = (callee == "str" || callee == "to_str") && args.len() == 1;
             let ok = funcs.contains(callee) || callee == "print" || callee == "len" || is_str
@@ -4320,6 +4322,8 @@ struct BoxRt {
     index_set: FuncId, slice: FuncId, range: FuncId, iter: FuncId,
     // Phase 3 — structs
     struct_new: FuncId, struct_set: FuncId, field: FuncId, field_set: FuncId,
+    // Phase 4 — maps (index get/set dispatch on tag inside nv_index/nv_index_set)
+    map: FuncId, map_put: FuncId,
 }
 
 struct BoxGen<'a, 'b> {
@@ -4836,6 +4840,30 @@ impl<'a, 'b> BoxGen<'a, 'b> {
                 let nm = self.lit(field.as_bytes())?;
                 Some(self.rt_call(self.rt.field, &[b, nm]))
             }
+            // a map literal: insertion-ordered pairs, keys/values evaluated in
+            // source order; nv_map_put dedups (last write wins), matching interp.
+            Expr::MapLit(pairs) => {
+                let cap = self.b.ins().iconst(I64, (pairs.len().max(1)) as i64);
+                let mh = self.rt_call(self.rt.map, &[cap]);
+                for (ke, ve) in pairs {
+                    let k = self.expr(ke)?;
+                    let v = self.expr(ve)?;
+                    self.rt_void(self.rt.map_put, &[mh, k, v]);
+                }
+                Some(mh)
+            }
+            // a set literal `#(a, b, ...)` is a map from element -> null with
+            // first-occurrence order (nv_map_put dedups), matching build_set.
+            Expr::SetLit(elems) => {
+                let cap = self.b.ins().iconst(I64, (elems.len().max(1)) as i64);
+                let mh = self.rt_call(self.rt.map, &[cap]);
+                for e in elems {
+                    let k = self.expr(e)?;
+                    let nul = self.rt_call(self.rt.null, &[]);
+                    self.rt_void(self.rt.map_put, &[mh, k, nul]);
+                }
+                Some(mh)
+            }
             _ => None,
         }
     }
@@ -4952,6 +4980,8 @@ pub fn compile_object_boxed(prog: &Program, target: NativeTarget) -> Option<(Vec
         struct_set: decl(&mut module, "nv_struct_set", &[I64, I64, I64, I64], false)?,
         field: decl(&mut module, "nv_field", &[I64, I64], true)?,
         field_set: decl(&mut module, "nv_field_set", &[I64, I64, I64], false)?,
+        map: decl(&mut module, "nv_map", &[I64], true)?,
+        map_put: decl(&mut module, "nv_map_put", &[I64, I64, I64], false)?,
     };
 
     // 2) declare every user function: (i64 handles...) -> i64 handle, Local.
@@ -5480,6 +5510,10 @@ mod jit_tests {
             // struct print (fields sorted, matching interp Display), field assignment
             "struct P { x: Int, y: Int } fn dist(p){ p.x + p.y } fn main(){ p = P { x: 3, y: 4 }  print(dist(p))  print(p.x)  print(p) }",
             "struct C { n: Int } fn main(){ c = C { n: 0 }  for i in 1..=5 { c.n = c.n + i }  print(c.n)  print(c) }",
+            // Phase 4 maps/sets: literal, index get (incl. missing -> null), index
+            // set (insert + overwrite), whole-map print (insertion order), set literal
+            "fn main(){ m = #{\"a\": 1, \"b\": 2}  m[\"c\"] = 3  m[\"a\"] = 10  print(m[\"a\"])  print(m[\"z\"])  print(m) }",
+            "fn main(){ s = #(1, 2, 2, 3)  print(s)  print(#{\"k\": s}) }",
         ] {
             let mut prog = parse_program(src).expect("parse");
             fold_program(&mut prog);
