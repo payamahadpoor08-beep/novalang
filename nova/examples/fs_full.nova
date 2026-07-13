@@ -1,0 +1,47 @@
+// The `fs` filesystem builtins: read/write/append, existence + type predicates,
+// size, rename, copy, directory create/list/remove. These are global builtins
+// (no `use` needed), backed by Rust std::fs. This example does a real round-trip
+// in a temp directory and cleans up after itself. Run:
+//   nova test examples/fs_full.nova
+
+test "fs round-trip (real filesystem)" {
+  base = "/tmp/nova_fs_example"
+  if exists(base) { remove_dir_all(base) }
+
+  mkdir(base)
+  assert(exists(base))
+  assert(is_dir(base))
+  assert(!is_file(base))
+
+  f = base + "/hello.txt"
+  write_file(f, "Nova FS!")
+  assert(exists(f))
+  assert(is_file(f))
+  assert(!is_dir(f))
+  assert_eq(file_size(f), 8)        // "Nova FS!" is 8 bytes
+  assert_eq(read_file(f), "Nova FS!")
+
+  append_file(f, " more")
+  assert_eq(read_file(f), "Nova FS! more")
+
+  g = base + "/copy.txt"
+  copy_file(f, g)
+  assert_eq(read_file(g), "Nova FS! more")
+
+  h = base + "/renamed.txt"
+  rename(g, h)
+  assert(!exists(g))
+  assert(exists(h))
+
+  names = list_dir(base)
+  assert_eq(len(names), 2)          // hello.txt, renamed.txt (sorted)
+  assert_eq(names[0], "hello.txt")
+  assert_eq(names[1], "renamed.txt")
+
+  remove_file(f)
+  remove_file(h)
+  assert(!exists(f))
+
+  remove_dir(base)
+  assert(!exists(base))
+}

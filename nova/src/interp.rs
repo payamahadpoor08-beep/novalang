@@ -1956,6 +1956,65 @@ impl Interp {
                     Err(e) => self.fail_assert(format!("cannot mkdir {}: {}", path, e)),
                 };
             }
+            // ---- fs predicates + operations (real filesystem via std::fs) ----
+            "exists" | "is_file" | "is_dir" => {
+                let path = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(format!("{} expects a string path", name)),
+                };
+                let p = std::path::Path::new(&path);
+                return Ok(Value::Bool(match name {
+                    "exists" => p.exists(),
+                    "is_file" => p.is_file(),
+                    _ => p.is_dir(),
+                }));
+            }
+            "file_size" => {
+                let path = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err("file_size expects a string path".into()),
+                };
+                return match std::fs::metadata(&path) {
+                    Ok(m) => Ok(Value::Int(m.len() as i64)),
+                    Err(e) => self.fail_assert(format!("cannot stat {}: {}", path, e)),
+                };
+            }
+            "rename" | "copy_file" => {
+                let src = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(format!("{} expects (src, dst) string paths", name)),
+                };
+                let dst = match args.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(format!("{} expects (src, dst) string paths", name)),
+                };
+                return if name == "rename" {
+                    match std::fs::rename(&src, &dst) {
+                        Ok(()) => Ok(Value::Null),
+                        Err(e) => self.fail_assert(format!("cannot rename {} -> {}: {}", src, dst, e)),
+                    }
+                } else {
+                    match std::fs::copy(&src, &dst) {
+                        Ok(n) => Ok(Value::Int(n as i64)),
+                        Err(e) => self.fail_assert(format!("cannot copy {} -> {}: {}", src, dst, e)),
+                    }
+                };
+            }
+            "remove_dir" | "remove_dir_all" => {
+                let path = match args.get(0) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(format!("{} expects a string path", name)),
+                };
+                let res = if name == "remove_dir" {
+                    std::fs::remove_dir(&path)
+                } else {
+                    std::fs::remove_dir_all(&path)
+                };
+                return match res {
+                    Ok(()) => Ok(Value::Null),
+                    Err(e) => self.fail_assert(format!("cannot remove dir {}: {}", path, e)),
+                };
+            }
             "cwd" => {
                 return match std::env::current_dir() {
                     Ok(p) => Ok(Value::Str(p.to_string_lossy().into_owned())),
