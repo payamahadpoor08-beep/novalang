@@ -1,0 +1,85 @@
+// Completeness + reference-verification for the `strings` standard library.
+// Every expected value here is produced by an authoritative reference
+// (Python str.* builtins and the `jellyfish` library) — see the comments.
+// Run with:  nova test examples/strings_full.nova
+
+use strings.{is_empty, rfind, rsplit, split_lines, swapcase, concat,
+             edit_distance, levenshtein, jaro_winkler, soundex,
+             upper, lower, find, split, join, replace, substring}
+
+fn approx(a, b) {
+  let d = a - b
+  if d < 0.0 { d = 0.0 - d }
+  d < 0.0000001
+}
+
+test "is_empty / concat" {
+  assert(is_empty(""))
+  assert(!is_empty("x"))
+  assert_eq(concat(["a", "b", "c"]), "abc")
+  assert_eq(concat([]), "")
+}
+
+test "rfind" {
+  // Python: 'abcabcabc'.rfind('bc') == 7 ; miss == -1
+  assert_eq(rfind("abcabcabc", "bc"), 7)
+  assert_eq(rfind("abc", "z"), 0 - 1)
+  assert_eq(rfind("abc", ""), 3)
+}
+
+test "rsplit" {
+  // Python: 'a,b,c,d'.rsplit(',', 2) == ['a,b', 'c', 'd']
+  assert_eq(rsplit("a,b,c,d", ",", 2), ["a,b", "c", "d"])
+  // no maxsplit == plain split
+  assert_eq(rsplit("a,b,c", ","), ["a", "b", "c"])
+}
+
+test "split_lines" {
+  // Python: 'Hi\nBye\r\nX\rY'.splitlines() == ['Hi', 'Bye', 'X', 'Y']
+  assert_eq(split_lines("Hi\nBye\r\nX\rY"), ["Hi", "Bye", "X", "Y"])
+  assert_eq(split_lines(""), [])
+  assert_eq(split_lines("a\n"), ["a"])
+  assert_eq(split_lines("a\n\nb"), ["a", "", "b"])
+}
+
+test "swapcase" {
+  // Python: 'Hello World 123'.swapcase() == 'hELLO wORLD 123'
+  assert_eq(swapcase("Hello World 123"), "hELLO wORLD 123")
+}
+
+test "edit_distance (== levenshtein)" {
+  assert_eq(edit_distance("kitten", "sitting"), 3)
+  assert_eq(edit_distance("same", "same"), 0)
+  assert_eq(edit_distance("", "abc"), 3)
+  assert_eq(edit_distance("abc", "abc"), levenshtein("abc", "abc"))
+}
+
+test "jaro_winkler (jellyfish reference values)" {
+  assert(approx(jaro_winkler("MARTHA", "MARHTA"), 0.9611111111111111))
+  assert(approx(jaro_winkler("DIXON", "DICKSONX"), 0.8133333333333332))
+  assert(approx(jaro_winkler("DWAYNE", "DUANE"), 0.8400000000000001))
+  assert(approx(jaro_winkler("nova", "nova"), 1.0))
+  assert(approx(jaro_winkler("abc", "xyz"), 0.0))
+}
+
+test "soundex (jellyfish reference values)" {
+  assert_eq(soundex("Robert"), "R163")
+  assert_eq(soundex("Rupert"), "R163")
+  assert_eq(soundex("Rubin"), "R150")
+  assert_eq(soundex("Ashcraft"), "A261")
+  assert_eq(soundex("Tymczak"), "T522")
+  assert_eq(soundex("Pfister"), "P236")
+  assert_eq(soundex("Honeyman"), "H555")
+  assert_eq(soundex("Euler"), "E460")
+  assert_eq(soundex("Gauss"), "G200")
+}
+
+test "existing strings still work" {
+  assert_eq(upper("nova"), "NOVA")
+  assert_eq(lower("NOVA"), "nova")
+  assert_eq(find("hello world", "world"), 6)
+  assert_eq(split("a,b,c", ","), ["a", "b", "c"])
+  assert_eq(join(["a", "b", "c"], "-"), "a-b-c")
+  assert_eq(replace("aaa", "a", "bb"), "bbbbbb")
+  assert_eq(substring("hello", 1, 4), "ell")
+}
