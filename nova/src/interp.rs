@@ -3851,7 +3851,7 @@ pub(crate) fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, String>
 }
 
 fn is_known_module(name: &str) -> bool {
-    matches!(name, "math" | "strings" | "arrays" | "collections" | "iter" | "rand" | "time" | "json" | "serialize" | "io" | "std")
+    matches!(name, "math" | "strings" | "arrays" | "collections" | "iter" | "rand" | "time" | "json" | "serialize" | "io" | "path" | "std")
 }
 
 // Jaro similarity of two char slices (the base of Jaro-Winkler). Standard
@@ -3933,6 +3933,29 @@ fn soundex_code(s: &str) -> String {
     while out.len() < 4 { out.push('0'); }
     out.truncate(4);
     out
+}
+
+// Lexical (no-filesystem) path normalization: resolve "." and ".." and collapse
+// duplicate/trailing slashes, without touching the disk (matches the well-known
+// os.path.normpath / lexically_normal semantics). ".." cannot rise above root.
+fn path_normalize(p: &str) -> String {
+    let abs = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for comp in p.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&last) if last != ".." => { out.pop(); }
+                None if abs => {}                 // can't go above root
+                _ => out.push(".."),
+            },
+            c => out.push(c),
+        }
+    }
+    let joined = out.join("/");
+    if abs { format!("/{}", joined) }
+    else if joined.is_empty() { ".".to_string() }
+    else { joined }
 }
 
 // Dispatch a standard-library function by (optional module) + name.
@@ -4027,6 +4050,47 @@ pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, S
             let mut acc: i64 = 1;
             for i in 2..=n { acc = acc.saturating_mul(i); }
             Some(Value::Int(acc))
+        }
+        // ---- path (POSIX; implementation + reference is Rust std::path) ----
+        // path.join collides with the array/string `join` under the flat stdlib
+        // namespace, so the joiner is `path_join`; the rest use their natural names.
+        "path_join" => {
+            let a = str_arg(args, 0, "path_join")?;
+            let b = str_arg(args, 1, "path_join")?;
+            Some(Value::Str(std::path::Path::new(&a).join(&b).to_string_lossy().into_owned()))
+        }
+        "file_name" | "basename" => {
+            let p = str_arg(args, 0, "file_name")?;
+            Some(Value::Str(std::path::Path::new(&p).file_name()
+                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))
+        }
+        "file_stem" | "stem" => {
+            let p = str_arg(args, 0, "file_stem")?;
+            Some(Value::Str(std::path::Path::new(&p).file_stem()
+                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))
+        }
+        "extension" => {
+            let p = str_arg(args, 0, "extension")?;
+            Some(Value::Str(std::path::Path::new(&p).extension()
+                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))
+        }
+        "parent" | "dirname" => {
+            let p = str_arg(args, 0, "parent")?;
+            Some(Value::Str(std::path::Path::new(&p).parent()
+                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))
+        }
+        "with_extension" => {
+            let p = str_arg(args, 0, "with_extension")?;
+            let ext = str_arg(args, 1, "with_extension")?;
+            Some(Value::Str(std::path::Path::new(&p).with_extension(&ext).to_string_lossy().into_owned()))
+        }
+        "is_absolute" => Some(Value::Bool(std::path::Path::new(&str_arg(args, 0, "is_absolute")?).is_absolute())),
+        "normalize" => Some(Value::Str(path_normalize(&str_arg(args, 0, "normalize")?))),
+        "components" => {
+            let p = str_arg(args, 0, "components")?;
+            let parts: Vec<Value> = std::path::Path::new(&p).components()
+                .map(|c| Value::Str(c.as_os_str().to_string_lossy().into_owned())).collect();
+            Some(Value::Array(Rc::new(RefCell::new(parts))))
         }
         // ---- strings ----
         "upper" => Some(Value::Str(str_arg(args, 0, "upper")?.to_uppercase())),
@@ -5197,6 +5261,34 @@ mod strings_tests {
             let (ca, cb): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
             assert!((jaro_winkler_sim(&ca, &cb) - want).abs() < 1e-9, "jw({},{})", a, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::path_normalize;
+    use std::path::Path;
+
+    #[test]
+    fn path_ops_match_std_path() {
+        assert_eq!(Path::new("a/b").join("c.txt").to_string_lossy(), "a/b/c.txt");
+        assert_eq!(Path::new("a").join("/b").to_string_lossy(), "/b");
+        assert_eq!(Path::new("a/b/c.txt").file_name().unwrap().to_string_lossy(), "c.txt");
+        assert_eq!(Path::new("a/b/c.txt").file_stem().unwrap().to_string_lossy(), "c");
+        assert_eq!(Path::new("a/b/c.txt").extension().unwrap().to_string_lossy(), "txt");
+        assert_eq!(Path::new("a/b/c.txt").parent().unwrap().to_string_lossy(), "a/b");
+        assert_eq!(Path::new("a/b/c.txt").with_extension("md").to_string_lossy(), "a/b/c.md");
+        assert!(Path::new("/x").is_absolute());
+        assert!(!Path::new("x").is_absolute());
+    }
+
+    #[test]
+    fn normalize_lexical() {
+        assert_eq!(path_normalize("a/./b/../c"), "a/c");
+        assert_eq!(path_normalize("/a/../b"), "/b");
+        assert_eq!(path_normalize("a/../../b"), "../b");
+        assert_eq!(path_normalize(""), ".");
+        assert_eq!(path_normalize("/a/../.."), "/");
     }
 }
 
