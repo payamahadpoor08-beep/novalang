@@ -1,0 +1,51 @@
+// The `path` standard library: POSIX path manipulation. The implementation and
+// the reference are Rust's own std::path (no external tool involved); normalize
+// follows the standard lexical os.path.normpath rules. Run:
+//   nova test examples/path_full.nova
+
+use path.{path_join, file_name, basename, file_stem, extension, parent, dirname,
+          with_extension, is_absolute, normalize, components}
+
+test "join" {
+  assert_eq(path_join("a/b", "c.txt"), "a/b/c.txt")
+  assert_eq(path_join("a", "/b"), "/b")      // an absolute second arg replaces
+  assert_eq(path_join("dir", "sub/x"), "dir/sub/x")
+}
+
+test "file_name / file_stem / extension" {
+  assert_eq(file_name("a/b/c.txt"), "c.txt")
+  assert_eq(basename("a/b/c.txt"), "c.txt")
+  assert_eq(file_stem("a/b/c.txt"), "c")
+  assert_eq(extension("a/b/c.txt"), "txt")
+  assert_eq(extension("a/b/c"), "")
+  assert_eq(file_name("/"), "")
+}
+
+test "parent / dirname" {
+  assert_eq(parent("a/b/c.txt"), "a/b")
+  assert_eq(dirname("a/b/c.txt"), "a/b")
+  assert_eq(parent("c.txt"), "")
+}
+
+test "with_extension" {
+  assert_eq(with_extension("a/b/c.txt", "md"), "a/b/c.md")
+  assert_eq(with_extension("a/b/c", "log"), "a/b/c.log")
+}
+
+test "is_absolute" {
+  assert(is_absolute("/x/y"))
+  assert(!is_absolute("x/y"))
+}
+
+test "normalize (lexical normpath)" {
+  assert_eq(normalize("a/./b/../c"), "a/c")
+  assert_eq(normalize("/a/../b"), "/b")
+  assert_eq(normalize("a/../../b"), "../b")
+  assert_eq(normalize(""), ".")
+  assert_eq(normalize("/a/../.."), "/")
+}
+
+test "components" {
+  assert_eq(components("a/b/c"), ["a", "b", "c"])
+  assert_eq(components("/a/b"), ["/", "a", "b"])
+}
