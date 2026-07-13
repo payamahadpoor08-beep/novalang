@@ -3854,6 +3854,87 @@ fn is_known_module(name: &str) -> bool {
     matches!(name, "math" | "strings" | "arrays" | "collections" | "iter" | "rand" | "time" | "json" | "serialize" | "io" | "std")
 }
 
+// Jaro similarity of two char slices (the base of Jaro-Winkler). Standard
+// algorithm: count matching chars within a window of max(len)/2 - 1, then
+// transpositions. Returns a value in [0, 1]. Matches jellyfish/Python references.
+fn jaro_sim(s1: &[char], s2: &[char]) -> f64 {
+    let (l1, l2) = (s1.len(), s2.len());
+    if l1 == 0 && l2 == 0 { return 1.0; }
+    if l1 == 0 || l2 == 0 { return 0.0; }
+    let win = (l1.max(l2) / 2).saturating_sub(1);
+    let mut m1 = vec![false; l1];
+    let mut m2 = vec![false; l2];
+    let mut matches = 0usize;
+    for i in 0..l1 {
+        let start = i.saturating_sub(win);
+        let end = (i + win + 1).min(l2);
+        for j in start..end {
+            if m2[j] || s1[i] != s2[j] { continue; }
+            m1[i] = true; m2[j] = true; matches += 1; break;
+        }
+    }
+    if matches == 0 { return 0.0; }
+    // half the number of out-of-order matched pairs = transpositions
+    let mut t = 0.0f64;
+    let mut k = 0usize;
+    for i in 0..l1 {
+        if !m1[i] { continue; }
+        while !m2[k] { k += 1; }
+        if s1[i] != s2[k] { t += 1.0; }
+        k += 1;
+    }
+    t /= 2.0;
+    let m = matches as f64;
+    (m / l1 as f64 + m / l2 as f64 + (m - t) / m) / 3.0
+}
+
+// Jaro-Winkler similarity: Jaro plus a boost for a common prefix (up to 4 chars,
+// scaling factor 0.1). Matches jellyfish.jaro_winkler_similarity.
+fn jaro_winkler_sim(s1: &[char], s2: &[char]) -> f64 {
+    let j = jaro_sim(s1, s2);
+    let mut prefix = 0usize;
+    for i in 0..s1.len().min(s2.len()).min(4) {
+        if s1[i] == s2[i] { prefix += 1; } else { break; }
+    }
+    j + prefix as f64 * 0.1 * (1.0 - j)
+}
+
+// American Soundex code (letter + 3 digits), NARA/Wikipedia rules including the
+// h/w-transparent and vowel-separator rules. Matches jellyfish.soundex.
+fn soundex_code(s: &str) -> String {
+    fn digit(c: char) -> u8 {
+        match c {
+            'B' | 'F' | 'P' | 'V' => b'1',
+            'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => b'2',
+            'D' | 'T' => b'3',
+            'L' => b'4',
+            'M' | 'N' => b'5',
+            'R' => b'6',
+            _ => b'0',
+        }
+    }
+    let chars: Vec<char> = s.chars().filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase()).collect();
+    if chars.is_empty() { return String::new(); }
+    let mut out = String::new();
+    out.push(chars[0]);
+    let mut prev = digit(chars[0]);
+    for &c in &chars[1..] {
+        if out.len() >= 4 { break; }
+        if c == 'H' || c == 'W' { continue; } // transparent: prev unchanged
+        let d = digit(c);
+        if d != b'0' {
+            if d != prev { out.push(d as char); }
+            prev = d;
+        } else {
+            prev = b'0'; // vowel separator resets, so same codes recode
+        }
+    }
+    while out.len() < 4 { out.push('0'); }
+    out.truncate(4);
+    out
+}
+
 // Dispatch a standard-library function by (optional module) + name.
 // Returns Ok(Some(value)) if handled, Ok(None) if the name isn't a stdlib fn.
 pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
@@ -4057,7 +4138,7 @@ pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, S
             let start = start.min(end);
             Some(Value::Str(chars[start..end].iter().collect()))
         }
-        "levenshtein" => {
+        "levenshtein" | "edit_distance" => {
             let a = str_arg(args, 0, "levenshtein")?;
             let b = str_arg(args, 1, "levenshtein")?;
             let (ac, bc): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
@@ -4073,6 +4154,66 @@ pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, S
             }
             Some(Value::Int(prev[bc.len()] as i64))
         }
+        "is_empty" => Some(Value::Bool(str_arg(args, 0, "is_empty")?.is_empty())),
+        "rfind" => {
+            let s = str_arg(args, 0, "rfind")?;
+            let sub = str_arg(args, 1, "rfind")?;
+            Some(match s.rfind(&sub as &str) {
+                Some(idx) => Value::Int(s[..idx].chars().count() as i64),
+                None => Value::Int(-1),
+            })
+        }
+        "rsplit" => {
+            let s = str_arg(args, 0, "rsplit")?;
+            let sep = str_arg(args, 1, "rsplit")?;
+            if sep.is_empty() { return Err("rsplit: empty separator".into()); }
+            // optional third arg = maxsplit (from the right); <0 or absent = split all
+            let maxsplit = match args.get(2) { Some(Value::Int(n)) => *n, _ => -1 };
+            let parts: Vec<Value> = if maxsplit < 0 {
+                s.split(&sep as &str).map(|p| Value::Str(p.to_string())).collect()
+            } else {
+                let mut v: Vec<String> = s.rsplitn(maxsplit as usize + 1, &sep as &str)
+                    .map(|p| p.to_string()).collect();
+                v.reverse();
+                v.into_iter().map(Value::Str).collect()
+            };
+            Some(Value::Array(Rc::new(RefCell::new(parts))))
+        }
+        "split_lines" => {
+            let s = str_arg(args, 0, "split_lines")?;
+            // split on \n, \r, and \r\n; no trailing empty element (Python splitlines)
+            let chars: Vec<char> = s.chars().collect();
+            let mut out: Vec<Value> = Vec::new();
+            let mut cur = String::new();
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '\n' {
+                    out.push(Value::Str(std::mem::take(&mut cur))); i += 1;
+                } else if c == '\r' {
+                    out.push(Value::Str(std::mem::take(&mut cur)));
+                    i += if i + 1 < chars.len() && chars[i + 1] == '\n' { 2 } else { 1 };
+                } else { cur.push(c); i += 1; }
+            }
+            if !cur.is_empty() { out.push(Value::Str(cur)); }
+            Some(Value::Array(Rc::new(RefCell::new(out))))
+        }
+        "swapcase" => Some(Value::Str(str_arg(args, 0, "swapcase")?.chars().map(|c| {
+            if c.is_uppercase() { c.to_lowercase().collect::<String>() }
+            else if c.is_lowercase() { c.to_uppercase().collect::<String>() }
+            else { c.to_string() }
+        }).collect())),
+        "jaro_winkler" => {
+            let a: Vec<char> = str_arg(args, 0, "jaro_winkler")?.chars().collect();
+            let b: Vec<char> = str_arg(args, 1, "jaro_winkler")?.chars().collect();
+            Some(Value::Float(jaro_winkler_sim(&a, &b)))
+        }
+        "jaro" => {
+            let a: Vec<char> = str_arg(args, 0, "jaro")?.chars().collect();
+            let b: Vec<char> = str_arg(args, 1, "jaro")?.chars().collect();
+            Some(Value::Float(jaro_sim(&a, &b)))
+        }
+        "soundex" => Some(Value::Str(soundex_code(&str_arg(args, 0, "soundex")?))),
         // ---- arrays / collections ----
         "sort" => {
             let arr = match args.get(0) {
@@ -5028,6 +5169,34 @@ mod attr_tests {
         let interp = Interp::new(&prog).expect("interp");
         assert_eq!(format!("{:?}", interp.call("main", vec![])),
                    format!("{:?}", Ok::<_,String>(Value::Int(5))));
+    }
+}
+
+#[cfg(test)]
+mod strings_tests {
+    use super::{soundex_code, jaro_winkler_sim};
+
+    #[test]
+    fn soundex_matches_reference() {
+        // reference: python jellyfish.soundex
+        for (w, code) in [("Robert", "R163"), ("Rupert", "R163"), ("Rubin", "R150"),
+                          ("Ashcraft", "A261"), ("Tymczak", "T522"), ("Pfister", "P236"),
+                          ("Honeyman", "H555"), ("Euler", "E460"), ("Gauss", "G200")] {
+            assert_eq!(soundex_code(w), code, "soundex({})", w);
+        }
+    }
+
+    #[test]
+    fn jaro_winkler_matches_reference() {
+        // reference: python jellyfish.jaro_winkler_similarity
+        let cases = [(("MARTHA", "MARHTA"), 0.9611111111111111_f64),
+                     (("DIXON", "DICKSONX"), 0.8133333333333332),
+                     (("DWAYNE", "DUANE"), 0.8400000000000001),
+                     (("nova", "nova"), 1.0), (("abc", "xyz"), 0.0)];
+        for ((a, b), want) in cases {
+            let (ca, cb): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            assert!((jaro_winkler_sim(&ca, &cb) - want).abs() < 1e-9, "jw({},{})", a, b);
+        }
     }
 }
 
