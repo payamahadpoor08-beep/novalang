@@ -521,6 +521,81 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// base64url (RFC 4648 §5): standard base64 with +/ -> -_ ; padding kept (matches
+// Python base64.urlsafe_b64encode).
+fn b64url_encode(data: &[u8]) -> String {
+    b64_encode(data).replace('+', "-").replace('/', "_")
+}
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    b64_decode(&s.replace('-', "+").replace('_', "/"))
+}
+
+// base32 (RFC 4648) with '=' padding — byte-identical to Python base64.b32encode.
+const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+fn b32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 4) / 5 * 8);
+    for chunk in data.chunks(5) {
+        let mut buf = [0u8; 5];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        let n = ((buf[0] as u64) << 32) | ((buf[1] as u64) << 24) | ((buf[2] as u64) << 16)
+            | ((buf[3] as u64) << 8) | (buf[4] as u64);
+        let outn = match chunk.len() { 1 => 2, 2 => 4, 3 => 5, 4 => 7, _ => 8 };
+        for i in 0..8 {
+            if i < outn { out.push(B32[((n >> (35 - i * 5)) & 31) as usize] as char); }
+            else { out.push('='); }
+        }
+    }
+    out
+}
+fn b32_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u64> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u64),
+            b'2'..=b'7' => Some((c - b'2' + 26) as u64),
+            _ => None,
+        }
+    }
+    let (mut acc, mut nbits, mut out) = (0u64, 0u32, Vec::new());
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() { continue; }
+        acc = (acc << 5) | val(c)?;
+        nbits += 5;
+        if nbits >= 8 { nbits -= 8; out.push(((acc >> nbits) & 0xFF) as u8); }
+    }
+    Some(out)
+}
+
+// percent-encoding matching Python urllib.parse.quote defaults: unreserved
+// (A-Za-z0-9 _.-~) and '/' pass through; everything else -> %XX (uppercase).
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '~' | '/') {
+            out.push(c);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+fn url_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16).ok()?;
+            out.push(h);
+            i += 3;
+        } else {
+            out.push(bytes[i]); i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let ml = (data.len() as u64).wrapping_mul(8);
@@ -3851,7 +3926,7 @@ pub(crate) fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, String>
 }
 
 fn is_known_module(name: &str) -> bool {
-    matches!(name, "math" | "strings" | "arrays" | "collections" | "iter" | "rand" | "time" | "json" | "serialize" | "io" | "path" | "std")
+    matches!(name, "math" | "strings" | "arrays" | "collections" | "iter" | "rand" | "time" | "json" | "serialize" | "io" | "encoding" | "path" | "std")
 }
 
 // Jaro similarity of two char slices (the base of Jaro-Winkler). Standard
@@ -4092,6 +4167,32 @@ pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, S
                 .map(|c| Value::Str(c.as_os_str().to_string_lossy().into_owned())).collect();
             Some(Value::Array(Rc::new(RefCell::new(parts))))
         }
+        // ---- encoding (base64/base64url/base32/hex/url; byte-verified vs Python) ----
+        "base64_encode" => Some(Value::Str(b64_encode(str_arg(args, 0, "base64_encode")?.as_bytes()))),
+        "base64_decode" => match b64_decode(&str_arg(args, 0, "base64_decode")?) {
+            Some(bytes) => Some(Value::Str(String::from_utf8_lossy(&bytes).into_owned())),
+            None => return Err("base64_decode: invalid base64".into()),
+        },
+        "base64url_encode" => Some(Value::Str(b64url_encode(str_arg(args, 0, "base64url_encode")?.as_bytes()))),
+        "base64url_decode" => match b64url_decode(&str_arg(args, 0, "base64url_decode")?) {
+            Some(bytes) => Some(Value::Str(String::from_utf8_lossy(&bytes).into_owned())),
+            None => return Err("base64url_decode: invalid base64url".into()),
+        },
+        "base32_encode" => Some(Value::Str(b32_encode(str_arg(args, 0, "base32_encode")?.as_bytes()))),
+        "base32_decode" => match b32_decode(&str_arg(args, 0, "base32_decode")?) {
+            Some(bytes) => Some(Value::Str(String::from_utf8_lossy(&bytes).into_owned())),
+            None => return Err("base32_decode: invalid base32".into()),
+        },
+        "hex_encode" => Some(Value::Str(hex_encode(str_arg(args, 0, "hex_encode")?.as_bytes()))),
+        "hex_decode" => match hex_decode(&str_arg(args, 0, "hex_decode")?) {
+            Some(bytes) => Some(Value::Str(String::from_utf8_lossy(&bytes).into_owned())),
+            None => return Err("hex_decode: invalid hex".into()),
+        },
+        "url_encode" => Some(Value::Str(url_encode(&str_arg(args, 0, "url_encode")?))),
+        "url_decode" => match url_decode(&str_arg(args, 0, "url_decode")?) {
+            Some(s) => Some(Value::Str(s)),
+            None => return Err("url_decode: invalid percent-encoding".into()),
+        },
         // ---- strings ----
         "upper" => Some(Value::Str(str_arg(args, 0, "upper")?.to_uppercase())),
         "lower" => Some(Value::Str(str_arg(args, 0, "lower")?.to_lowercase())),
@@ -5289,6 +5390,28 @@ mod path_tests {
         assert_eq!(path_normalize("a/../../b"), "../b");
         assert_eq!(path_normalize(""), ".");
         assert_eq!(path_normalize("/a/../.."), "/");
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::{b64_encode, b64_decode, b64url_encode, b32_encode, b32_decode, url_encode, url_decode};
+
+    #[test]
+    fn base64_and_base32_match_python() {
+        assert_eq!(b64_encode(b"Nova rocks!"), "Tm92YSByb2NrcyE=");
+        assert_eq!(b64_encode(b"a"), "YQ==");
+        assert_eq!(b64_encode(b"ab"), "YWI=");
+        assert_eq!(b64_decode("Tm92YSByb2NrcyE=").unwrap(), b"Nova rocks!");
+        assert_eq!(b64url_encode(b"sure."), "c3VyZS4=");
+        assert_eq!(b32_encode(b"Nova"), "JZXXMYI=");
+        assert_eq!(b32_decode("JZXXMYI=").unwrap(), b"Nova");
+    }
+
+    #[test]
+    fn url_percent_encoding_matches_python() {
+        assert_eq!(url_encode("a b/c?=&x=1"), "a%20b/c%3F%3D%26x%3D1");
+        assert_eq!(url_decode("a%20b/c%3F%3D%26x%3D1").unwrap(), "a b/c?=&x=1");
     }
 }
 
