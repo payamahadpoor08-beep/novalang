@@ -4203,14 +4203,6 @@ pub(crate) fn call_stdlib(name: &str, args: &[Value]) -> Result<Option<Value>, S
             else if c.is_lowercase() { c.to_uppercase().collect::<String>() }
             else { c.to_string() }
         }).collect())),
-        "concat" => {
-            let arr = match args.get(0) {
-                Some(Value::Array(a)) => a.clone(),
-                _ => return Err("concat expects an array of strings".into()),
-            };
-            let out: String = arr.borrow().iter().map(|v| v.to_string()).collect();
-            Some(Value::Str(out))
-        }
         "jaro_winkler" => {
             let a: Vec<char> = str_arg(args, 0, "jaro_winkler")?.chars().collect();
             let b: Vec<char> = str_arg(args, 1, "jaro_winkler")?.chars().collect();

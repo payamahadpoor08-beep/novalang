@@ -3,7 +3,7 @@
 // (Python str.* builtins and the `jellyfish` library) — see the comments.
 // Run with:  nova test examples/strings_full.nova
 
-use strings.{is_empty, rfind, rsplit, split_lines, swapcase, concat,
+use strings.{is_empty, rfind, rsplit, split_lines, swapcase,
              edit_distance, levenshtein, jaro_winkler, soundex,
              upper, lower, find, split, join, replace, substring}
 
@@ -13,11 +13,9 @@ fn approx(a, b) {
   d < 0.0000001
 }
 
-test "is_empty / concat" {
+test "is_empty" {
   assert(is_empty(""))
   assert(!is_empty("x"))
-  assert_eq(concat(["a", "b", "c"]), "abc")
-  assert_eq(concat([]), "")
 }
 
 test "rfind" {
