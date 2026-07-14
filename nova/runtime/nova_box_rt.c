@@ -66,8 +66,34 @@ typedef struct BV {
     union { i64 i; double f; BStr *s; BArr *a; BStruct *st; BMap *m; BEnum *en; };
 } BV;
 
-/* handle <-> pointer. Allocate-and-leak: a boxed value lives for the whole run. */
-static BV *bv_h(i64 h) { return (BV *)(intptr_t)h; }
+/* Immediate small-integer tagging. A value HANDLE whose low bit is 1 encodes an
+ * inline integer (value = handle >> 1) that needs NO heap `BV` — this removes the
+ * malloc that would otherwise happen for every intermediate integer in a hot loop
+ * (the boxed tier's main cost on real code). A handle whose low bit is 0 is a
+ * pointer to a malloc'd `BV` (8-byte aligned, so its low bits are 0), exactly as
+ * before. Immediates cover ~63-bit ints; a value that doesn't fit boxes on the
+ * heap and still works. Equal small ints always share the same encoding, so
+ * value-equality by handle is well defined. */
+#define NV_IS_IMM(h)  ((h) & 1)
+#define NV_IMM_VAL(h) ((h) >> 1)               /* signed value of an immediate */
+#define NV_MK_IMM(v)  (((i64)(v) << 1) | 1)
+static int nv_imm_fits(i64 v) { return ((v << 1) >> 1) == v; } /* no sign loss */
+
+/* handle -> pointer. For an immediate, materialize a transient `BV` into a small
+ * rotating pool so the pervasive `bv_h(h)->tag/->i` access pattern keeps working
+ * unchanged. Any handle held live across many bv_h calls is necessarily a heap
+ * object (array/struct/map/string) — never an immediate, which is only ever read
+ * locally and briefly — so a rotating window is safe. */
+static BV nv_imm_pool[64];
+static unsigned nv_imm_cursor;
+static BV *bv_h(i64 h) {
+    if (NV_IS_IMM(h)) {
+        BV *p = &nv_imm_pool[nv_imm_cursor++ & 63];
+        p->tag = BV_INT; p->i = NV_IMM_VAL(h);
+        return p;
+    }
+    return (BV *)(intptr_t)h;
+}
 static i64 bv_mk(BV v) { BV *p = malloc(sizeof(BV)); *p = v; return (i64)(intptr_t)p; }
 
 static void bv_die(const char *msg) {
@@ -85,7 +111,8 @@ static void bv_dief(const char *fmt, i64 a, i64 b) {
 }
 
 /* ---- constructors (all return a handle) ---- */
-i64 nv_int(i64 v)    { BV x; x.tag = BV_INT;   x.i = v;      return bv_mk(x); }
+i64 nv_int(i64 v)    { if (nv_imm_fits(v)) return NV_MK_IMM(v);
+                       BV x; x.tag = BV_INT;   x.i = v;      return bv_mk(x); }
 i64 nv_float(double v){ BV x; x.tag = BV_FLOAT; x.f = v;      return bv_mk(x); }
 i64 nv_bool(i64 v)   { BV x; x.tag = BV_BOOL;  x.i = v != 0; return bv_mk(x); }
 i64 nv_null(void)    { BV x; x.tag = BV_NULL;  x.i = 0;      return bv_mk(x); }
@@ -241,14 +268,15 @@ i64 nv_enum_is(i64 eh, i64 name_h) {
 }
 
 /* ---- pattern-match introspection (used by BoxGen's compiled match) ---- */
-i64 nv_tag(i64 h) { return bv_h(h)->tag; }
-i64 nv_is_arr(i64 h) { return bv_h(h)->tag == BV_ARR; } /* tuple/slice patterns match arrays only */
+i64 nv_tag(i64 h) { return NV_IS_IMM(h) ? BV_INT : bv_h(h)->tag; }
+i64 nv_is_arr(i64 h) { return !NV_IS_IMM(h) && bv_h(h)->tag == BV_ARR; } /* tuple/slice patterns match arrays only */
 /* int value in lo..hi (or lo..=hi); 0 if not an int or out of range */
 i64 nv_in_range(i64 h, i64 lo, i64 hi, i64 inclusive) {
-    BV *v = bv_h(h);
-    if (v->tag != BV_INT) return 0;
-    if (inclusive) return v->i >= lo && v->i <= hi;
-    return v->i >= lo && v->i < hi;
+    i64 iv;
+    if (NV_IS_IMM(h)) iv = NV_IMM_VAL(h);
+    else { BV *v = bv_h(h); if (v->tag != BV_INT) return 0; iv = v->i; }
+    if (inclusive) return iv >= lo && iv <= hi;
+    return iv >= lo && iv < hi;
 }
 /* is `h` a struct of type `name_h` (empty name matches any struct)? */
 i64 nv_struct_is(i64 h, i64 name_h) {
@@ -296,6 +324,7 @@ static const char *bv_type_name(BV *v) {
 
 /* ---- truthiness / length / equality (mirror nova_rt.c) ---- */
 i64 nv_truthy(i64 h) {
+    if (NV_IS_IMM(h)) return NV_IMM_VAL(h) != 0;
     BV *v = bv_h(h);
     switch (v->tag) {
         case BV_BOOL: case BV_INT: return v->i != 0;
@@ -360,8 +389,16 @@ static i64 bv_eq(BV *a, BV *b) {
     }
     return 0;
 }
-i64 nv_eq(i64 a, i64 b) { return nv_bool(bv_eq(bv_h(a), bv_h(b))); }
-i64 nv_ne(i64 a, i64 b) { return nv_bool(!bv_eq(bv_h(a), bv_h(b))); }
+/* two immediate ints are equal iff their handles are identical (bijective
+ * encoding); otherwise fall back to structural bv_eq. */
+i64 nv_eq(i64 a, i64 b) {
+    if (NV_IS_IMM(a) && NV_IS_IMM(b)) return nv_bool(a == b);
+    return nv_bool(bv_eq(bv_h(a), bv_h(b)));
+}
+i64 nv_ne(i64 a, i64 b) {
+    if (NV_IS_IMM(a) && NV_IS_IMM(b)) return nv_bool(a != b);
+    return nv_bool(!bv_eq(bv_h(a), bv_h(b)));
+}
 
 /* ---- display: byte-identical to interp.rs `impl Display for Value` ---- */
 typedef struct SB { char *buf; i64 len, cap; } SB;
@@ -552,6 +589,7 @@ i64 nv_concat2(i64 ah, i64 bh) { /* string + value / value + string */
 }
 
 i64 nv_add(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_int(NV_IMM_VAL(ah) + NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_INT && b->tag == BV_INT) return nv_int(a->i + b->i); /* overflow -> gate */
     if (a->tag == BV_STR || b->tag == BV_STR) return nv_concat2(ah, bh);
@@ -560,6 +598,7 @@ i64 nv_add(i64 ah, i64 bh) {
     exit(1);
 }
 i64 nv_sub(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_int(NV_IMM_VAL(ah) - NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_INT && b->tag == BV_INT) return nv_int(a->i - b->i);
     if (bv_is_num(a) && bv_is_num(b)) return nv_float(bv_as_f(a) - bv_as_f(b));
@@ -567,6 +606,7 @@ i64 nv_sub(i64 ah, i64 bh) {
     exit(1);
 }
 i64 nv_mul(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_int(NV_IMM_VAL(ah) * NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_INT && b->tag == BV_INT) return nv_int(a->i * b->i);
     if (bv_is_num(a) && bv_is_num(b)) return nv_float(bv_as_f(a) * bv_as_f(b));
@@ -574,6 +614,11 @@ i64 nv_mul(i64 ah, i64 bh) {
     exit(1);
 }
 i64 nv_div(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) {
+        i64 bi = NV_IMM_VAL(bh);
+        if (bi == 0) bv_die("division by zero");
+        return nv_int(NV_IMM_VAL(ah) / bi);
+    }
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_INT && b->tag == BV_INT) {
         if (b->i == 0) bv_die("division by zero");
@@ -584,6 +629,11 @@ i64 nv_div(i64 ah, i64 bh) {
     exit(1);
 }
 i64 nv_rem(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) {
+        i64 bi = NV_IMM_VAL(bh);
+        if (bi == 0) bv_die("modulo by zero");
+        return nv_int(NV_IMM_VAL(ah) % bi);
+    }
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_INT && b->tag == BV_INT) {
         if (b->i == 0) bv_die("modulo by zero");
@@ -603,39 +653,49 @@ static int bv_strcmp(BV *a, BV *b) {
     return (a->s->nbytes > b->s->nbytes) - (a->s->nbytes < b->s->nbytes);
 }
 i64 nv_cmp_lt(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_bool(NV_IMM_VAL(ah) < NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_STR && b->tag == BV_STR) return nv_bool(bv_strcmp(a, b) < 0);
     return nv_bool(bv_as_f(a) < bv_as_f(b));
 }
 i64 nv_cmp_le(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_bool(NV_IMM_VAL(ah) <= NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_STR && b->tag == BV_STR) return nv_bool(bv_strcmp(a, b) <= 0);
     return nv_bool(bv_as_f(a) <= bv_as_f(b));
 }
 i64 nv_cmp_gt(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_bool(NV_IMM_VAL(ah) > NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_STR && b->tag == BV_STR) return nv_bool(bv_strcmp(a, b) > 0);
     return nv_bool(bv_as_f(a) > bv_as_f(b));
 }
 i64 nv_cmp_ge(i64 ah, i64 bh) {
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) return nv_bool(NV_IMM_VAL(ah) >= NV_IMM_VAL(bh));
     BV *a = bv_h(ah), *b = bv_h(bh);
     if (a->tag == BV_STR && b->tag == BV_STR) return nv_bool(bv_strcmp(a, b) >= 0);
     return nv_bool(bv_as_f(a) >= bv_as_f(b));
 }
 
 i64 nv_bit(i64 ah, i64 bh, i64 op) {
-    BV *a = bv_h(ah), *b = bv_h(bh);
-    if (a->tag != BV_INT || b->tag != BV_INT) bv_die("bitwise operators require integer operands");
+    i64 ai, bi;
+    if (NV_IS_IMM(ah) && NV_IS_IMM(bh)) { ai = NV_IMM_VAL(ah); bi = NV_IMM_VAL(bh); }
+    else {
+        BV *a = bv_h(ah), *b = bv_h(bh);
+        if (a->tag != BV_INT || b->tag != BV_INT) bv_die("bitwise operators require integer operands");
+        ai = a->i; bi = b->i;
+    }
     switch ((char)op) {
-        case '&': return nv_int(a->i & b->i);
-        case '|': return nv_int(a->i | b->i);
-        case '^': return nv_int(a->i ^ b->i);
-        case '<': return nv_int((i64)((uint64_t)a->i << (b->i & 63)));
-        default:  return nv_int(a->i >> (b->i & 63));
+        case '&': return nv_int(ai & bi);
+        case '|': return nv_int(ai | bi);
+        case '^': return nv_int(ai ^ bi);
+        case '<': return nv_int((i64)((uint64_t)ai << (bi & 63)));
+        default:  return nv_int(ai >> (bi & 63));
     }
 }
 
 i64 nv_neg(i64 h) {
+    if (NV_IS_IMM(h)) return nv_int(-NV_IMM_VAL(h));
     BV *v = bv_h(h);
     if (v->tag == BV_INT) return nv_int(-v->i);
     if (v->tag == BV_FLOAT) return nv_float(-v->f);
@@ -644,6 +704,7 @@ i64 nv_neg(i64 h) {
 }
 i64 nv_not(i64 h) { return nv_bool(!nv_truthy(h)); }
 i64 nv_bitnot(i64 h) {
+    if (NV_IS_IMM(h)) return nv_int(~NV_IMM_VAL(h));
     BV *v = bv_h(h);
     if (v->tag != BV_INT) bv_die("cannot apply BitNot to non-int");
     return nv_int(~v->i);
@@ -762,6 +823,7 @@ i64 nv_get(i64 arrh, i64 idxh) {
 }
 
 i64 nv_as_int(i64 h) {
+    if (NV_IS_IMM(h)) return NV_IMM_VAL(h);
     BV *v = bv_h(h);
     if (v->tag != BV_INT) { fprintf(stderr, "runtime error: expected integer, got %s\n", bv_type_name(v)); exit(1); }
     return v->i;

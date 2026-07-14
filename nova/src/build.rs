@@ -180,12 +180,12 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
     // scalar/string programs: locals, loops, conditionals, runtime string
     // building), always linking nova_box_rt.c. `rt_src` is the runtime C source to
     // compile+link, or None for a libc-only binary.
-    let (obj, rt_src): (Vec<u8>, Option<&'static str>) =
+    let (obj, rt_src, boxed): (Vec<u8>, Option<&'static str>, bool) =
         match crate::jit::compile_object(program, arch.target()) {
-            Some((obj, true)) => (obj, Some(NOVA_NATIVE_RT)),
-            Some((obj, false)) => (obj, None),
+            Some((obj, true)) => (obj, Some(NOVA_NATIVE_RT), false),
+            Some((obj, false)) => (obj, None, false),
             None => match crate::jit::compile_object_boxed(program, arch.target()) {
-                Some((obj, _)) => (obj, Some(NOVA_BOX_RT)),
+                Some((obj, _)) => (obj, Some(NOVA_BOX_RT), true),
                 None => return Ok(None), // not native-able -> fall back
             },
         };
@@ -211,8 +211,20 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
     };
     if let Some(src) = rt_src {
         std::fs::write(&rtc, src).map_err(|e| e.to_string())?;
-        let st = Command::new(cc).arg("-O2").arg("-c").arg(&rtc).arg("-o").arg(&rtp)
-            .status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
+        // Optimize the runtime hard: the boxed tier's hot loop is dominated by
+        // calls to these nv_* primitives (Cranelift emits the program logic but
+        // can't inline across into this C object), so compiling them at the same
+        // -O3 -march=native the C backend uses is a real win. Cross targets keep
+        // a portable -O2 (no host -march, and the qemu runner isn't timed).
+        let mut rc = Command::new(cc);
+        rc.arg("-c");
+        if arch == NativeArch::Host {
+            rc.arg("-O3").arg("-march=native").arg("-fno-math-errno");
+        } else {
+            rc.arg("-O2");
+        }
+        rc.arg(&rtc).arg("-o").arg(&rtp);
+        let st = rc.status().map_err(|e| format!("cannot run {}: {}", cc, e))?;
         if !st.success() {
             let _ = std::fs::remove_file(&objp);
             cleanup_rt();
@@ -244,7 +256,7 @@ fn build_native(entry: &str, out: &Path, program: &crate::ast::Program, arch: Na
     cleanup_rt();
     if expect.stdout == got.stdout && expect.status.code() == got.status.code() {
         // keep the .o alongside the binary as proof of the object path
-        Ok(Some(crate::aot::Tier::Typed))
+        Ok(Some(if boxed { crate::aot::Tier::Boxed } else { crate::aot::Tier::Typed }))
     } else {
         let _ = std::fs::remove_file(out);
         let _ = std::fs::remove_file(&objp);
