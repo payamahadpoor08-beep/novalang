@@ -1,0 +1,40 @@
+// The `encoding` standard library: base64, base64url, base32, hex, and URL
+// percent-encoding. Every expected value is produced by an authoritative
+// reference (Python base64 / urllib.parse) — see the comments.
+// Scope: operates on UTF-8 text (Nova strings are UTF-8); decoders return text.
+// Run with:  nova test examples/encoding_full.nova
+
+use encoding.{base64_encode, base64_decode, base64url_encode, base64url_decode,
+              base32_encode, base32_decode, hex_encode, hex_decode,
+              url_encode, url_decode}
+
+test "base64 (Python base64.b64encode)" {
+  assert_eq(base64_encode("Nova rocks!"), "Tm92YSByb2NrcyE=")
+  assert_eq(base64_encode(""), "")
+  assert_eq(base64_encode("ab"), "YWI=")   // one pad
+  assert_eq(base64_encode("a"), "YQ==")    // two pads
+  assert_eq(base64_decode("Tm92YSByb2NrcyE="), "Nova rocks!")
+  assert_eq(base64_decode(base64_encode("round trip ✓ text")), "round trip ✓ text")
+}
+
+test "base64url (Python base64.urlsafe_b64encode)" {
+  assert_eq(base64url_encode("sure."), "c3VyZS4=")
+  assert_eq(base64url_decode("c3VyZS4="), "sure.")
+}
+
+test "base32 (Python base64.b32encode)" {
+  assert_eq(base32_encode("Nova"), "JZXXMYI=")
+  assert_eq(base32_decode("JZXXMYI="), "Nova")
+}
+
+test "hex (Python bytes.hex)" {
+  assert_eq(hex_encode("Nova"), "4e6f7661")
+  assert_eq(hex_decode("4e6f7661"), "Nova")
+  assert_eq(hex_encode(""), "")
+}
+
+test "url percent-encoding (Python urllib.parse.quote / unquote)" {
+  assert_eq(url_encode("a b/c?=&x=1"), "a%20b/c%3F%3D%26x%3D1")
+  assert_eq(url_decode("a%20b/c%3F%3D%26x%3D1"), "a b/c?=&x=1")
+  assert_eq(url_decode(url_encode("hello, world! (100%)")), "hello, world! (100%)")
+}
