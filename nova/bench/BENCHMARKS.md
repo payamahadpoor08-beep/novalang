@@ -97,6 +97,34 @@ readable style (one statement per line), so on raw line count Nova sits mid-pack
 (e.g. mandel: JS/Lua 6–7, C 7, Rust 12, Go 14, Nova 21). Micro-benchmark LOC is
 not where a batteries-included language wins — see below.
 
+## General programs go native too (not just numeric kernels)
+
+The three kernels above ride Nova's **typed** native track (unboxed `i64`/`f64`).
+Nova also has a **general native tier** (`BoxGen`, `--aot=native`): a Cranelift
+code generator over a tagged-value runtime (`runtime/nova_box_rt.c`) that compiles
+*arbitrary* programs — locals, loops, conditionals, runtime string building,
+recursion, arrays, structs, maps/sets, enums + `match`, `impl` methods, safe-field
+`?.`, and built-in string/array methods — to a real relocatable object, linked to
+an ELF on **host + aarch64 + riscv64** and byte-diffed against `nova run` (the
+oracle gate) so output is never wrong. On the 37-program corpus the AOT census
+moved from **native 3/37** at the start of this work to **19/37** — every program
+whose feature set is statically AOT-compilable now ships as a from-scratch native
+binary instead of an embedded-interpreter build.
+
+What stays on the embed tier (the interpreter linked into the binary — still 100%
+correct, just not a standalone compile): closures-with-capture, generators
+(`yield`), async/channels, `try`/`catch` unwinding, and i64-overflow→BigInt. These
+need heap-closures / coroutine state machines / non-local unwinding / arbitrary
+precision that a simple boxed AOT model can't express.
+
+**Honest performance note.** The typed track is near-C (above). The general boxed
+tier is built for *generality*, not peak throughput: every value is a heap handle
+(allocate-and-leak, one process = one run), so an allocation-heavy hot loop is
+malloc-bound and can trail the interpreter, while compute that stays in registers
+runs at native speed. Encoding small ints/bools/null as immediates in the handle
+(no heap alloc) is the tracked next optimization — it removes the per-operation
+allocation that dominates such loops.
+
 ## Where Nova wins on code size: breadth (the "does everything" story)
 Nova's *core* ships batteries that most languages need libraries/frameworks for.
 On real tasks that touch these, the Nova program is dramatically shorter because
